@@ -10,56 +10,27 @@ mod antigravity;
 mod tray;
 
 use app::AppState;
-use tauri::WindowEvent;
-
-#[cfg(windows)]
-fn ensure_single_instance() -> bool {
-    use std::ffi::OsStr;
-    use std::os::windows::ffi::OsStrExt;
-
-    extern "system" {
-        fn CreateMutexW(lpMutexAttributes: *mut std::ffi::c_void, bInitialOwner: i32, lpName: *const u16) -> *mut std::ffi::c_void;
-        fn GetLastError() -> u32;
-        fn FindWindowW(lpClassName: *const u16, lpWindowName: *const u16) -> *mut std::ffi::c_void;
-        fn ShowWindow(hWnd: *mut std::ffi::c_void, nCmdShow: i32) -> i32;
-        fn SetForegroundWindow(hWnd: *mut std::ffi::c_void) -> i32;
-    }
-
-    let mutex_name: Vec<u16> = OsStr::new("Local\\AgentBurnWindowsSingleInstanceMutex")
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-
-    unsafe {
-        CreateMutexW(std::ptr::null_mut(), 1, mutex_name.as_ptr());
-        if GetLastError() == 183 {
-            // Une instance existe déjà : restaurer la fenêtre de l'instance existante
-            let title: Vec<u16> = OsStr::new("Agent Burn")
-                .encode_wide()
-                .chain(std::iter::once(0))
-                .collect();
-            let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
-            if !hwnd.is_null() {
-                ShowWindow(hwnd, 9); // SW_RESTORE = 9
-                SetForegroundWindow(hwnd);
-            }
-            return false;
-        }
-    }
-    true
-}
+use tauri::{Manager, WindowEvent};
 
 fn main() {
-    #[cfg(windows)]
-    if !ensure_single_instance() {
-        // Une instance est déjà active, la seconde s'arrête immédiatement
-        return;
-    }
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .manage(AppState::new())
         .setup(|app| {
+            let log_path = "startup.log";
+            let mut log = format!("Setup démarré à {}\n", chrono::Local::now());
+            let win = app.get_webview_window("main");
+            log.push_str(&format!("Fenêtre 'main' trouvée : {}\n", win.is_some()));
+            if let Some(ref w) = win {
+                log.push_str(&format!("Visibilité initiale : {:?}\n", w.is_visible()));
+                log.push_str(&format!("Résultat show() : {:?}\n", w.show()));
+                log.push_str(&format!("Résultat set_focus() : {:?}\n", w.set_focus()));
+            } else {
+                log.push_str("ATTENTION: Fenêtre 'main' INTROUVABLE !\n");
+            }
+            let _ = std::fs::write(log_path, &log);
+
             let handle = app.handle();
             let _ = tray::setup_tray(handle);
             background::spawn_quota_collector(handle.clone());
