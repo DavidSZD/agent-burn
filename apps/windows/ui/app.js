@@ -64,7 +64,11 @@ window.addEventListener("DOMContentLoaded", async () => {
 async function initColdStart() {
   try {
     const cached = await invokeTauri("get_report_cache");
-    if (cached && (cached.summary || cached.projects)) {
+    if (cached && (cached.summary || cached.projects || cached.antigravity)) {
+      if (cached.antigravity) {
+        antigravityData = cached.antigravity;
+        antigravityCache[currentPeriod] = cached.antigravity;
+      }
       if (cached.summary) {
         reportData = cached.summary;
         periodCache[currentPeriod] = cached.summary;
@@ -401,12 +405,12 @@ async function loadData(force = false) {
   try {
     const data = await invokeTauri("get_summary", { period: targetPeriod });
 
-    if (!fullReportData || targetPeriod === "all") {
+    if (targetPeriod === "all") {
       fullReportData = data;
     }
 
-    reportData = sliceSummaryData(data, targetPeriod);
-    periodCache[targetPeriod] = reportData;
+    reportData = data;
+    periodCache[targetPeriod] = data;
 
     autoDetectCursor(reportData);
 
@@ -471,6 +475,7 @@ async function persistCache() {
       data: {
         summary: reportData,
         projects: projectsCache[currentPeriod] || projectsData,
+        antigravity: antigravityCache[currentPeriod] || antigravityData,
         updatedAt: new Date().toISOString(),
       },
     });
@@ -867,14 +872,25 @@ function renderSummary() {
       quotasContainer.innerHTML = `<div class="quota-card" style="grid-column: 1/-1; color: var(--text-muted);">Aucun quota d'agent en cours détecté.</div>`;
     } else {
       agents.forEach((agent) => {
-        const remaining = agent.window?.usedPercent != null ? (100 - agent.window.usedPercent) : (agent.quota?.remainingPercent ?? 100);
-        const reset = agent.window?.elapsedMinutes != null ? `${(agent.window.elapsedMinutes / 60).toFixed(1)}h écoulées` : (agent.quota?.resetCountdown ?? "Dans le cycle");
+        let remaining = agent.window?.usedPercent != null ? (100 - agent.window.usedPercent) : (agent.quota?.remainingPercent ?? 100);
+        let reset = agent.window?.elapsedMinutes != null ? `${(agent.window.elapsedMinutes / 60).toFixed(1)}h écoulées` : (agent.quota?.resetCountdown ?? "Dans le cycle");
+        let plan = agent.plan || "Défaut";
+
+        if (agent.agent === "cursor" && reportData.cursorAccount) {
+          const ca = reportData.cursorAccount;
+          if (ca.activePercentUsed != null) {
+            remaining = Math.max(0, 100 - ca.activePercentUsed);
+            reset = `${ca.activePercentUsed}% quota utilisé`;
+            plan = "Usage direct";
+          }
+        }
+
         const costVal = agent.periodUsage ?? agent.periodCost ?? 0;
         const card = document.createElement("div");
         card.className = "quota-card";
         card.innerHTML = `
           <div class="quota-header">
-            <span class="quota-title">${agent.agent.toUpperCase()} (${agent.plan || "Défaut"})</span>
+            <span class="quota-title">${escapeHtml(agent.agent.toUpperCase())} (${escapeHtml(plan)})</span>
             <span class="quota-percent">${remaining.toFixed(0)}% restant</span>
           </div>
           <div class="progress-bar-bg">
@@ -882,7 +898,7 @@ function renderSummary() {
           </div>
           <div class="quota-footer">
             <span>Consommation : ${formatCurrency(costVal)}</span>
-            <span>Statut : ${reset}</span>
+            <span>Statut : ${escapeHtml(reset)}</span>
           </div>
         `;
         quotasContainer.appendChild(card);
