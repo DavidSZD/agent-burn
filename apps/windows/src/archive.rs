@@ -198,3 +198,20 @@ fn save_atomic_with_backup(primary: &PathBuf, backup: &PathBuf, tmp: &PathBuf, v
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_save_and_load_report_cache() {
+        let test_val = json!({
+            "testKey": "testVal",
+            "number": 42
+        });
+        save_report_cache(&test_val);
+        let loaded = load_report_cache();
+        assert_eq!(loaded["testKey"], "testVal");
+        assert_eq!(loaded["number"], 42);
+    }
+}
