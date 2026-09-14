@@ -152,4 +152,8 @@ fn is_embedded_model(model: &str) -> bool {
         || model.starts_with("azure/")
         || model.starts_with("zai/")
         || model.starts_with("openrouter/openai/")
+        || model.starts_with("gemini-")
+        || model.starts_with("gemini/")
+        || model.starts_with("google/")
+        || model.starts_with("vertex_ai/")
 }
