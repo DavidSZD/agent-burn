@@ -84,7 +84,7 @@ pub fn get_antigravity_data(period_str: Option<&str>) -> Result<AntigravitySumma
                         let conv_id = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
                         let transcript_path = path.join(".system_generated").join("logs").join("transcript.jsonl");
                         if transcript_path.is_file() {
-                            if let Some(session) = parse_transcript(&transcript_path, &conv_id, min_date) {
+                            if let Some(session) = parse_transcript(&transcript_path, &conv_id, min_date, Some(&home)) {
                                 let entry = model_tokens.entry(session.model.clone()).or_insert((0, 0.0));
                                 entry.0 += session.total_tokens;
                                 entry.1 += session.cost;
@@ -134,7 +134,58 @@ pub fn get_antigravity_data(period_str: Option<&str>) -> Result<AntigravitySumma
     })
 }
 
-fn parse_transcript(path: &Path, conv_id: &str, min_date: Option<DateTime<Utc>>) -> Option<AntigravitySession> {
+fn extract_model_from_conversation(conv_id: &str, home: Option<&Path>) -> String {
+    if let Some(home) = home {
+        let db_path = home
+            .join(".gemini")
+            .join("antigravity")
+            .join("conversations")
+            .join(format!("{}.db", conv_id));
+        if let Ok(data) = fs::read(&db_path) {
+            let mut best_model = None;
+            let len = data.len();
+            let mut i = 0;
+            while i + 3 < len {
+                if data[i] == 0x9a && data[i + 1] == 0x01 {
+                    let field_len = data[i + 2] as usize;
+                    if field_len >= 4 && field_len <= 50 && i + 3 + field_len <= len {
+                        if let Ok(s) = std::str::from_utf8(&data[i + 3..i + 3 + field_len]) {
+                            if s.starts_with("gemini-") || s.starts_with("claude-") || s.starts_with("gpt-") {
+                                best_model = Some(s.to_string());
+                            }
+                        }
+                    }
+                }
+                i += 1;
+            }
+            if let Some(m) = best_model {
+                return m;
+            }
+        }
+    }
+    "gemini-3.8-flash".to_string()
+}
+
+fn get_model_pricing(model: &str) -> (f64, f64) {
+    let lower = model.to_lowercase();
+    if lower.contains("flash-lite") {
+        // Gemini Flash Lite (LiteLLM) : $0.0375 / 1M input, $0.15 / 1M output
+        (0.0375, 0.15)
+    } else if lower.contains("pro") {
+        // Gemini Pro (LiteLLM) : $1.25 / 1M input, $5.00 / 1M output
+        (1.25, 5.00)
+    } else if lower.contains("claude-3-7") || lower.contains("claude-3-5-sonnet") {
+        (3.00, 15.00)
+    } else if lower.contains("gpt-4o") {
+        (2.50, 10.00)
+    } else {
+        // Gemini Flash officiel LiteLLM (gemini-3.8-flash, gemini-3.7-flash, gemini-3.6-flash, etc.) :
+        // $0.075 / 1M input, $0.30 / 1M output
+        (0.075, 0.30)
+    }
+}
+
+fn parse_transcript(path: &Path, conv_id: &str, min_date: Option<DateTime<Utc>>, home: Option<&Path>) -> Option<AntigravitySession> {
     let file = File::open(path).ok()?;
     let reader = BufReader::new(file);
 
@@ -221,9 +272,9 @@ fn parse_transcript(path: &Path, conv_id: &str, min_date: Option<DateTime<Utc>>)
     let output_tokens = (output_chars / 4).max(50);
     let total_tokens = input_tokens + output_tokens;
 
-    // Tarification officielle LiteLLM Google Gemini 2.5 Pro :
-    // input = $1.25 / 1M, output = $5.00 / 1M
-    let cost = (input_tokens as f64 * 1.25 + output_tokens as f64 * 5.00) / 1_000_000.0;
+    let model = extract_model_from_conversation(conv_id, home);
+    let (input_rate_per_m, output_rate_per_m) = get_model_pricing(&model);
+    let cost = (input_tokens as f64 * input_rate_per_m + output_tokens as f64 * output_rate_per_m) / 1_000_000.0;
 
     let project_path = detected_project_path.unwrap_or_else(|| "Projet général (Workspace Antigravity)".to_string());
     let project_name = Path::new(&project_path)
@@ -242,7 +293,7 @@ fn parse_transcript(path: &Path, conv_id: &str, min_date: Option<DateTime<Utc>>)
         output_tokens,
         total_tokens,
         cost: (cost * 100.0).round() / 100.0,
-        model: "gemini-2.5-pro".to_string(),
+        model,
     })
 }
 
@@ -258,6 +309,9 @@ mod tests {
         println!("Antigravity total sessions: {}", data.session_count);
         println!("Antigravity total tokens: {}", data.total_tokens);
         println!("Antigravity total cost: ${}", data.total_cost);
+        for m in &data.top_models {
+            println!("  Model: {:<25} Tokens: {:>10} Cost: ${:.2}", m.model, m.tokens, m.cost);
+        }
         assert!(data.session_count > 0);
     }
 }

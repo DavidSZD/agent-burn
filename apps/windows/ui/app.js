@@ -92,8 +92,22 @@ function initTabs() {
       btn.classList.add("active");
       currentTab = btn.dataset.tab;
 
+      // S'assurer que les boutons de timeline reflètent toujours la période active
+      document.querySelectorAll(".period-btn").forEach((b) => {
+        b.classList.toggle("active", b.dataset.period === currentPeriod);
+      });
+
       if (currentTab === "summary") {
         document.getElementById("view-summary").classList.add("active");
+        if (fullReportData) {
+          reportData = sliceSummaryData(fullReportData, currentPeriod);
+          periodCache[currentPeriod] = reportData;
+        }
+        if (reportData) {
+          renderSummary();
+        } else {
+          await loadData();
+        }
       } else if (currentTab === "projects") {
         document.getElementById("view-projects").classList.add("active");
         await loadProjects();
@@ -117,20 +131,45 @@ function initPeriods() {
       btn.classList.add("active");
       currentPeriod = btn.dataset.period;
 
-      // Anti-rebond (Debounce 100 ms)
+      // 1. Découpage instantané en 0 ms si données en mémoire
+      if (fullReportData) {
+        reportData = sliceSummaryData(fullReportData, currentPeriod);
+        periodCache[currentPeriod] = reportData;
+      }
+
+      // 2. Mise à jour immédiate selon l'onglet courant
+      if (currentTab === "summary") {
+        if (reportData) renderSummary();
+        updateStatusSynced();
+      } else if (currentTab === "antigravity") {
+        if (antigravityCache[currentPeriod]) {
+          antigravityData = antigravityCache[currentPeriod];
+          renderAntigravityView(antigravityData);
+          updateStatusSynced();
+        }
+      } else if (currentTab === "projects") {
+        if (projectsCache[currentPeriod]) {
+          projectsData = projectsCache[currentPeriod];
+          renderProjectsView(projectsData);
+          updateStatusSynced();
+        }
+      } else if (currentTab !== "settings") {
+        renderHarnessView(currentTab);
+      }
+
+      // Anti-rebond (Debounce 50 ms) pour requêtes complémentaires
       clearTimeout(debouncePeriodTimer);
       debouncePeriodTimer = setTimeout(async () => {
         if (currentTab === "projects") {
           await loadProjects();
         } else if (currentTab === "antigravity") {
           await loadAntigravity();
-        } else {
+        } else if (currentTab === "summary") {
           await loadData();
-          if (currentTab !== "summary" && currentTab !== "settings") {
-            renderHarnessView(currentTab);
-          }
+        } else if (currentTab !== "settings") {
+          renderHarnessView(currentTab);
         }
-      }, 100);
+      }, 50);
     });
   });
 }
@@ -262,12 +301,94 @@ function updateStatusSynced() {
   }
 }
 
+let fullReportData = null;
+
+function sliceSummaryData(fullData, period) {
+  if (!fullData || !fullData.daily) return fullData;
+  if (period === "all") return fullData;
+
+  const now = new Date();
+  const todayStr = now.toISOString().split("T")[0];
+
+  const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+  const weekStr = sevenDaysAgo.toISOString().split("T")[0];
+
+  const mtdStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-01`;
+
+  const dateFilter = (dateStr) => {
+    if (period === "today") return dateStr === todayStr;
+    if (period === "week") return dateStr >= weekStr;
+    if (period === "mtd") return dateStr >= mtdStr;
+    return true;
+  };
+
+  const filteredDaily = (fullData.daily || []).filter((d) => dateFilter(d.date));
+  const totalCost = filteredDaily.reduce((acc, d) => acc + (d.cost || 0), 0);
+  const totalTokens = filteredDaily.reduce((acc, d) => acc + (d.tokens || 0), 0);
+
+  const filteredAgents = (fullData.agents || []).map((ag) => {
+    const agDaily = (ag.daily || []).filter((d) => dateFilter(d.date));
+    const agCost = agDaily.reduce((acc, d) => acc + (d.cost || 0), 0);
+    const agTokens = agDaily.reduce((acc, d) => acc + (d.tokens || 0), 0);
+    return {
+      ...ag,
+      daily: agDaily,
+      totalCost: agCost,
+      totalTokens: agTokens,
+    };
+  });
+
+  return {
+    ...fullData,
+    daily: filteredDaily,
+    agents: filteredAgents,
+    totals: {
+      totalCost,
+      totalTokens,
+    },
+  };
+}
+
+function autoDetectCursor(data) {
+  const hasCursor =
+    data?.subscription?.agents?.some((a) => a.agent?.toLowerCase() === "cursor") ||
+    data?.models?.some((m) => m.model?.toLowerCase().includes("cursor")) ||
+    data?.agents?.some((a) => a.agent === "cursor");
+  if (hasCursor) {
+    const saved = localStorage.getItem("agent_burn_visible_tabs");
+    let visibleTabs = { summary: true, projects: true, antigravity: true, codex: true, claude: false, cursor: true };
+    if (saved) {
+      try {
+        visibleTabs = Object.assign(visibleTabs, JSON.parse(saved));
+        if (visibleTabs.cursor === undefined) {
+          visibleTabs.cursor = true;
+          localStorage.setItem("agent_burn_visible_tabs", JSON.stringify(visibleTabs));
+        }
+      } catch (_) {}
+    } else {
+      localStorage.setItem("agent_burn_visible_tabs", JSON.stringify(visibleTabs));
+    }
+    applyTabVisibility("cursor", visibleTabs.cursor !== false);
+    const cb = document.querySelector(`input[data-tab-target="cursor"]`);
+    if (cb) cb.checked = visibleTabs.cursor !== false;
+  }
+}
+
 async function loadData(force = false) {
   const statusBar = document.getElementById("status-text");
   const reqId = ++currentSummaryRequestId;
   const targetPeriod = currentPeriod;
 
-  // 1. Si déjà en mémoire, affichage instantané (0.0 ms)
+  // 1. Découpage instantané en 0 ms si données complètes en mémoire
+  if (!force && fullReportData) {
+    reportData = sliceSummaryData(fullReportData, targetPeriod);
+    periodCache[targetPeriod] = reportData;
+    renderCurrentTabContent();
+    updateStatusSynced();
+    return;
+  }
+
+  // 2. Si déjà en cache pour cette période précise
   if (!force && periodCache[targetPeriod]) {
     reportData = periodCache[targetPeriod];
     renderCurrentTabContent();
@@ -280,12 +401,25 @@ async function loadData(force = false) {
   try {
     const data = await invokeTauri("get_summary", { period: targetPeriod });
 
-    // TOUJOURS sauvegarder le résultat dans le cache pour ne jamais perdre le calcul !
-    periodCache[targetPeriod] = data;
+    if (!fullReportData || targetPeriod === "all") {
+      fullReportData = data;
+    }
+
+    reportData = sliceSummaryData(data, targetPeriod);
+    periodCache[targetPeriod] = reportData;
+
+    autoDetectCursor(reportData);
+
+    // Charger ou synchroniser Antigravity en arrière-plan
+    if (!antigravityCache[targetPeriod]) {
+      invokeTauri("get_antigravity_summary", { period: targetPeriod }).then((agd) => {
+        antigravityCache[targetPeriod] = agd;
+        if (currentTab === "summary") renderSummary();
+      }).catch(() => {});
+    }
 
     // Garde-fou d'affichage : on ne modifie l'écran que si l'utilisateur est toujours sur cette timeline
     if (reqId === currentSummaryRequestId && targetPeriod === currentPeriod) {
-      reportData = data;
       renderCurrentTabContent();
       updateStatusSynced();
       await persistCache();
@@ -294,7 +428,7 @@ async function loadData(force = false) {
     // Lancer le pré-chargement en arrière-plan des autres périodes pour que tout soit instantané
     if (!warmupDone) {
       warmupDone = true;
-      setTimeout(warmupAllPeriods, 1200);
+      setTimeout(warmupAllPeriods, 1000);
     }
   } catch (error) {
     console.error("Échec chargement des données:", error);
@@ -321,6 +455,11 @@ async function warmupAllPeriods() {
         projectsCache[p] = pd;
       } catch (_) {}
     }
+  }
+  if (!harnessCache["codex"]) {
+    try {
+      harnessCache["codex"] = await invokeTauri("get_harness", { agent: "codex" });
+    } catch (_) {}
   }
   await persistCache();
   console.log("⚡ Pré-chargement de toutes les timelines terminé en mémoire !");
@@ -439,7 +578,6 @@ function renderProjectsView(data) {
     tr.innerHTML = `
       <td>
         <div class="project-name-cell">
-          <span>📁</span>
           <strong>${escapeHtml(proj.name)}</strong>
         </div>
       </td>
@@ -514,7 +652,6 @@ async function loadAntigravity(force = false) {
   }
 
   container.innerHTML = `<div style="padding: 40px; text-align: center; color: var(--text-muted);">
-    <div style="font-size: 28px; margin-bottom: 10px;">🪐</div>
     <div>Analyse des 56 sessions Google Antigravity (${getPeriodLabel(targetPeriod)})...</div>
   </div>`;
 
@@ -548,7 +685,7 @@ function renderAntigravityView(data) {
     container.innerHTML = `
       <div class="card settings-card">
         <div style="display: flex; justify-content: space-between; align-items: center;">
-          <h3 style="color: var(--accent-flame); font-size: 18px;">GOOGLE ANTIGRAVITY 🪐</h3>
+          <h3 style="color: var(--accent-flame); font-size: 18px;">GOOGLE ANTIGRAVITY</h3>
           <span class="badge">0 session</span>
         </div>
         <p style="color: var(--text-muted); margin-top: 12px;">
@@ -578,7 +715,7 @@ function renderAntigravityView(data) {
           <tbody>
             ${data.top_models.map(m => `
               <tr>
-                <td><strong>🪐 ${escapeHtml(m.model)}</strong></td>
+                <td><strong>${escapeHtml(m.model)}</strong></td>
                 <td>${formatNumber(m.tokens)}</td>
                 <td><strong style="color: var(--accent-flame);">${formatCurrency(m.cost)}</strong></td>
               </tr>
@@ -626,7 +763,6 @@ function renderAntigravityView(data) {
                 <tr>
                   <td>
                     <div class="project-name-cell">
-                      <span>🪐</span>
                       <strong>${escapeHtml(s.project_name)}</strong>
                     </div>
                   </td>
@@ -651,7 +787,7 @@ function renderAntigravityView(data) {
   container.innerHTML = `
     <div class="card settings-card">
       <div style="display: flex; justify-content: space-between; align-items: center;">
-        <h3 style="color: var(--accent-flame); font-size: 18px;">GOOGLE ANTIGRAVITY 🪐</h3>
+        <h3 style="color: var(--accent-flame); font-size: 18px;">GOOGLE ANTIGRAVITY</h3>
         <span class="badge active">${data.session_count} session${data.session_count > 1 ? "s" : ""}</span>
       </div>
 
@@ -694,9 +830,15 @@ function escapeHtml(str) {
 function renderSummary() {
   if (!reportData) return;
 
-  // Métriques globales
-  const totalCost = reportData.totals?.totalCost ?? reportData.totalCost ?? 0;
-  const totalTokens = reportData.totals?.totalTokens ?? reportData.totalTokens ?? 0;
+  const agData = antigravityCache[currentPeriod] || antigravityData;
+  const agCost = agData?.total_cost || 0;
+  const agTokens = agData?.total_tokens || 0;
+
+  // Métriques globales unifiées (Codex + Cursor + Antigravity)
+  const baseCost = reportData.totals?.totalCost ?? reportData.totalCost ?? 0;
+  const baseTokens = reportData.totals?.totalTokens ?? reportData.totalTokens ?? 0;
+  const totalCost = baseCost + agCost;
+  const totalTokens = baseTokens + agTokens;
 
   document.getElementById("metric-spend").textContent = formatCurrency(totalCost);
   document.getElementById("metric-tokens").textContent = formatNumber(totalTokens);
@@ -716,12 +858,12 @@ function renderSummary() {
   // Rendu du graphique d'évolution journalière
   renderDailyChart(reportData.daily || []);
 
-  // Quotas par agent
+  // Quotas par agent et statut direct
   const quotasContainer = document.getElementById("quotas-container");
   if (quotasContainer) {
     quotasContainer.innerHTML = "";
     const agents = sub?.agents || reportData.agents || [];
-    if (agents.length === 0) {
+    if (agents.length === 0 && (!agData || agData.session_count === 0)) {
       quotasContainer.innerHTML = `<div class="quota-card" style="grid-column: 1/-1; color: var(--text-muted);">Aucun quota d'agent en cours détecté.</div>`;
     } else {
       agents.forEach((agent) => {
@@ -745,24 +887,56 @@ function renderSummary() {
         `;
         quotasContainer.appendChild(card);
       });
+
+      // Carte de statut direct Google Antigravity
+      if (agData && agData.session_count > 0) {
+        const topModel = agData.top_models?.[0]?.model || "gemini-3.8-flash";
+        const agCard = document.createElement("div");
+        agCard.className = "quota-card";
+        agCard.innerHTML = `
+          <div class="quota-header">
+            <span class="quota-title">ANTIGRAVITY (${topModel})</span>
+            <span class="quota-percent">${agData.session_count} session${agData.session_count > 1 ? "s" : ""}</span>
+          </div>
+          <div class="progress-bar-bg">
+            <div class="progress-bar-fill" style="width: 100%;"></div>
+          </div>
+          <div class="quota-footer">
+            <span>Consommation : ${formatCurrency(agData.total_cost || 0)}</span>
+            <span>Activité : ${formatNumber(agData.total_tokens || 0)} tokens</span>
+          </div>
+        `;
+        quotasContainer.appendChild(agCard);
+      }
     }
   }
 
-  // Modèles
+  // Modèles les plus utilisés (fusion Codex, Cursor et Gemini Antigravity)
   const tbody = document.getElementById("models-tbody");
   if (tbody) {
     tbody.innerHTML = "";
-    const models = reportData.models || [];
-    if (models.length === 0) {
+    let mergedModels = [...(reportData.models || [])];
+    if (agData?.top_models) {
+      for (const agm of agData.top_models) {
+        mergedModels.push({
+          model: agm.model,
+          totalTokens: agm.tokens,
+          totalCost: agm.cost,
+        });
+      }
+    }
+    mergedModels.sort((a, b) => (b.totalTokens ?? b.tokens ?? 0) - (a.totalTokens ?? a.tokens ?? 0));
+
+    if (mergedModels.length === 0) {
       tbody.innerHTML = `<tr><td colspan="3" style="text-align: center; color: var(--text-muted);">Aucune donnée de modèle disponible pour cette période.</td></tr>`;
     } else {
-      models.forEach((m) => {
+      mergedModels.forEach((m) => {
         const tr = document.createElement("tr");
         const modelName = m.model || m.name || "Inconnu";
         const modelTokens = m.totalTokens ?? m.tokens ?? 0;
         const modelCost = m.totalCost ?? m.cost ?? 0;
         tr.innerHTML = `
-          <td><strong>${modelName}</strong></td>
+          <td><strong>${escapeHtml(modelName)}</strong></td>
           <td>${formatNumber(modelTokens)}</td>
           <td>${formatCurrency(modelCost)}</td>
         `;
@@ -778,6 +952,15 @@ async function renderHarnessView(agentName) {
 
   container.innerHTML = `<div style="padding: 24px; text-align: center; color: var(--text-muted);">Chargement des données détaillées pour ${agentName.toUpperCase()}...</div>`;
 
+  if (agentName === "cursor") {
+    const subAgent = (reportData?.subscription?.agents || []).find((a) => a.agent?.toLowerCase() === "cursor");
+    const cursorModels = (reportData?.models || []).filter((m) => m.model?.toLowerCase().includes("cursor"));
+    const cursorTokens = cursorModels.reduce((acc, m) => acc + (m.totalTokens || m.tokens || 0), 0);
+    const cursorCost = subAgent?.periodUsage ?? cursorModels.reduce((acc, m) => acc + (m.totalCost || m.cost || 0), 0);
+    renderCursorHarness(container, subAgent, cursorModels, cursorCost, cursorTokens);
+    return;
+  }
+
   let hData = null;
   if (agentName === "codex" || agentName === "claude") {
     try {
@@ -788,13 +971,6 @@ async function renderHarnessView(agentName) {
     } catch (e) {
       console.warn("Échec récupération harness pour", agentName, e);
     }
-  }
-
-  if (agentName === "cursor") {
-    const cursorAgent = (reportData?.agents || []).find((a) => a.agent === "cursor");
-    const cursorAcc = reportData?.cursorAccount;
-    renderCursorHarness(container, cursorAgent, cursorAcc);
-    return;
   }
 
   if (!hData || (!hData.plan && (!hData.topModels || hData.topModels.length === 0))) {
@@ -816,9 +992,16 @@ async function renderHarnessView(agentName) {
 
   // Consommation dynamique de l'agent sur la période active
   const agentPeriod = (periodCache[currentPeriod]?.agents || reportData?.agents || []).find((a) => a.agent === agentName);
-  const agentCost = agentPeriod?.totalCost ?? 0;
-  const agentTokens = agentPeriod?.totalTokens ?? 0;
-  const agentModels = agentPeriod?.models || [];
+  let agentCost = agentPeriod?.totalCost ?? 0;
+  let agentTokens = agentPeriod?.totalTokens ?? 0;
+  let agentModels = agentPeriod?.models || [];
+
+  if (agentName === "codex" && agentTokens === 0) {
+    const codexModels = (reportData?.models || []).filter((m) => !m.model?.toLowerCase().includes("cursor") && !m.model?.toLowerCase().includes("gemini"));
+    agentTokens = codexModels.reduce((acc, m) => acc + (m.totalTokens || m.tokens || 0), 0);
+    agentCost = codexModels.reduce((acc, m) => acc + (m.totalCost || m.cost || 0), 0);
+    agentModels = codexModels;
+  }
 
   const periodActivityHtml = `
     <div class="section-title-row" style="margin-top: 24px;">
@@ -950,30 +1133,25 @@ async function renderHarnessView(agentName) {
   `;
 }
 
-function renderCursorHarness(container, cursorAgent, cursorAcc) {
-  const cursorPeriod = (periodCache[currentPeriod]?.agents || reportData?.agents || []).find((a) => a.agent === "cursor");
-  const used = cursorAcc?.activePercentUsed ?? cursorAcc?.includedPercentUsed ?? 0;
-  const planSpend = cursorPeriod?.totalCost ?? cursorAcc?.planSpendUSD ?? cursorAgent?.totalCost ?? 0;
-  const tokens = cursorPeriod?.totalTokens ?? cursorAgent?.totalTokens ?? 0;
-  const models = cursorPeriod?.models || cursorAgent?.models || [];
-
+function renderCursorHarness(container, subAgent, models, totalCost, totalTokens) {
+  const planName = subAgent?.plan || "Usage détecté";
   container.innerHTML = `
     <div class="card settings-card">
       <div style="display: flex; justify-content: space-between; align-items: center;">
         <h3 style="color: var(--accent-flame); font-size: 18px;">Compte CURSOR</h3>
-        <span class="badge active">Pro / Usage</span>
+        <span class="badge active">${escapeHtml(planName)}</span>
       </div>
 
       <div class="metrics-grid" style="margin-top: 16px;">
         <div class="metric-card">
-          <div class="metric-label">Utilisation active du quota (Direct)</div>
-          <div class="metric-value" style="color: var(--accent-flame);">${used}%</div>
-          <div class="metric-sub">Crédits inclus & bonus</div>
+          <div class="metric-label">Consommation · ${getPeriodLabel(currentPeriod)}</div>
+          <div class="metric-value" style="color: var(--accent-flame);">${formatCurrency(totalCost)}</div>
+          <div class="metric-sub">Coût équivalent API calculé</div>
         </div>
         <div class="metric-card">
-          <div class="metric-label">Consommation · ${getPeriodLabel(currentPeriod)}</div>
-          <div class="metric-value">${formatCurrency(planSpend)}</div>
-          <div class="metric-sub">${formatNumber(tokens)} tokens</div>
+          <div class="metric-label">Tokens consommés</div>
+          <div class="metric-value">${formatNumber(totalTokens)}</div>
+          <div class="metric-sub">${models.length} modèle${models.length > 1 ? "s" : ""} actif${models.length > 1 ? "s" : ""}</div>
         </div>
       </div>
     </div>
@@ -992,15 +1170,19 @@ function renderCursorHarness(container, cursorAgent, cursorAcc) {
           <tbody>
             ${models.map(m => `
               <tr>
-                <td><strong>${m.model}</strong></td>
-                <td>${formatNumber(m.totalTokens)}</td>
-                <td>${formatCurrency(m.totalCost)}</td>
+                <td><strong>${escapeHtml(m.model || m.name)}</strong></td>
+                <td>${formatNumber(m.totalTokens ?? m.tokens ?? 0)}</td>
+                <td><strong style="color: var(--accent-flame);">${formatCurrency(m.totalCost ?? m.cost ?? 0)}</strong></td>
               </tr>
             `).join("")}
           </tbody>
         </table>
       </div>
-    ` : ""}
+    ` : `
+      <div class="card settings-card" style="margin-top: 20px;">
+        <p style="color: var(--text-muted);">Aucun modèle spécifique Cursor n'a été utilisé sur cette timeline.</p>
+      </div>
+    `}
   `;
 }
 
@@ -1163,20 +1345,23 @@ function initDataFolder() {
 }
 
 function initCustomization() {
-  // 1. Préférences des onglets (par défaut : Claude et Cursor masqués si non détectés)
+  // 1. Préférences des onglets (Cursor, Codex, Projets, Antigravity actifs par défaut)
   let visibleTabs = {
     summary: true,
     projects: true,
     antigravity: true,
     codex: true,
     claude: false,
-    cursor: false,
+    cursor: true,
   };
 
   try {
     const savedTabs = localStorage.getItem("agent_burn_visible_tabs");
     if (savedTabs) {
       visibleTabs = Object.assign(visibleTabs, JSON.parse(savedTabs));
+      if (visibleTabs.cursor === undefined) {
+        visibleTabs.cursor = true;
+      }
     }
   } catch (_) {}
 
