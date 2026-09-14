@@ -175,17 +175,26 @@ fn load_json_array_with_fallback(primary: &PathBuf, fallback: &PathBuf) -> Vec<V
 }
 
 fn save_atomic_with_backup(primary: &PathBuf, backup: &PathBuf, tmp: &PathBuf, val: &Value) {
-    if let Ok(mut f) = File::create(tmp) {
-        if let Ok(bytes) = serde_json::to_vec_pretty(val) {
+    if let Ok(bytes) = serde_json::to_vec_pretty(val) {
+        if let Ok(mut f) = File::create(tmp) {
             if f.write_all(&bytes).is_ok() && f.flush().is_ok() {
                 drop(f);
 
                 if primary.exists() {
                     let _ = fs::copy(primary, backup);
+                    let _ = fs::remove_file(primary);
                 }
 
-                let _ = fs::rename(tmp, primary);
+                if fs::rename(tmp, primary).is_err() {
+                    let _ = fs::write(primary, &bytes);
+                    let _ = fs::remove_file(tmp);
+                }
             }
+        } else {
+            if primary.exists() {
+                let _ = fs::copy(primary, backup);
+            }
+            let _ = fs::write(primary, &bytes);
         }
     }
 }
