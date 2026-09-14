@@ -1,0 +1,13 @@
+# Windows desktop application recipes
+
+# Run development mode
+run:
+    cargo tauri dev
+
+# Build production executable
+build:
+    cargo tauri build
+
+# Clean artifacts
+clean:
+    cargo clean

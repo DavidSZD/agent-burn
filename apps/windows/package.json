@@ -1,0 +1,14 @@
+{
+	"name": "@agent-burn/windows",
+	"version": "20.0.20",
+	"private": true,
+	"description": "Agent Burn Windows system tray and dashboard application",
+	"type": "module",
+	"scripts": {
+		"dev": "tauri dev",
+		"build": "tauri build"
+	},
+	"devDependencies": {
+		"@tauri-apps/cli": "^2.0.0"
+	}
+}

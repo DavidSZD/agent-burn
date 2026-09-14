@@ -111,13 +111,21 @@ void describe(resolveCliRuntime.name, () => {
 	});
 
 	void it('treats package bin symlinks as the main module entry point', () => {
+		const isWindows = process.platform === 'win32';
+		const binEntry = isWindows
+			? 'C:\\project\\node_modules\\.bin\\agent-burn'
+			: '/project/node_modules/.bin/agent-burn';
+		const modulePath = isWindows
+			? 'C:\\project\\node_modules\\agent-burn\\src\\cli.js'
+			: '/project/node_modules/agent-burn/src/cli.js';
+		const moduleUrl = isWindows
+			? 'file:///C:/project/node_modules/agent-burn/src/cli.js'
+			: 'file:///project/node_modules/agent-burn/src/cli.js';
+
 		const actual = isMainModule({
-			argvEntry: '/project/node_modules/.bin/agent-burn',
-			moduleUrl: 'file:///project/node_modules/agent-burn/src/cli.js',
-			realpathPath: (path) =>
-				path === '/project/node_modules/.bin/agent-burn'
-					? '/project/node_modules/agent-burn/src/cli.js'
-					: path,
+			argvEntry: binEntry,
+			moduleUrl,
+			realpathPath: (path) => (path === binEntry ? modulePath : path),
 		});
 
 		assert.equal(actual, true);
