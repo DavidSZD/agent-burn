@@ -75,7 +75,6 @@ export function quotaRemainingPercent(agent) {
 }
 
 export function mergeLiveSubscription(currentReport, liveReport) {
-  if (!liveReport?.subscription) return currentReport;
-  if (!currentReport) return liveReport;
+  if (!currentReport || !liveReport?.subscription) return currentReport;
   return { ...currentReport, subscription: liveReport.subscription };
 }

@@ -49,6 +49,7 @@ let reportData = null;
 let fullReportData = null;
 let antigravityData = null;
 let quotaHistoryData = null;
+let latestLiveQuotaReport = null;
 let currentSpendGranularity = "monthly"; // "Monthly" actif par défaut sur les captures
 let detectedAgents = [];
 const allKnownAgents = new Set();
@@ -200,6 +201,7 @@ function initBackendEvents() {
   });
   listen("quotas_updated", async (event) => {
     if (event?.payload) {
+      latestLiveQuotaReport = event.payload;
       lastUpdatedTime = Date.now();
       const footerEl = document.getElementById("footer-status-text");
       if (footerEl) footerEl.textContent = "Updated just now";
@@ -208,7 +210,7 @@ function initBackendEvents() {
         quotaHistoryData = await invokeTauri("get_quota_history");
       } catch (_) {}
 
-      reportData = mergeLiveSubscription(reportData, event.payload);
+      reportData = mergeLiveSubscription(reportData, latestLiveQuotaReport);
       computeDetectedAgents(reportData, antigravityData);
       if (currentTab === "summary") {
         renderSummary();
@@ -232,7 +234,10 @@ async function initColdStart() {
     if (cached && (cached.summary || cached.antigravity)) {
       if (cached.antigravity) antigravityData = cached.antigravity;
       const selectedCache = periodCache[currentPeriod];
-      const startupSummary = selectedCache?.reportData || cached.summary;
+      const startupSummary = mergeLiveSubscription(
+        selectedCache?.reportData || cached.summary,
+        latestLiveQuotaReport,
+      );
       if (startupSummary) {
         reportData = startupSummary;
         fullReportData = startupSummary;
@@ -418,7 +423,7 @@ async function switchPeriod(newPeriod) {
   if (periodCache[currentPeriod]) {
     setTimelineLoading(false);
     const cached = periodCache[currentPeriod];
-    reportData = cached.reportData;
+    reportData = mergeLiveSubscription(cached.reportData, latestLiveQuotaReport);
     antigravityData = cached.antigravityData;
     computeDetectedAgents(reportData, antigravityData);
     renderHarnessTabs();
@@ -475,7 +480,7 @@ async function loadData(force = false) {
 
     if (!summaryRequestGate.isCurrent(requestGeneration) || currentPeriod !== cacheKey) return;
 
-    reportData = summary;
+    reportData = mergeLiveSubscription(summary, latestLiveQuotaReport);
     antigravityData = null;
     if (currentPeriod === "all" || !fullReportData) {
       fullReportData = summary;

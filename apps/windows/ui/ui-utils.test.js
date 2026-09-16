@@ -113,3 +113,12 @@ test("live quota refresh preserves the selected timeline usage", () => {
     subscription: { agents: [{ agent: "codex", window: { usedPercent: 25 } }] },
   });
 });
+
+test("live quota refresh waits for the first timeline report", () => {
+  const live = {
+    totals: { totalCost: 999 },
+    subscription: { agents: [{ agent: "codex", window: { usedPercent: 25 } }] },
+  };
+
+  assert.equal(mergeLiveSubscription(null, live), null);
+});
