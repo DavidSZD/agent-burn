@@ -29,7 +29,7 @@ import AppKit
     return Dictionary(
       uniqueKeysWithValues: [
         "cursor", "claude", "codex", "opencode", "openclaw", "droid", "pi", "gemini", "kimi", "amp",
-        "qwen",
+        "qwen", "hermes",
       ].compactMap { name in
         guard let url = bundle.url(forResource: name, withExtension: "png", subdirectory: "Brands"),
           let image = NSImage(contentsOf: url)
