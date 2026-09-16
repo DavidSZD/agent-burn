@@ -7,6 +7,9 @@ use std::{
     path::PathBuf,
 };
 
+const MAX_QUOTA_SAMPLES: usize = 50_000;
+const MAX_REPORT_JOURNAL_ENTRIES: usize = 500;
+
 pub fn get_data_dir() -> PathBuf {
     let base = env::var("LOCALAPPDATA")
         .map(PathBuf::from)
@@ -91,7 +94,14 @@ pub fn record_quota_sample(data: &Value) {
 }
 
 fn retained_quota_samples(samples: Vec<Value>) -> Vec<Value> {
-    samples
+    retain_latest(samples, MAX_QUOTA_SAMPLES)
+}
+
+fn retain_latest(mut values: Vec<Value>, maximum: usize) -> Vec<Value> {
+    if values.len() > maximum {
+        values.drain(..values.len() - maximum);
+    }
+    values
 }
 
 pub fn record_metrics_snapshot(data: &Value) {
@@ -172,6 +182,7 @@ fn save_report_cache_in(directory: &std::path::Path, data: &Value) -> Result<(),
         .unwrap_or_default();
     if journal.last() != Some(data) {
         journal.push(data.clone());
+        journal = retain_latest(journal, MAX_REPORT_JOURNAL_ENTRIES);
         fs::write(
             &journal_path,
             serde_json::to_vec_pretty(&journal).map_err(|error| error.to_string())?,
@@ -253,9 +264,12 @@ mod tests {
     }
 
     #[test]
-    fn quota_history_keeps_every_recorded_sample() {
+    fn quota_history_retains_only_the_latest_bounded_samples() {
         let samples = (0..10_001).map(|value| json!(value)).collect::<Vec<_>>();
-        assert_eq!(retained_quota_samples(samples).len(), 10_001);
+        let retained = retain_latest(samples, 10_000);
+        assert_eq!(retained.len(), 10_000);
+        assert_eq!(retained.first(), Some(&json!(1)));
+        assert_eq!(retained.last(), Some(&json!(10_000)));
     }
 
     #[test]

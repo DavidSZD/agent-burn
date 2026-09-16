@@ -111,7 +111,7 @@ impl PricingRegistry {
         }
 
         // 4. Correspondance de variantes (ex: gemini-3.8-flash-high -> gemini-3.8-flash)
-        for base in &[
+        let mut variant_bases = [
             "gemini-3.8-flash",
             "gemini-3.7-flash",
             "gemini-3.6-flash",
@@ -135,7 +135,9 @@ impl PricingRegistry {
             "claude-3-5-sonnet",
             "claude-sonnet-4-6",
             "claude-opus-4-6",
-        ] {
+        ];
+        variant_bases.sort_unstable_by_key(|base| std::cmp::Reverse(base.len()));
+        for base in &variant_bases {
             if stripped.starts_with(base) {
                 if let Some(&p) = self.entries.get(*base) {
                     return Some(p);
@@ -199,6 +201,18 @@ mod tests {
         assert_eq!(
             get_model_pricing("cursor-grok-4.6-medium"),
             PricingRegistry::global().find("vertex_ai/xai/grok-4.6")
+        );
+    }
+
+    #[test]
+    fn variant_matching_prefers_the_most_specific_model_name() {
+        assert_eq!(
+            get_model_pricing("gemini-2.5-flash-lite-preview-12-2026"),
+            get_model_pricing("gemini-2.5-flash-lite")
+        );
+        assert_eq!(
+            get_model_pricing("gpt-5.1-codex-mini-preview"),
+            get_model_pricing("gpt-5.1-codex-mini")
         );
     }
 }

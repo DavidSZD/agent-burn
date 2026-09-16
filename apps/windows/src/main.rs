@@ -33,7 +33,7 @@ fn main() {
                 let _ = win.set_focus();
             }
             let handle = app.handle();
-            let _ = tray::setup_tray(handle);
+            tray::setup_tray(handle)?;
             background::spawn_quota_collector(handle.clone());
             Ok(())
         })

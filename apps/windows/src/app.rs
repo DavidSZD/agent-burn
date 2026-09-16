@@ -47,7 +47,7 @@ impl AppSettings {
             .filter(|path| !path.is_empty());
         self.antigravity_ultra_price = self
             .antigravity_ultra_price
-            .filter(|price| matches!(*price as u64, 100 | 200));
+            .filter(|price| matches!(*price, 100.0 | 200.0));
         self
     }
 }
@@ -189,10 +189,11 @@ async fn execute_cli_json_inner(
     cmd.arg("--no-color");
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+    cmd.kill_on_drop(true);
 
-    let output = cmd
-        .output()
+    let output = tokio::time::timeout(std::time::Duration::from_secs(120), cmd.output())
         .await
+        .map_err(|_| "La CLI a dépassé le délai maximal de 120 secondes.".to_string())?
         .map_err(|e| format!("Impossible d'exécuter la CLI: {e}"))?;
 
     let stdout_str = String::from_utf8_lossy(&output.stdout);
@@ -236,11 +237,7 @@ async fn execute_cli_json_inner(
     Err(format!(
         "Format JSON invalide retourné par la CLI: contenu reçu ({} caractères): {}",
         trimmed.len(),
-        if trimmed.len() > 200 {
-            &trimmed[..200]
-        } else {
-            trimmed
-        }
+        trimmed.chars().take(200).collect::<String>()
     ))
 }
 
@@ -273,5 +270,24 @@ mod tests {
     #[test]
     fn missing_cli_never_falls_back_to_a_network_download() {
         assert!(cli_command(None).is_err());
+    }
+
+    #[test]
+    fn antigravity_ultra_price_accepts_only_exact_supported_prices() {
+        for price in [100.0, 200.0] {
+            let settings = AppSettings {
+                antigravity_ultra_price: Some(price),
+                ..AppSettings::default()
+            }
+            .normalized();
+            assert_eq!(settings.antigravity_ultra_price, Some(price));
+        }
+
+        let settings = AppSettings {
+            antigravity_ultra_price: Some(100.99),
+            ..AppSettings::default()
+        }
+        .normalized();
+        assert_eq!(settings.antigravity_ultra_price, None);
     }
 }

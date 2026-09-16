@@ -2,7 +2,7 @@ use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::time::sleep;
 
-use crate::app::{execute_cli_json_with_settings, resolve_cli_path_with_override, AppState};
+use crate::app::{resolve_cli_path_with_override, AppState};
 
 pub fn spawn_quota_collector(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
@@ -31,9 +31,7 @@ async fn collect_and_archive(app: &AppHandle) {
     };
     let cli = resolve_cli_path_with_override(settings.custom_cli_path.as_deref())
         .or_else(|| state.cli_path.clone());
-    if let Ok(data) =
-        execute_cli_json_with_settings(cli.as_deref(), &["summary", "--value"], &settings).await
-    {
+    if let Ok(data) = crate::commands::build_summary("all", &settings, cli.as_deref()).await {
         // Émission de l'événement vers l'UI
         let _ = app.emit("quotas_updated", &data);
 

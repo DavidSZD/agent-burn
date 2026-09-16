@@ -1,5 +1,5 @@
 use crate::pricing::get_model_pricing;
-use chrono::{DateTime, Datelike, Duration, Local, TimeZone, Utc};
+use chrono::{DateTime, Local, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -38,61 +38,7 @@ struct ProjectAccumulator {
 
 pub fn get_projects_usage(period_str: Option<&str>) -> Result<Value, String> {
     let period = period_str.unwrap_or("mtd");
-    let now = Utc::now();
-
-    // Déterminer la borne minimale temporelle selon la période
-    let (min_date, max_date): (Option<DateTime<Utc>>, Option<DateTime<Utc>>) = match period {
-        "today" => {
-            let local_now = Local::now();
-            let start_of_day = local_now
-                .date_naive()
-                .and_hms_opt(0, 0, 0)
-                .and_then(|naive| local_now.offset().from_local_datetime(&naive).single())
-                .map(|dt| dt.with_timezone(&Utc));
-            (start_of_day, None)
-        }
-        "yesterday" => {
-            let local_now = Local::now();
-            let today = local_now.date_naive();
-            let midnight = |date: chrono::NaiveDate| {
-                date.and_hms_opt(0, 0, 0)
-                    .and_then(|naive| local_now.offset().from_local_datetime(&naive).single())
-                    .map(|dt| dt.with_timezone(&Utc))
-            };
-            (midnight(today - Duration::days(1)), midnight(today))
-        }
-        "week" | "rtd" => (Some(now - Duration::days(7)), None),
-        "month" => (Some(now - Duration::days(30)), None),
-        "wtd" => {
-            let local_now = Local::now();
-            let date = local_now.date_naive()
-                - Duration::days(i64::from(local_now.weekday().num_days_from_monday()));
-            (
-                date.and_hms_opt(0, 0, 0)
-                    .and_then(|naive| local_now.offset().from_local_datetime(&naive).single())
-                    .map(|dt| dt.with_timezone(&Utc)),
-                None,
-            )
-        }
-        "mtd" => {
-            let local_now = Local::now();
-            let start_of_month =
-                chrono::NaiveDate::from_ymd_opt(local_now.year(), local_now.month(), 1)
-                    .and_then(|date| date.and_hms_opt(0, 0, 0))
-                    .and_then(|naive| local_now.offset().from_local_datetime(&naive).single())
-                    .map(|dt| dt.with_timezone(&Utc));
-            (start_of_month, None)
-        }
-        "ytd" => {
-            let local_now = Local::now();
-            let start = chrono::NaiveDate::from_ymd_opt(local_now.year(), 1, 1)
-                .and_then(|date| date.and_hms_opt(0, 0, 0))
-                .and_then(|naive| local_now.offset().from_local_datetime(&naive).single())
-                .map(|dt| dt.with_timezone(&Utc));
-            (start, None)
-        }
-        _ => (None, None),
-    };
+    let (min_date, max_date) = crate::antigravity::period_bounds(period, Local::now());
 
     let mut projects_map: HashMap<String, ProjectAccumulator> = HashMap::new();
 
@@ -118,7 +64,9 @@ pub fn get_projects_usage(period_str: Option<&str>) -> Result<Value, String> {
     }
 
     // Agrégation des sessions Google Antigravity (avec les coûts exacts LiteLLM déjà calculés)
-    if let Ok(agy) = crate::antigravity::get_antigravity_data(period_str) {
+    if let Ok(agy) =
+        crate::antigravity::get_antigravity_data_with_bounds(period, min_date, max_date)
+    {
         for s in agy.sessions {
             if s.project_path.starts_with("Projet général") {
                 continue;
@@ -457,6 +405,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires local Codex or Antigravity session data"]
     fn test_extract_projects_all() {
         let res = get_projects_usage(Some("all"));
         assert!(res.is_ok(), "L'extraction totale ne doit pas échouer");

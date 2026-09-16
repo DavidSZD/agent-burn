@@ -34,6 +34,7 @@ $cliBin = Join-Path $rootDir "rust\target\release\agent-burn.exe"
 if (-not (Test-Path $cliBin)) {
     Write-Host "==> Compilation du binaire natif agent-burn..." -ForegroundColor Cyan
     cargo build --manifest-path (Join-Path $rootDir "rust\Cargo.toml") --release --bin agent-burn
+    if ($LASTEXITCODE -ne 0) { throw "La compilation du CLI Agent Burn a échoué (code $LASTEXITCODE)." }
 }
 
 # 4. Préparation du sidecar CLI inclus dans chaque bundle Tauri
@@ -51,6 +52,7 @@ try {
     } else {
         npx --yes @tauri-apps/cli dev
     }
+    if ($LASTEXITCODE -ne 0) { throw "La commande Tauri a échoué (code $LASTEXITCODE)." }
 } finally {
     Pop-Location
 }

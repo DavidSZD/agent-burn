@@ -37,6 +37,21 @@ jobs:
       - name: Verify Windows build script
         shell: pwsh
         run: |
-          Test-Path "apps/windows/build.ps1"
-          Test-Path "apps/windows/Cargo.toml"
-          Test-Path "apps/windows/tauri.conf.json"
+          $required = @(
+            "apps/windows/build.ps1",
+            "apps/windows/Cargo.toml",
+            "apps/windows/tauri.conf.json"
+          )
+          $missing = $required | Where-Object { -not (Test-Path -LiteralPath $_) }
+          if ($missing) { throw "Missing required Windows files: $($missing -join ', ')" }
+
+      - name: Test Windows application
+        run: cargo test --manifest-path apps/windows/Cargo.toml
+
+      - name: Install workspace dependencies
+        run: |
+          corepack enable
+          pnpm install --frozen-lockfile
+
+      - name: Package Windows application
+        run: pnpm --dir apps/windows build

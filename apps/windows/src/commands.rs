@@ -2,6 +2,7 @@ use crate::app::{
     execute_cli_json_with_settings, resolve_cli_path_with_override, save_settings, AppSettings,
     AppState,
 };
+use std::path::Path;
 use tauri::State;
 
 #[tauri::command]
@@ -10,12 +11,7 @@ pub async fn get_summary(
     range: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<serde_json::Value, String> {
-    let mut args = vec!["summary", "--value"];
     let period_val = period.or(range).unwrap_or_else(|| "all".to_string());
-    if period_val != "all" && !period_val.is_empty() {
-        args.push(&period_val);
-    }
-
     let settings = state
         .settings
         .read()
@@ -23,15 +19,27 @@ pub async fn get_summary(
         .clone();
     let cli = resolve_cli_path_with_override(settings.custom_cli_path.as_deref())
         .or_else(|| state.cli_path.clone());
-    let mut summary = execute_cli_json_with_settings(cli.as_deref(), &args, &settings).await?;
-    if let Ok(mut antigravity) = crate::antigravity::get_antigravity_data(Some(&period_val)) {
+    build_summary(&period_val, &settings, cli.as_deref()).await
+}
+
+pub(crate) async fn build_summary(
+    period: &str,
+    settings: &AppSettings,
+    cli: Option<&Path>,
+) -> Result<serde_json::Value, String> {
+    let mut args = vec!["summary", "--value"];
+    if period != "all" && !period.is_empty() {
+        args.push(period);
+    }
+    let mut summary = execute_cli_json_with_settings(cli, &args, settings).await?;
+    if let Ok(mut antigravity) = crate::antigravity::get_antigravity_data(Some(period)) {
         if let Some(plan) = antigravity.plan.as_mut() {
             plan.price_per_month = crate::antigravity::antigravity_plan_price(
                 &plan.plan,
                 settings.antigravity_ultra_price,
             );
         }
-        merge_antigravity(&mut summary, &antigravity);
+        merge_antigravity(&mut summary, &antigravity)?;
     }
     Ok(summary)
 }
@@ -39,9 +47,12 @@ pub async fn get_summary(
 fn merge_antigravity(
     summary: &mut serde_json::Value,
     data: &crate::antigravity::AntigravitySummary,
-) {
+) -> Result<(), String> {
     if data.session_count == 0 && data.plan.is_none() {
-        return;
+        return Ok(());
+    }
+    if !summary.is_object() {
+        return Err("Le résumé CLI doit être un objet JSON.".to_string());
     }
     let models = data
         .top_models
@@ -169,6 +180,9 @@ fn merge_antigravity(
         });
     }
     if let Some(plan) = &data.plan {
+        let root = summary
+            .as_object_mut()
+            .ok_or_else(|| "Le résumé CLI doit être un objet JSON.".to_string())?;
         let limiting = plan
             .quotas
             .iter()
@@ -184,7 +198,6 @@ fn merge_antigravity(
                 "resetDate": quota.reset_time,
             })),
         });
-        let root = summary.as_object_mut().expect("summary JSON object");
         let subscriptions = root
             .entry("subscription")
             .or_insert_with(|| serde_json::json!({"agents": []}));
@@ -197,6 +210,7 @@ fn merge_antigravity(
             agents.push(subscription);
         }
     }
+    Ok(())
 }
 
 #[tauri::command]
@@ -338,7 +352,7 @@ mod tests {
             plan: None,
         };
 
-        merge_antigravity(&mut summary, &antigravity);
+        merge_antigravity(&mut summary, &antigravity).expect("merge summary");
 
         assert_eq!(summary["agents"][0]["agent"], "antigravity");
         assert_eq!(summary["agents"][0]["tokenBreakdown"]["cacheRead"], 15);
@@ -348,5 +362,25 @@ mod tests {
         assert_eq!(summary["totals"]["totalTokens"], 40);
         assert_eq!(summary["models"][0]["model"], "gemini-test");
         assert_eq!(summary["daily"][0]["tokens"], 30);
+    }
+
+    #[test]
+    fn antigravity_merge_rejects_a_non_object_summary() {
+        let mut summary = serde_json::json!([]);
+        let antigravity = crate::antigravity::AntigravitySummary {
+            period: "all".into(),
+            session_count: 1,
+            total_tokens: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            total_cost: 0.0,
+            top_models: vec![],
+            sessions: vec![],
+            daily: vec![],
+            plan: None,
+        };
+
+        assert!(merge_antigravity(&mut summary, &antigravity).is_err());
     }
 }

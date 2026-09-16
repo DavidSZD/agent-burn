@@ -321,7 +321,7 @@ function renderHarnessTabs() {
 
     const moreBtn = document.createElement("button");
     moreBtn.className = "more-dropdown-btn" + (isOverflowActive ? " active" : "");
-    moreBtn.innerHTML = (isOverflowActive ? getAgentDisplayName(currentTab) : "More") + " ▾";
+    moreBtn.textContent = (isOverflowActive ? getAgentDisplayName(currentTab) : "More") + " ▾";
 
     const moreMenu = document.createElement("div");
     moreMenu.className = "more-menu";

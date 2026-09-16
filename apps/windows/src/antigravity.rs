@@ -75,7 +75,14 @@ pub struct AntigravitySummary {
 pub fn get_antigravity_data(period_str: Option<&str>) -> Result<AntigravitySummary, String> {
     let period = period_str.unwrap_or("mtd");
     let (min_date, max_date) = period_bounds(period, Local::now());
+    get_antigravity_data_with_bounds(period, min_date, max_date)
+}
 
+pub(crate) fn get_antigravity_data_with_bounds(
+    period: &str,
+    min_date: Option<DateTime<Utc>>,
+    max_date: Option<DateTime<Utc>>,
+) -> Result<AntigravitySummary, String> {
     let home = std::env::var("USERPROFILE")
         .ok()
         .map(PathBuf::from)
@@ -330,7 +337,7 @@ fn parse_conversation_db(
     })
 }
 
-fn period_bounds(
+pub(crate) fn period_bounds(
     period: &str,
     local_now: DateTime<Local>,
 ) -> (Option<DateTime<Utc>>, Option<DateTime<Utc>>) {
