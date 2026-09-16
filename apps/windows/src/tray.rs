@@ -6,7 +6,8 @@ use tauri::{
 
 pub fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     let show_item = MenuItem::with_id(app, "show", "Afficher Agent Burn", true, None::<&str>)?;
-    let refresh_item = MenuItem::with_id(app, "refresh", "Actualiser les données", true, None::<&str>)?;
+    let refresh_item =
+        MenuItem::with_id(app, "refresh", "Actualiser les données", true, None::<&str>)?;
     let quit_item = MenuItem::with_id(app, "quit", "Quitter", true, None::<&str>)?;
 
     let menu = Menu::with_items(app, &[&show_item, &refresh_item, &quit_item])?;
@@ -36,24 +37,24 @@ pub fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
             }
             _ => {}
         })
-        .on_tray_icon_event(|tray, event| {
-            if let TrayIconEvent::Click {
+        .on_tray_icon_event(|tray, event| match event {
+            TrayIconEvent::Click {
                 button: MouseButton::Left,
                 button_state: MouseButtonState::Up,
                 ..
-            } = event
-            {
+            }
+            | TrayIconEvent::DoubleClick {
+                button: MouseButton::Left,
+                ..
+            } => {
                 let app = tray.app_handle();
                 if let Some(window) = app.get_webview_window("main") {
-                    if window.is_visible().unwrap_or(false) {
-                        let _ = window.hide();
-                    } else {
-                        let _ = window.unminimize();
-                        let _ = window.show();
-                        let _ = window.set_focus();
-                    }
+                    let _ = window.unminimize();
+                    let _ = window.show();
+                    let _ = window.set_focus();
                 }
             }
+            _ => {}
         })
         .build(app)?;
 

@@ -36,7 +36,13 @@ if (-not (Test-Path $cliBin)) {
     cargo build --manifest-path (Join-Path $rootDir "rust\Cargo.toml") --release --bin agent-burn
 }
 
-# 4. Compilation de l'application Tauri
+# 4. Préparation du sidecar CLI inclus dans chaque bundle Tauri
+$resourcesDir = Join-Path $PSScriptRoot "resources"
+$bundledCli = Join-Path $resourcesDir "agent-burn.exe"
+New-Item -ItemType Directory -Force -Path $resourcesDir | Out-Null
+Copy-Item -LiteralPath $cliBin -Destination $bundledCli -Force
+
+# 5. Compilation de l'application Tauri
 Write-Host "==> Lancement de l'application Tauri Windows..." -ForegroundColor Cyan
 Push-Location $PSScriptRoot
 try {

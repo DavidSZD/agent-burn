@@ -1,8 +1,8 @@
 use std::time::Duration;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use tokio::time::sleep;
 
-use crate::app::{execute_cli_json, resolve_cli_path};
+use crate::app::{execute_cli_json_with_settings, resolve_cli_path_with_override, AppState};
 
 pub fn spawn_quota_collector(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
@@ -11,15 +11,29 @@ pub fn spawn_quota_collector(app: AppHandle) {
         collect_and_archive(&app).await;
 
         loop {
-            sleep(Duration::from_secs(60)).await;
+            let minutes = app
+                .state::<AppState>()
+                .settings
+                .read()
+                .map(|settings| settings.refresh_minutes)
+                .unwrap_or(1);
+            sleep(Duration::from_secs(minutes.max(1) * 60)).await;
             collect_and_archive(&app).await;
         }
     });
 }
 
 async fn collect_and_archive(app: &AppHandle) {
-    let cli = resolve_cli_path();
-    if let Ok(data) = execute_cli_json(cli.as_deref(), &["summary", "--value"]).await {
+    let state = app.state::<AppState>();
+    let settings = match state.settings.read() {
+        Ok(settings) => settings.clone(),
+        Err(_) => return,
+    };
+    let cli = resolve_cli_path_with_override(settings.custom_cli_path.as_deref())
+        .or_else(|| state.cli_path.clone());
+    if let Ok(data) =
+        execute_cli_json_with_settings(cli.as_deref(), &["summary", "--value"], &settings).await
+    {
         // Émission de l'événement vers l'UI
         let _ = app.emit("quotas_updated", &data);
 
@@ -36,7 +50,11 @@ async fn collect_and_archive(app: &AppHandle) {
         if let Some(agents) = sub_agents {
             for a in agents {
                 let name = a.get("agent").and_then(|v| v.as_str()).unwrap_or("");
-                if let Some(used_pct) = a.get("window").and_then(|win| win.get("usedPercent")).and_then(|u| u.as_f64()) {
+                if let Some(used_pct) = a
+                    .get("window")
+                    .and_then(|win| win.get("usedPercent"))
+                    .and_then(|u| u.as_f64())
+                {
                     let remaining = (100.0f64 - used_pct).max(0.0f64);
                     parts.push(format!("{}: {:.0}%", name, remaining));
                 }

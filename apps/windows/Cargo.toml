@@ -1,6 +1,6 @@
 [package]
 name = "agent-burn-windows"
-version = "20.0.20"
+version = "0.1.13"
 description = "Agent Burn Windows Desktop Application"
 edition = "2021"
 
@@ -12,6 +12,7 @@ serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "process"] }
 winreg = "0.52"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+sqlite = { version = "0.37.0", default-features = false, features = ["bundled", "linkage"] }
 
 [build-dependencies]
-tauri-build = { version = "2", default-features = false }
+tauri-build = { version = "2", default-features = false , features = [] }

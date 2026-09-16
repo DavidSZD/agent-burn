@@ -54,3 +54,5 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 
 # Binaires Windows
 *.exe
+!apps/windows/resources/
+!apps/windows/resources/.gitkeep

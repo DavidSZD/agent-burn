@@ -1,4 +1,18 @@
-// Pont IPC direct Tauri v2 (aucune fausse donnée de test)
+import { RequestGate } from "./request-gate.js";
+import {
+  escapeHtml,
+  getRestoredPeriod,
+  shouldShowTimelineLoading,
+  timelineStartDate,
+  shouldShowAntigravityUltraSetting,
+  quotaPresentation,
+  subscriptionPresentation,
+  visibleTokenBreakdownEntries,
+} from "./ui-utils.js";
+
+// Agent Burn Windows - Client Web / Tauri v2
+// Interface fidèle à 100% à la version originale macOS
+
 function getInvoke() {
   if (window.__TAURI__?.core?.invoke) {
     return window.__TAURI__.core.invoke;
@@ -17,1431 +31,1956 @@ async function invokeTauri(cmd, args = {}) {
   return await inv(cmd, args);
 }
 
-let currentPeriod = "mtd";
+function showStatusError(message) {
+  const footer = document.getElementById("footer-status-text");
+  if (footer) footer.textContent = message;
+}
+
+function getListen() {
+  return window.__TAURI__?.event?.listen || null;
+}
+
+// État de l'application
+let currentPeriod = "all"; // "All time" par défaut comme sur les captures macOS
 let currentTab = "summary";
 let reportData = null;
-let projectsData = null;
+let fullReportData = null;
+let antigravityData = null;
+let quotaHistoryData = null;
+let currentSpendGranularity = "monthly"; // "Monthly" actif par défaut sur les captures
+let detectedAgents = [];
+const allKnownAgents = new Set();
+let lastUpdatedTime = Date.now();
+let appSettings = null;
 const periodCache = {};
 const harnessCache = {};
-const projectsCache = {};
-let debouncePeriodTimer = null;
+const summaryRequestGate = new RequestGate();
 
-function getPeriodLabel(p) {
-  switch (p) {
-    case "today":
-      return "Aujourd'hui";
-    case "week":
-      return "7 derniers jours";
-    case "mtd":
-      return "Ce mois-ci";
-    case "all":
-      return "Tout l'historique";
+// Libellés des périodes (alignés avec UsagePeriod de macOS)
+const PERIOD_LABELS = {
+  all: "All time",
+  today: "Today",
+  yesterday: "Yesterday",
+  rtd: "Reset to date",
+  wtd: "Week to date",
+  mtd: "This month",
+  week: "Last 7 days",
+  month: "Last 30 days",
+  ytd: "Year to date",
+};
+
+// Formattage des nombres façon macOS (compact : 46.01B, 15.42M, 994.0K)
+function formatCompactTokens(num) {
+  if (!num || num === 0) return "0";
+  const n = Number(num);
+  if (n >= 1e9) return (n / 1e9).toFixed(2) + "B";
+  if (n >= 1e6) return (n / 1e6).toFixed(2) + "M";
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + "K";
+  return n.toLocaleString();
+}
+
+function formatCurrency(num) {
+  const n = Number(num) || 0;
+  return "$" + n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+function formatTokensPerDollar(tokens, cost) {
+  if (!cost || cost <= 0 || !tokens || tokens <= 0) return "—";
+  const tpd = tokens / cost;
+  if (tpd >= 1e6) return (tpd / 1e6).toFixed(1) + "M / $";
+  if (tpd >= 1e3) return (tpd / 1e3).toFixed(1) + "K / $";
+  return Math.round(tpd) + " / $";
+}
+
+function getAgentColor(agent) {
+  switch ((agent || "").toLowerCase()) {
+    case "codex":
+      return "#22c55e"; // Vert vif OpenAI Codex
+    case "claude":
+      return "#f97316"; // Orange terracotta Claude
+    case "cursor":
+      return "#a855f7"; // Violet Cursor
+    case "antigravity":
+      return "#06b6d4"; // Cyan Google Antigravity
+    case "hermes":
+      return "#ec4899"; // Rose vif Nous Research Hermes
+    case "opencode":
+      return "#3b82f6";
     default:
-      return p || "Période";
+      return "#38bdf8";
   }
 }
 
+function getAgentBrandIcon(agent) {
+  const a = (agent || "").toLowerCase();
+  switch (a) {
+    case "codex":
+      return "brands/codex.png";
+    case "claude":
+      return "brands/claude.png";
+    case "cursor":
+      return "brands/cursor.png";
+    case "antigravity":
+      return "brands/antigravity.png";
+    case "gemini":
+      return "brands/gemini.png";
+    case "hermes":
+      return "brands/hermes.png";
+    case "opencode":
+      return "brands/opencode.png";
+    case "openclaw":
+      return "brands/openclaw.png";
+    case "pi":
+      return "brands/pi.png";
+    case "kimi":
+      return "brands/kimi.png";
+    case "qwen":
+      return "brands/qwen.png";
+    case "amp":
+      return "brands/amp.png";
+    default:
+      return "brands/gemini.png";
+  }
+}
 
-// Initialisation
+function getAgentDisplayName(agent) {
+  const a = (agent || "").toLowerCase();
+  switch (a) {
+    case "codex":
+      return "Codex";
+    case "claude":
+      return "Claude Code";
+    case "cursor":
+      return "Cursor";
+    case "antigravity":
+      return "Antigravity";
+    case "gemini":
+      return "Gemini";
+    case "hermes":
+      return "Hermes";
+    case "opencode":
+      return "OpenCode";
+    case "openclaw":
+      return "OpenClaw";
+    case "pi":
+      return "Pi";
+    default:
+      return agent.charAt(0).toUpperCase() + agent.slice(1);
+  }
+}
+
+// ==========================================================================
+// Initialisation au chargement
+// ==========================================================================
 window.addEventListener("DOMContentLoaded", async () => {
-  initTabs();
+  const savedPeriod = localStorage.getItem("agent-burn-period");
+  currentPeriod = getRestoredPeriod(savedPeriod, Object.keys(PERIOD_LABELS));
   initPeriods();
   initRefresh();
-  initSearch();
-  initCustomization();
-  initTauriEvents();
-  initAutostart();
-  initDataFolder();
+  initSettings();
+  initFooterTimer();
+  initBackendEvents();
 
-
-  // Démarrage instantané (0 ms) via le cache disque report-cache.json
+  // Démarrage rapide avec le cache
   await initColdStart();
-
-  await checkCliStatus();
-  await loadData();
+  // Chargement frais en direct
+  await loadData(false);
+  // Fill every timeline cache without changing the currently visible period.
+  void preloadTimelines();
 });
 
+function initBackendEvents() {
+  const listen = getListen();
+  if (!listen) return;
+  listen("refresh_requested", async () => {
+    for (const key in periodCache) delete periodCache[key];
+    await loadData(true);
+  });
+  listen("quotas_updated", (event) => {
+    // The collector already performed a full CLI scan. Reuse its payload for
+    // the lightweight quota indicator instead of immediately scanning again.
+    if (event?.payload) updateTopBarQuotaPill(event.payload);
+  });
+}
+
+// Cache au démarrage (0 ms)
 async function initColdStart() {
   try {
     const cached = await invokeTauri("get_report_cache");
-    if (cached && (cached.summary || cached.projects || cached.antigravity)) {
-      if (cached.antigravity) {
-        antigravityData = cached.antigravity;
-        antigravityCache[currentPeriod] = cached.antigravity;
-      }
-      if (cached.summary) {
-        reportData = cached.summary;
-        periodCache[currentPeriod] = cached.summary;
+    if (cached?.periods && typeof cached.periods === "object") {
+      Object.assign(periodCache, cached.periods);
+    }
+    if (cached?.currentPeriod) {
+      currentPeriod = getRestoredPeriod(cached.currentPeriod, Object.keys(PERIOD_LABELS));
+    }
+    if (cached && (cached.summary || cached.antigravity)) {
+      if (cached.antigravity) antigravityData = cached.antigravity;
+      const selectedCache = periodCache[currentPeriod];
+      const startupSummary = selectedCache?.reportData || cached.summary;
+      if (startupSummary) {
+        reportData = startupSummary;
+        fullReportData = startupSummary;
+        computeDetectedAgents(reportData, antigravityData);
+        renderHarnessTabs();
         renderSummary();
       }
-      if (cached.projects) {
-        projectsData = cached.projects;
-        projectsCache[currentPeriod] = cached.projects;
-        renderProjectsView(cached.projects);
-      }
-      const statusBar = document.getElementById("status-text");
-      if (statusBar) statusBar.textContent = "⚡ Prêt immédiatement (actualisation en fond...)";
     }
   } catch (e) {
-    console.debug("Aucun cache disque initial disponible", e);
+    console.debug("Pas de cache disponible au démarrage", e);
   }
 }
 
-function initTabs() {
-  document.querySelectorAll(".tab-btn").forEach((btn) => {
-    btn.addEventListener("click", async () => {
-      document.querySelectorAll(".tab-btn").forEach((b) => b.classList.remove("active"));
-      document.querySelectorAll(".view-panel").forEach((p) => p.classList.remove("active"));
-
-      btn.classList.add("active");
-      currentTab = btn.dataset.tab;
-
-      // S'assurer que les boutons de timeline reflètent toujours la période active
-      document.querySelectorAll(".period-btn").forEach((b) => {
-        b.classList.toggle("active", b.dataset.period === currentPeriod);
+async function preloadTimelines() {
+  for (const period of Object.keys(PERIOD_LABELS)) {
+    if (periodCache[period]) continue;
+    try {
+      const summary = await invokeTauri("get_summary", { range: period === "all" ? null : period });
+      periodCache[period] = {
+        reportData: JSON.parse(JSON.stringify(summary)),
+        antigravityData: null,
+      };
+      await invokeTauri("save_report_cache", {
+        data: { summary: reportData, periods: periodCache, currentPeriod },
       });
-
-      if (currentTab === "summary") {
-        document.getElementById("view-summary").classList.add("active");
-        if (fullReportData) {
-          reportData = sliceSummaryData(fullReportData, currentPeriod);
-          periodCache[currentPeriod] = reportData;
-        }
-        if (reportData) {
-          renderSummary();
-        } else {
-          await loadData();
-        }
-      } else if (currentTab === "projects") {
-        document.getElementById("view-projects").classList.add("active");
-        await loadProjects();
-      } else if (currentTab === "antigravity") {
-        document.getElementById("view-antigravity").classList.add("active");
-        await loadAntigravity();
-      } else if (currentTab === "settings") {
-        document.getElementById("view-settings").classList.add("active");
-      } else {
-        document.getElementById("view-harness").classList.add("active");
-        renderHarnessView(currentTab);
-      }
-    });
-  });
+    } catch (error) {
+      // A missing source for one period must not prevent the other periods loading.
+      console.debug(`Unable to preload ${period}`, error);
+    }
+  }
 }
 
+// ==========================================================================
+// Détection stricte des harnais : conservation des harnais connus façon macOS
+// ==========================================================================
+function computeDetectedAgents(summary, agy) {
+  if (summary && summary.agents && Array.isArray(summary.agents)) {
+    for (const a of summary.agents) {
+      const hasTokens = (a.totalTokens || 0) > 0;
+      const hasCost = (a.totalCost || 0) > 0;
+      const hasModels = a.models && a.models.length > 0;
+      if (hasTokens || hasCost || hasModels) {
+        allKnownAgents.add(a.agent.toLowerCase());
+      }
+    }
+  }
+
+  // Vérifier aussi les abonnements avec quota actif
+  if (summary && summary.subscription && Array.isArray(summary.subscription.agents)) {
+    for (const sub of summary.subscription.agents) {
+      if (sub.liveLimits || sub.window != null) {
+        allKnownAgents.add(sub.agent.toLowerCase());
+      }
+    }
+  }
+
+  // Google Antigravity
+  if (agy && ((agy.total_tokens || 0) > 0 || (agy.total_cost || 0) > 0 || (agy.session_count || 0) > 0)) {
+    allKnownAgents.add("antigravity");
+  }
+
+  detectedAgents = Array.from(allKnownAgents).sort();
+}
+
+// ==========================================================================
+// Rendu dynamique des onglets (HarnessTabs) façon macOS avec menu More ▾
+// ==========================================================================
+function renderHarnessTabs() {
+  const container = document.getElementById("harness-tabs");
+  if (!container) return;
+
+  container.innerHTML = "";
+
+  // 1. Onglet permanent : General
+  const generalBtn = document.createElement("button");
+  generalBtn.className = "harness-tab" + (currentTab === "summary" ? " active" : "");
+  generalBtn.dataset.tab = "summary";
+  generalBtn.textContent = "General";
+  generalBtn.addEventListener("click", () => switchTab("summary"));
+  container.appendChild(generalBtn);
+
+  // 2. Les agents détectés sous forme d'onglets directs (jusqu'à 8 pour inclure tous les agents actifs)
+  const maxDirectTabs = 8;
+  const directAgents = detectedAgents.slice(0, maxDirectTabs);
+  const overflowAgents = detectedAgents.slice(maxDirectTabs);
+
+  directAgents.forEach((agent) => {
+    const btn = document.createElement("button");
+    btn.className = "harness-tab" + (currentTab === agent ? " active" : "");
+    btn.dataset.tab = agent;
+    btn.textContent = getAgentDisplayName(agent);
+    btn.addEventListener("click", () => switchTab(agent));
+    container.appendChild(btn);
+  });
+
+  // 3. Dropdown "More ▾" si d'autres agents détectés existent
+  if (overflowAgents.length > 0) {
+    const moreWrap = document.createElement("div");
+    moreWrap.className = "more-dropdown-wrap";
+
+    const isOverflowActive = overflowAgents.includes(currentTab);
+
+    const moreBtn = document.createElement("button");
+    moreBtn.className = "more-dropdown-btn" + (isOverflowActive ? " active" : "");
+    moreBtn.innerHTML = (isOverflowActive ? getAgentDisplayName(currentTab) : "More") + " ▾";
+
+    const moreMenu = document.createElement("div");
+    moreMenu.className = "more-menu";
+
+    overflowAgents.forEach((agent) => {
+      const item = document.createElement("button");
+      item.className = "more-menu-item";
+      item.textContent = getAgentDisplayName(agent);
+      item.addEventListener("click", (e) => {
+        e.stopPropagation();
+        moreMenu.classList.remove("open");
+        switchTab(agent);
+      });
+      moreMenu.appendChild(item);
+    });
+
+    moreBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      moreMenu.classList.toggle("open");
+    });
+
+    document.addEventListener("click", () => {
+      moreMenu.classList.remove("open");
+    });
+
+    moreWrap.appendChild(moreBtn);
+    moreWrap.appendChild(moreMenu);
+    container.appendChild(moreWrap);
+  }
+}
+
+function switchTab(tabId) {
+  currentTab = tabId;
+
+  // Mise à jour de la classe active sur les onglets
+  renderHarnessTabs();
+
+  // Masquer tous les panneaux
+  document.querySelectorAll(".view-panel").forEach((p) => p.classList.remove("active"));
+
+  if (tabId === "summary") {
+    document.getElementById("view-summary")?.classList.add("active");
+    renderSummary();
+  } else if (tabId === "settings") {
+    document.getElementById("view-settings")?.classList.add("active");
+    renderSettings();
+  } else {
+    document.getElementById("view-harness")?.classList.add("active");
+    renderHarnessView(tabId);
+  }
+}
+
+// ==========================================================================
+// Gestion de la timeline (Sélecteur de période façon macOS & 0 ms switcher)
+// ==========================================================================
 function initPeriods() {
-  document.querySelectorAll(".period-btn").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      document.querySelectorAll(".period-btn").forEach((b) => b.classList.remove("active"));
-      btn.classList.add("active");
-      currentPeriod = btn.dataset.period;
+  const summarySelect = document.getElementById("summary-period-select");
+  if (summarySelect) {
+    summarySelect.value = currentPeriod;
+    summarySelect.addEventListener("change", async (e) => {
+      await switchPeriod(e.target.value);
+    });
+  }
+}
 
-      // 1. Découpage instantané en 0 ms si données en mémoire
-      if (fullReportData) {
-        reportData = sliceSummaryData(fullReportData, currentPeriod);
-        periodCache[currentPeriod] = reportData;
+async function switchPeriod(newPeriod) {
+  currentPeriod = newPeriod;
+  localStorage.setItem("agent-burn-period", currentPeriod);
+
+  // Mise à jour de tous les dropdowns de l'interface
+  const sSelect = document.getElementById("summary-period-select");
+  if (sSelect) sSelect.value = currentPeriod;
+  const hSelect = document.getElementById("harness-period-select");
+  if (hSelect) hSelect.value = currentPeriod;
+
+  // Si déjà en cache, affichage immédiat en 0 ms
+  if (periodCache[currentPeriod]) {
+    setTimelineLoading(false);
+    const cached = periodCache[currentPeriod];
+    reportData = cached.reportData;
+    antigravityData = cached.antigravityData;
+    computeDetectedAgents(reportData, antigravityData);
+    renderHarnessTabs();
+    if (currentTab === "summary") renderSummary();
+    else if (currentTab !== "settings") renderHarnessView(currentTab);
+    return;
+  }
+
+  if (shouldShowTimelineLoading(periodCache, currentPeriod)) setTimelineLoading(true);
+  await loadData(true);
+}
+
+function setTimelineLoading(loading) {
+  const viewId = currentTab === "summary" ? "view-summary" : "view-harness";
+  const view = document.getElementById(viewId);
+  if (!view) return;
+  view.classList.toggle("timeline-loading", loading);
+  view.setAttribute("aria-busy", String(loading));
+  let overlay = view.querySelector(":scope > .timeline-loading-overlay");
+  if (loading && !overlay) {
+    overlay = document.createElement("div");
+    overlay.className = "timeline-loading-overlay";
+    overlay.innerHTML = '<span class="timeline-spinner" aria-hidden="true"></span><span>Loading this timeline…</span>';
+    view.appendChild(overlay);
+  } else if (!loading) {
+    overlay?.remove();
+  }
+}
+
+// ==========================================================================
+// Chargement principal des données CLI
+// ==========================================================================
+async function loadData(force = false) {
+  const cacheKey = currentPeriod;
+  const requestGeneration = summaryRequestGate.begin();
+  if (!force && periodCache[cacheKey]) {
+    const cached = periodCache[cacheKey];
+    reportData = cached.reportData;
+    antigravityData = cached.antigravityData;
+    computeDetectedAgents(reportData, antigravityData);
+    renderHarnessTabs();
+    if (currentTab === "summary") renderSummary();
+    else if (currentTab !== "settings") renderHarnessView(currentTab);
+    return;
+  }
+
+  try {
+    // 1. Récupération du résumé CLI
+    const args = currentPeriod === "all" ? [] : [currentPeriod];
+    const summary = await invokeTauri("get_summary", { range: args.length > 0 ? args[0] : null });
+
+    if (!summaryRequestGate.isCurrent(requestGeneration) || currentPeriod !== cacheKey) return;
+
+    reportData = summary;
+    antigravityData = null;
+    if (currentPeriod === "all" || !fullReportData) {
+      fullReportData = summary;
+    }
+    lastUpdatedTime = Date.now();
+
+    // Antigravity est déjà normalisé dans le rapport standard par le backend Rust.
+    periodCache[cacheKey] = {
+      reportData: JSON.parse(JSON.stringify(reportData)),
+      antigravityData: null,
+    };
+
+    // 4. Calcul strict des harnais détectés
+    computeDetectedAgents(reportData, antigravityData);
+
+    // 5. Mise à jour de la pilule de quota dans la barre supérieure
+    updateTopBarQuotaPill(reportData);
+
+    // 6. Rendu de l'UI
+    renderHarnessTabs();
+
+    if (currentTab === "summary") {
+      renderSummary();
+    } else if (currentTab === "settings") {
+      renderSettings();
+    } else {
+      renderHarnessView(currentTab);
+    }
+
+    // Sauvegarde en cache disque
+    invokeTauri("save_report_cache", {
+      data: { summary: reportData, periods: periodCache, currentPeriod },
+    }).catch((error) => showStatusError(`Unable to save report cache: ${error}`));
+
+  } catch (err) {
+    showStatusError(`Unable to load usage: ${err}`);
+  } finally {
+    if (summaryRequestGate.isCurrent(requestGeneration)) setTimelineLoading(false);
+  }
+}
+
+// Mise à jour de la pilule de quota dans le header
+function updateTopBarQuotaPill(data) {
+  const pillText = document.getElementById("quota-pill-text");
+  const dot = document.querySelector("#quota-menu-pill .quota-dot");
+  if (!pillText) return;
+
+  const agents = data?.subscription?.agents || [];
+  const quotaSource = appSettings?.quotaSource || "codex";
+  const selectedAgent = agents.find((agent) => agent.agent === quotaSource);
+
+  if (selectedAgent && selectedAgent.window) {
+    const used = selectedAgent.window.usedPercent || 0;
+    const remaining = Math.max(0, 100 - used);
+    pillText.textContent = `${remaining.toFixed(0)}% · live`;
+    if (dot) dot.className = "quota-dot live";
+  } else {
+    pillText.textContent = "Quota tracker";
+    if (dot) dot.className = "quota-dot";
+  }
+}
+
+// ==========================================================================
+// Rendu de la vue "General" (All harnesses)
+// ==========================================================================
+function renderSummary() {
+  if (!reportData) return;
+
+  // 1. Sous-titre de période
+  const periodLabel = PERIOD_LABELS[currentPeriod] || "All time";
+  document.querySelectorAll(".period-subtitle").forEach((el) => {
+    el.textContent = periodLabel;
+  });
+
+  const select = document.getElementById("summary-period-select");
+  if (select) select.value = currentPeriod;
+
+  // 2. Les 4 Cartes de métriques
+  const totals = reportData.totals || {};
+  const cost = totals.totalCost || 0;
+  const tokens = totals.totalTokens || 0;
+  const models = reportData.models || [];
+
+  const spendEl = document.getElementById("summary-metric-spend");
+  const tokensEl = document.getElementById("summary-metric-tokens");
+  const tpdEl = document.getElementById("summary-metric-tokens-dollar");
+  const modelsEl = document.getElementById("summary-metric-models");
+
+  if (spendEl) spendEl.textContent = formatCurrency(cost);
+  if (tokensEl) tokensEl.textContent = formatCompactTokens(tokens);
+  if (tpdEl) tpdEl.textContent = formatTokensPerDollar(tokens, cost);
+  if (modelsEl) modelsEl.textContent = models.length.toString();
+
+  // 3. Configuration intelligente et écouteurs de granularité (Daily | Weekly | Monthly)
+  setupGranularityPicker(
+    "summary-granularity",
+    "summary-activity-svg",
+    "summary-chart-title",
+    reportData.daily || [],
+    null
+  );
+  renderActivityChart(
+    "summary-activity-svg",
+    "summary-chart-title",
+    reportData.daily || [],
+    null // null = couleur multi-agents
+  );
+
+  // 4. Liste "By harness"
+  renderByHarnessList();
+
+  // 5. Tableau des modèles
+  renderModelsTable(models, cost, "summary-models-tbody", "summary-models-count", "summary-filter-input");
+
+  // 6. Abonnements
+  renderSubscriptions();
+}
+
+// Rendu de la liste By harness
+function renderByHarnessList() {
+  const container = document.getElementById("by-harness-list");
+  if (!container) return;
+
+  container.innerHTML = "";
+
+  const agents = (reportData?.agents || []).filter((a) => {
+    return (a.totalCost || 0) > 0 || (a.totalTokens || 0) > 0;
+  });
+
+  if (agents.length === 0) {
+    container.innerHTML = `<div style="color: var(--text-muted); font-size: 12px; padding: 12px;">No active harnesses in this period.</div>`;
+    return;
+  }
+
+  agents.forEach((a) => {
+    const row = document.createElement("div");
+    row.className = "by-harness-row";
+    row.innerHTML = `
+      <div class="by-harness-row-left">
+        <img class="by-harness-icon" src="${getAgentBrandIcon(a.agent)}" alt="${escapeHtml(a.agent)}" />
+        <div class="by-harness-info">
+          <span class="by-harness-name">${escapeHtml(getAgentDisplayName(a.agent))}</span>
+          <span class="by-harness-tokens">${formatCompactTokens(a.totalTokens)} tokens</span>
+        </div>
+      </div>
+      <span class="by-harness-spend">${formatCurrency(a.totalCost)}</span>
+    `;
+
+    // Cliquer sur un harnais bascule instantanément sur l'onglet de cet agent
+    row.addEventListener("click", () => {
+      switchTab(a.agent.toLowerCase());
+    });
+
+    container.appendChild(row);
+  });
+}
+
+// ==========================================================================
+// Rendu de la vue d'un Agent Spécifique (Codex, Cursor, etc.)
+// ==========================================================================
+function renderHarnessView(agent) {
+  const container = document.getElementById("harness-view-content");
+  if (!container || !reportData) return;
+
+  let agentData = (reportData.agents || []).find((a) => a.agent.toLowerCase() === agent.toLowerCase());
+  const subscriptionAgent = (reportData.subscription?.agents || fullReportData?.subscription?.agents || []).find(
+    (a) => a.agent.toLowerCase() === agent.toLowerCase()
+  );
+  const subscriptionUi = subscriptionAgent ? subscriptionPresentation(subscriptionAgent) : null;
+
+  const cost = agentData?.totalCost || 0;
+  const tokens = agentData?.totalTokens || 0;
+  const models = agentData?.models || [];
+  const periodLabel = PERIOD_LABELS[currentPeriod] || "All time";
+  const agentColor = getAgentColor(agent);
+
+  let html = `
+    <!-- En-tête de page -->
+    <div class="page-header">
+      <div class="header-titles">
+        <div class="header-icon-box">
+          <img src="${getAgentBrandIcon(agent)}" alt="${escapeHtml(agent)}" />
+        </div>
+        <div>
+          <h1 class="page-title">${escapeHtml(getAgentDisplayName(agent))}</h1>
+          <p class="page-subtitle">${periodLabel} · usage from your logs and connected providers</p>
+        </div>
+      </div>
+
+      <div class="period-picker-box">
+        <select class="macos-period-select" id="harness-period-select">
+          ${Object.entries(PERIOD_LABELS)
+            .map(([k, v]) => `<option value="${k}" ${k === currentPeriod ? "selected" : ""}>${v}</option>`)
+            .join("")}
+        </select>
+      </div>
+    </div>
+  `;
+
+  // 1. CARTE WEEKLY QUOTA (BURN-DOWN CHART) si l'agent a un quota (ex. Codex, Antigravity)
+  const hasQuota = Boolean(subscriptionAgent && subscriptionAgent.window);
+  if (hasQuota) {
+    const quota = quotaPresentation(subscriptionAgent.window);
+    const used = quota.usedPercent;
+    const remaining = quota.remainingPercent;
+
+    // Calculs de reset et d'allure 100% RÉELS basés sur les données CLI et l'archive
+    const elapsed = subscriptionAgent.window.elapsedMinutes || 0;
+    const totalMinutes = 7 * 24 * 60; // 10,080 minutes hebdomadaires
+    const minutesLeft = quota.resetInMinutes ?? Math.max(0, totalMinutes - elapsed);
+    const daysLeft = Math.floor(minutesLeft / 1440);
+    const hoursLeft = Math.floor((minutesLeft % 1440) / 60);
+    const resetInText = `${daysLeft}d ${hoursLeft}h`;
+
+    const resetDateObj = quota.resetDate || new Date(Date.now() + minutesLeft * 60 * 1000);
+    const resetDateText = resetDateObj.toLocaleDateString("en-US", { month: "short", day: "numeric" }) + " · " + resetDateObj.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+
+    const idealRemaining = Math.max(0, 100 - (elapsed / totalMinutes) * 100);
+    const paceDeltaVal = remaining - idealRemaining;
+    const isAhead = paceDeltaVal >= -0.05;
+    const paceDeltaText = (paceDeltaVal >= 0 ? "+" : "") + paceDeltaVal.toFixed(1) + "% " + (isAhead ? "ahead" : "behind");
+    const paceClass = isAhead ? "ahead" : "behind";
+    const resetsAvail = subscriptionAgent.resetCreditsAvailable ?? 0;
+    const dailyAllowance = (remaining / Math.max(1, daysLeft)).toFixed(1) + "% / day";
+
+    const apiSpent = subscriptionAgent.window.apiEquivalentSpent || 0;
+    const avgDollarsPerPct = "$" + (used > 0 ? (apiSpent / used).toFixed(2) : "0.00") + " / %";
+    const avgTokensPerDollar = formatTokensPerDollar(tokens, cost);
+
+    html += `
+      <div class="groupbox burndown-grid-card">
+        <!-- Colonne Gauche : Synthèse du Quota (1/3) -->
+        <div class="quota-facts-col">
+          <div class="quota-header-row">
+            <span>Weekly quota</span>
+            <span style="color: var(--text-muted); font-size: 13px;">🕒</span>
+          </div>
+
+          <div>
+            <div class="quota-big-percent">${remaining.toFixed(1)}%</div>
+            <div class="quota-remaining-label">remaining</div>
+          </div>
+
+          <div class="pace-badge ${paceClass}">${paceDeltaText}</div>
+
+          <div class="quota-capsule-bar-bg">
+            <div class="quota-capsule-bar-fill ${paceClass}" style="width: ${remaining}%;"></div>
+          </div>
+
+          <div class="quota-facts-list">
+            <div class="quota-fact-row">
+              <span class="quota-fact-label">Reset in</span>
+              <div class="quota-fact-val-group">
+                <span class="quota-fact-primary">${resetInText}</span>
+                <span class="quota-fact-sub">${resetDateText}</span>
+              </div>
+            </div>
+            <div class="quota-fact-row">
+              <span class="quota-fact-label">Used</span>
+              <div class="quota-fact-val-group">
+                <span class="quota-fact-primary">${used.toFixed(1)}%</span>
+                <span class="quota-fact-sub">since cycle start</span>
+              </div>
+            </div>
+            <div class="quota-fact-row">
+              <span class="quota-fact-label">Daily</span>
+              <span class="quota-fact-primary">${dailyAllowance}</span>
+            </div>
+            <div class="quota-fact-row">
+              <span class="quota-fact-label">Avg $ / %</span>
+              <div class="quota-fact-val-group">
+                <span class="quota-fact-primary">${avgDollarsPerPct}</span>
+                <span class="quota-fact-sub">${avgTokensPerDollar}</span>
+              </div>
+            </div>
+            <div class="quota-fact-row">
+              <span class="quota-fact-label">Resets</span>
+              <div class="quota-fact-val-group">
+                <span class="quota-fact-primary">${resetsAvail}</span>
+                <span class="quota-fact-sub">banked</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Colonne Droite : Le Burn-Down Chart SVG (2/3) -->
+        <div class="burndown-chart-col">
+          <div class="burndown-top-bar">
+            <div class="burndown-legend" id="burndown-legend-container">
+            </div>
+
+            <div class="burndown-right-controls">
+              <select class="macos-select" id="quota-horizon-select">
+                <option value="rte" ${currentQuotaHorizon === "rte" ? "selected" : ""}>Until reset</option>
+                <option value="rtd" ${currentQuotaHorizon === "rtd" ? "selected" : ""}>Reset to today</option>
+                <option value="today" ${currentQuotaHorizon === "today" ? "selected" : ""}>Today</option>
+                <option value="week" ${currentQuotaHorizon === "week" ? "selected" : ""}>Last 7 days</option>
+                <option value="month" ${currentQuotaHorizon === "month" ? "selected" : ""}>Last 30 days</option>
+              </select>
+              <span class="projected-time-text">Projected · ${resetDateText}</span>
+            </div>
+          </div>
+
+          <div class="burndown-svg-wrapper" id="burndown-svg-wrapper">
+            <!-- Rendu interactif du Burn-Down SVG -->
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  // 2. Les 4 Cartes de métriques de l'agent
+  html += `
+    <div class="groupbox metrics-groupbox">
+      <div class="metric-col">
+        <span class="metric-title">Total spend</span>
+        <span class="metric-value">${formatCurrency(cost)}</span>
+        <span class="metric-detail">API-equivalent value</span>
+      </div>
+      <div class="metric-divider"></div>
+      <div class="metric-col">
+        <span class="metric-title">Tokens</span>
+        <span class="metric-value">${formatCompactTokens(tokens)}</span>
+        <span class="metric-detail">Input, output and cache</span>
+      </div>
+      <div class="metric-divider"></div>
+      <div class="metric-col">
+        <span class="metric-title">Avg tokens / $</span>
+        <span class="metric-value">${formatTokensPerDollar(tokens, cost)}</span>
+        <span class="metric-detail">${periodLabel}</span>
+      </div>
+      <div class="metric-divider"></div>
+      <div class="metric-col">
+        <span class="metric-title">Models</span>
+        <span class="metric-value">${models.length}</span>
+        <span class="metric-detail">${escapeHtml(getAgentDisplayName(agent))}</span>
+      </div>
+    </div>
+
+    <!-- Histogramme d'activité de l'agent -->
+    <div class="groupbox activity-card" style="margin-bottom: 20px;">
+      <div class="chart-top-bar">
+        <span class="chart-heading" id="harness-chart-title">Weekly spend</span>
+        <div class="granularity-pill-group" id="harness-granularity">
+          <button class="gran-btn" data-gran="daily">Daily</button>
+          <button class="gran-btn active" data-gran="weekly">Weekly</button>
+          <button class="gran-btn" data-gran="monthly">Monthly</button>
+        </div>
+        <span class="currency-label">USD</span>
+      </div>
+      <div class="chart-svg-container" id="harness-activity-svg"></div>
+    </div>
+
+    <!-- Tableau des modèles de l'agent -->
+    <div class="groupbox models-card">
+      <div class="models-header-row">
+        <div class="models-title-wrap">
+          <span class="card-heading">Models · available source data</span>
+          <span class="count-badge">${models.length}</span>
+        </div>
+        <div class="search-wrap">
+          <input type="text" class="macos-filter-input" id="harness-filter-input" placeholder="Filter models" />
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table class="macos-table" id="harness-models-table">
+          <thead>
+            <tr>
+              <th class="col-model sortable" data-sort="model">Model <span class="sort-indicator"></span></th>
+              <th class="col-tokens text-right sortable" data-sort="tokens">Tokens <span class="sort-indicator"></span></th>
+              <th class="col-spend text-right sortable" data-sort="spend">Spend <span class="sort-indicator">↓</span></th>
+              <th class="col-share text-right sortable" data-sort="share">Share <span class="sort-indicator"></span></th>
+            </tr>
+          </thead>
+          <tbody id="harness-models-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+  `;
+
+  // 3. Token Breakdown (Capture d'écran de l'utilisateur)
+  if (agentData?.tokenBreakdown) {
+    const breakdownItems = visibleTokenBreakdownEntries(agentData.tokenBreakdown);
+    html += `
+      <div class="groupbox token-breakdown-card">
+        <h2 class="card-heading">Token breakdown · available source data</h2>
+        <div class="token-breakdown-grid">
+          ${breakdownItems.map(([label, value]) => `
+            <div class="token-metric-item">
+              <span class="token-metric-label">${escapeHtml(label)}</span>
+              <span class="token-metric-val">${formatCompactTokens(value || 0)}</span>
+            </div>`).join("")}
+        </div>
+      </div>
+    `;
+  }
+
+  // 4. Subscription economics, token costs and weekly trends (Accordéon dépliable)
+  if (subscriptionAgent && subscriptionUi.monthlyPrice !== null) {
+    const est = subscriptionAgent.estimate || {};
+    const planCost = subscriptionUi.monthlyPrice;
+    const monthlyVal = est.monthlyValue || cost;
+    const valueMult = est.valueMultiple ? est.valueMultiple.toFixed(2) + "×" : "—";
+    const subsidy = Math.max(0, monthlyVal - planCost);
+    const discountPct = monthlyVal > 0 ? ((subsidy / monthlyVal) * 100).toFixed(1) + "%" : "—";
+
+    html += `
+      <details class="groupbox disclosure-box">
+        <summary class="disclosure-summary">
+          <span>Subscription economics, token costs and weekly trends</span>
+          <span class="disclosure-arrow">▾</span>
+        </summary>
+        <div class="disclosure-content">
+          <div class="econ-metrics-row">
+            <div class="metric-col">
+              <span class="metric-title">Past 30 days</span>
+              <span class="metric-value">${formatCurrency(monthlyVal)}</span>
+              <span class="metric-detail">API-equivalent value</span>
+            </div>
+            <div class="metric-divider"></div>
+            <div class="metric-col">
+              <span class="metric-title">Monthly plan</span>
+              <span class="metric-value">${formatCurrency(planCost)}</span>
+          <span class="metric-detail">${escapeHtml(subscriptionUi.plan)} plan</span>
+            </div>
+            <div class="metric-divider"></div>
+            <div class="metric-col">
+              <span class="metric-title">Subscription value</span>
+              <span class="metric-value">${valueMult}</span>
+              <span class="metric-detail">Usage / monthly price</span>
+            </div>
+          </div>
+          <div class="econ-sub-row">
+            <span>API-equivalent minus plan: ${formatCurrency(subsidy)}</span>
+            <span>API pricing discount: ${discountPct}</span>
+          </div>
+        </div>
+      </details>
+    `;
+  }
+
+  // 5. Subscriptions Pill
+  if (subscriptionAgent) {
+    html += `
+      <div class="subscriptions-section">
+        <h2 class="card-heading" style="margin-bottom: 8px;">Subscriptions</h2>
+        <div class="subscriptions-pills-row">
+          <div class="sub-pill">
+            <strong>${escapeHtml(getAgentDisplayName(agent))} · ${escapeHtml(subscriptionUi.plan)}</strong>
+            <span style="color: var(--text-muted);">·</span>
+            <span>${subscriptionUi.monthlyPrice === null ? "Monthly price unavailable" : `${formatCurrency(subscriptionUi.monthlyPrice)}/mo`}</span>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  // 6. Note légale
+  html += `
+    <div class="disclaimer-note">
+      <span>ⓘ</span>
+      <span>Spend is API-equivalent usage, not your subscription bill.</span>
+    </div>
+  `;
+
+  container.innerHTML = html;
+
+  // Listeners pour l'agent
+  document.getElementById("harness-period-select")?.addEventListener("change", async (e) => {
+    await switchPeriod(e.target.value);
+  });
+
+  // Granularité d'activité adaptée et rendu de l'histogramme de l'agent
+  const agentDays = agentData?.daily || [];
+  setupGranularityPicker("harness-granularity", "harness-activity-svg", "harness-chart-title", agentDays, agentColor);
+  renderActivityChart("harness-activity-svg", "harness-chart-title", agentDays, agentColor);
+
+  // Rendu du tableau des modèles
+  renderModelsTable(models, cost, "harness-models-tbody", null, "harness-filter-input");
+
+  // Rendu du Burn-Down SVG avec vraies données
+  if (hasQuota) {
+    renderBurndownSVG("burndown-svg-wrapper", subscriptionAgent);
+  }
+}
+
+// État d'horizon de la carte quota (5 timelines macOS : rte, rtd, today, week, month)
+let currentQuotaHorizon = "rte";
+
+// ==========================================================================
+// Rendu SVG du Burn-Down Chart (Interactif, 5 Timelines & Survol souris)
+// Conditionnalité 100% conforme à macOS Swift (showsForecast et showsIdeal)
+// ==========================================================================
+function renderBurndownSVG(containerId, subAgent) {
+  const container = document.getElementById(containerId);
+  if (!container) return;
+
+  // Écouteur de changement d'horizon si le sélecteur existe
+  const horizonSelect = document.getElementById("quota-horizon-select");
+  if (horizonSelect && !horizonSelect.dataset.listenerAttached) {
+    horizonSelect.dataset.listenerAttached = "true";
+    horizonSelect.value = currentQuotaHorizon;
+    horizonSelect.addEventListener("change", (e) => {
+      currentQuotaHorizon = e.target.value;
+      renderBurndownSVG(containerId, subAgent);
+    });
+  }
+
+  const width = container.clientWidth || 600;
+  const height = 220;
+  const padL = 40;
+  const padR = 30;
+  const padT = 20;
+  const padB = 30;
+
+  const chartW = width - padL - padR;
+  const chartH = height - padT - padB;
+
+  const used = subAgent?.window?.usedPercent || 0;
+  const remaining = Math.max(0, 100 - used);
+  const elapsed = Math.max(1, subAgent?.window?.elapsedMinutes || 1000);
+
+  // Règles exactes de QuotaChart.swift macOS :
+  // showsForecast est true UNIQUEMENT pour 'rte' (Until reset)
+  // showsIdeal (Pace) est true UNIQUEMENT pour 'rte' et 'rtd' (Reset to today)
+  const showsForecast = currentQuotaHorizon === "rte";
+  const showsIdeal = currentQuotaHorizon === "rte" || currentQuotaHorizon === "rtd";
+
+  // Définition de l'échelle temporelle selon l'horizon sélectionné
+  let totalWindowMins = 7 * 24 * 60; // Défaut : 7 jours (rte)
+  const nowTime = new Date();
+  let cycleEndTime = subAgent?.window?.resetDate ? new Date(subAgent.window.resetDate) : new Date(nowTime.getTime() + (totalWindowMins - elapsed) * 60000);
+  if (isNaN(cycleEndTime.getTime())) {
+    cycleEndTime = new Date(nowTime.getTime() + (totalWindowMins - elapsed) * 60000);
+  }
+
+  if (currentQuotaHorizon === "rtd") {
+    totalWindowMins = Math.max(elapsed, 1440);
+  } else if (currentQuotaHorizon === "today") {
+    totalWindowMins = 24 * 60; // 1440 mins
+  } else if (currentQuotaHorizon === "week") {
+    totalWindowMins = 7 * 24 * 60;
+  } else if (currentQuotaHorizon === "month") {
+    totalWindowMins = 30 * 24 * 60;
+  }
+
+  const cycleStartTime = new Date(cycleEndTime.getTime() - totalWindowMins * 60000);
+
+  function formatMacChartDate(d) {
+    if (!d || isNaN(d.getTime())) return "";
+    const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    const m = months[d.getMonth()];
+    const dayNum = d.getDate();
+    let h = d.getHours();
+    const mins = d.getMinutes().toString().padStart(2, "0");
+    const ampm = h >= 12 ? "PM" : "AM";
+    h = h % 12 || 12;
+    return `${m} ${dayNum} at ${h}:${mins} ${ampm}`;
+  }
+
+  // Noms réels des jours de la semaine abrégés pour l'axe X (façon macOS)
+  let daysNames = [];
+  const numGridX = 7;
+  for (let i = 0; i < numGridX; i++) {
+    const d = new Date(cycleStartTime.getTime() + (i / (numGridX - 1)) * totalWindowMins * 60000);
+    if (currentQuotaHorizon === "today") {
+      daysNames.push(`${d.getHours().toString().padStart(2, "0")}:${d.getMinutes().toString().padStart(2, "0")}`);
+    } else {
+      daysNames.push(d.toLocaleDateString("en-US", { weekday: "short" }));
+    }
+  }
+
+  // Échelle Y : 0% à 100%
+  const yToCoord = (pct) => padT + chartH * (1 - Math.max(0, Math.min(100, pct)) / 100);
+
+  // Échelle X selon l'horizon
+  const xToCoord = (min) => padL + (Math.max(0, Math.min(totalWindowMins, min)) / totalWindowMins) * chartW;
+
+  // Ligne de rythme idéal (Pace) : de 100% à 0%
+  const paceX1 = xToCoord(0);
+  const paceY1 = yToCoord(100);
+  const paceX2 = xToCoord(totalWindowMins);
+  const paceY2 = yToCoord(0);
+
+  // Position actuelle
+  const curElapsed = Math.min(elapsed, totalWindowMins);
+  const curX = xToCoord(curElapsed);
+  const curY = yToCoord(remaining);
+
+  const currentIdeal = Math.max(0, 100 - (curElapsed / totalWindowMins) * 100);
+  const paceDelta = remaining - currentIdeal;
+  const isAhead = paceDelta >= -0.05;
+  const lineColor = isAhead ? "var(--green-ahead)" : "var(--red-behind)";
+
+  // Projection Forecast
+  const projPct = subAgent?.estimate?.projectedUsePercent != null ? Math.max(0, 100 - subAgent.estimate.projectedUsePercent) : Math.max(0, remaining - (currentIdeal - 0));
+  const forecastY = yToCoord(projPct);
+
+  // Initialisation du texte temporel en haut à droite
+  const projectedText = container.closest(".burndown-chart-col")?.querySelector(".projected-time-text");
+  if (projectedText) {
+    projectedText.textContent = showsForecast ? `Projected · ${formatMacChartDate(cycleEndTime)}` : `Recorded · ${formatMacChartDate(nowTime)}`;
+  }
+
+  // Synchronisation dynamique de la légende en haut selon l'horizon
+  const burndownCol = container.closest(".burndown-chart-col");
+  const legendEl = burndownCol?.querySelector(".burndown-legend");
+  if (legendEl) {
+    let legendHtml = `
+      <div class="legend-item recorded ${isAhead ? 'ahead' : 'behind'}" id="burndown-legend-recorded">
+        <span class="legend-stroke" style="background: ${isAhead ? 'var(--green-ahead)' : 'var(--red-behind)'};"></span>
+        <span class="legend-label-text">Recorded ${remaining.toFixed(1)}%</span>
+      </div>
+    `;
+    if (showsForecast) {
+      legendHtml += `
+        <div class="legend-item" id="burndown-legend-forecast">
+          <span class="legend-stroke dashed" style="color: var(--text-muted);"></span>
+          <span class="legend-label-text">Forecast ${(subAgent?.estimate?.projectedUsePercent != null ? Math.max(0, 100 - subAgent.estimate.projectedUsePercent).toFixed(1) : remaining.toFixed(1))}%</span>
+        </div>
+      `;
+    }
+    if (showsIdeal) {
+      legendHtml += `
+        <div class="legend-item" id="burndown-legend-pace">
+          <span class="legend-stroke dashed" style="color: var(--text-muted);"></span>
+          <span class="legend-label-text">Pace ${currentIdeal.toFixed(1)}%</span>
+        </div>
+      `;
+    }
+    legendEl.innerHTML = legendHtml;
+  }
+
+  // 1. Grille horizontale Y
+  let yGridSvg = "";
+  [0, 25, 50, 75, 100].forEach((val) => {
+    const y = yToCoord(val);
+    yGridSvg += `
+      <line x1="${padL}" y1="${y}" x2="${padL + chartW}" y2="${y}" stroke="rgba(255,255,255,0.06)" stroke-dasharray="3,5" stroke-width="0.8" />
+      <text x="${padL - 8}" y="${y + 4}" fill="#8e8e93" font-size="10" text-anchor="end" font-family="monospace">${val}%</text>
+    `;
+  });
+
+  // 2. Grille verticale X
+  let xGridSvg = "";
+  daysNames.forEach((dName, i) => {
+    const x = padL + (i / (daysNames.length - 1)) * chartW;
+    xGridSvg += `
+      <line x1="${x}" y1="${padT}" x2="${x}" y2="${padT + chartH}" stroke="rgba(255,255,255,0.04)" stroke-width="1" />
+      <text x="${x}" y="${padT + chartH + 18}" fill="#8e8e93" font-size="10" text-anchor="middle">${dName}</text>
+    `;
+  });
+
+  // 3. Bande de position actuelle (uniquement si showsIdeal)
+  const dayBandSvg = showsIdeal ? `
+    <rect x="${Math.max(padL, curX - 14)}" y="${padT}" width="28" height="${chartH}" fill="${isAhead ? 'rgba(34, 197, 94, 0.08)' : 'rgba(239, 68, 68, 0.08)'}" />
+  ` : "";
+
+  // 4. Ligne de Pace (uniquement si showsIdeal)
+  const paceSvg = showsIdeal ? `
+    <line x1="${paceX1}" y1="${paceY1}" x2="${paceX2}" y2="${paceY2}" stroke="#8e8e93" stroke-dasharray="4,4" stroke-width="1.5" />
+  ` : "";
+
+  // 5. Tracé Recorded réel (avec aire subtile si !showsIdeal, comme macOS)
+  const pathD = `M ${padL} ${yToCoord(100)} L ${curX} ${curY}`;
+  const recordedAreaSvg = !showsIdeal ? `
+    <path d="M ${padL} ${yToCoord(100)} L ${curX} ${curY} L ${curX} ${padT + chartH} L ${padL} ${padT + chartH} Z" fill="${lineColor}" opacity="0.08" />
+  ` : "";
+
+  // 6. Projection Forecast (si applicable pour l'horizon : rte uniquement)
+  const forecastSvg = showsForecast ? `
+    <line x1="${curX}" y1="${curY}" x2="${paceX2}" y2="${forecastY}" stroke="${lineColor}" stroke-dasharray="5,5" stroke-width="2" opacity="0.8" />
+  ` : "";
+
+  // 7. Ligne de Reset (rte uniquement)
+  const resetSvg = showsForecast ? `
+    <line x1="${paceX2}" y1="${padT}" x2="${paceX2}" y2="${padT + chartH}" stroke="#8e8e93" stroke-dasharray="3,3" stroke-width="1" />
+    <text x="${paceX2 - 6}" y="${padT + 12}" fill="#8e8e93" font-size="9.5" text-anchor="end">Reset</text>
+  ` : "";
+
+  // 8. Curseur interactif
+  const deltaBadgeText = (paceDelta >= 0 ? "+" : "") + paceDelta.toFixed(1) + "%";
+
+  container.innerHTML = `
+    <svg id="burndown-chart-svg" width="100%" height="${height}" viewBox="0 0 ${width} ${height}" style="overflow: visible; cursor: crosshair;">
+      ${dayBandSvg}
+      ${yGridSvg}
+      ${xGridSvg}
+      ${paceSvg}
+      ${recordedAreaSvg}
+      ${forecastSvg}
+      ${resetSvg}
+      <path d="${pathD}" fill="none" stroke="${lineColor}" stroke-width="2.5" stroke-linejoin="round" />
+      <line id="burndown-hover-line" x1="${curX}" y1="${padT}" x2="${curX}" y2="${padT + chartH}" stroke="rgba(255,255,255,0.3)" stroke-width="1" stroke-dasharray="2,3" />
+      <circle id="burndown-hover-dot" cx="${curX}" cy="${curY}" r="4.5" fill="${lineColor}" />
+      <g id="burndown-hover-badge" transform="translate(${Math.min(chartW - 80, curX + 10)}, ${Math.max(padT + 10, curY - 12)})">
+        <rect x="0" y="0" width="${showsIdeal ? 125 : 65}" height="22" rx="11" fill="rgba(28, 28, 32, 0.95)" stroke="rgba(255,255,255,0.2)" stroke-width="0.5" />
+        <text id="burndown-badge-pct" x="12" y="15" fill="#ffffff" font-size="10.5" font-weight="600" font-family="monospace">${remaining.toFixed(1)}%</text>
+        ${showsIdeal ? `
+          <text x="56" y="15" fill="#8e8e93" font-size="10">·</text>
+          <text id="burndown-badge-delta" x="66" y="15" fill="${lineColor}" font-size="10.5" font-weight="600">${deltaBadgeText}</text>
+        ` : ""}
+      </g>
+    </svg>
+  `;
+
+  // Gestion du survol interactif souris sur le Burn-Down Chart (Façon macOS)
+  const svgEl = document.getElementById("burndown-chart-svg");
+  const hoverDot = document.getElementById("burndown-hover-dot");
+  const hoverBadge = document.getElementById("burndown-hover-badge");
+  const hoverLine = document.getElementById("burndown-hover-line");
+  const badgePct = document.getElementById("burndown-badge-pct");
+  const badgeDelta = document.getElementById("burndown-badge-delta");
+
+  if (svgEl) {
+    svgEl.addEventListener("mousemove", (e) => {
+      const rect = svgEl.getBoundingClientRect();
+      const rawMouseX = ((e.clientX - rect.left) / rect.width) * width;
+      // Si pas de forecast, le curseur ne va pas au-delà de curX
+      const mouseX = Math.max(padL, Math.min(showsForecast ? padL + chartW : curX, rawMouseX));
+      const ratio = (mouseX - padL) / chartW;
+
+      const idealVal = Math.max(0, 100 - ratio * 100);
+      let curVal;
+
+      if (mouseX <= curX) {
+        const curProgress = (mouseX - padL) / (curX - padL || 1);
+        curVal = Math.max(0, 100 - curProgress * used);
+      } else {
+        const forecastProgress = (mouseX - curX) / (paceX2 - curX || 1);
+        curVal = Math.max(0, remaining - forecastProgress * (remaining - projPct));
       }
 
-      // 2. Mise à jour immédiate selon l'onglet courant
-      if (currentTab === "summary") {
-        if (reportData) renderSummary();
-        updateStatusSynced();
-      } else if (currentTab === "antigravity") {
-        if (antigravityCache[currentPeriod]) {
-          antigravityData = antigravityCache[currentPeriod];
-          renderAntigravityView(antigravityData);
-          updateStatusSynced();
-        }
-      } else if (currentTab === "projects") {
-        if (projectsCache[currentPeriod]) {
-          projectsData = projectsCache[currentPeriod];
-          renderProjectsView(projectsData);
-          updateStatusSynced();
-        }
-      } else if (currentTab !== "settings") {
-        renderHarnessView(currentTab);
+      const curYPos = yToCoord(curVal);
+      const delta = curVal - idealVal;
+      const ahead = delta >= -0.05;
+      const tone = ahead ? "var(--green-ahead)" : "var(--red-behind)";
+
+      if (hoverLine) {
+        hoverLine.setAttribute("x1", mouseX);
+        hoverLine.setAttribute("x2", mouseX);
+      }
+      if (hoverDot) {
+        hoverDot.setAttribute("cx", mouseX);
+        hoverDot.setAttribute("cy", curYPos);
+        hoverDot.setAttribute("fill", tone);
+      }
+      if (hoverBadge) {
+        const badgeWidth = showsIdeal ? 125 : 65;
+        const bx = Math.min(chartW - badgeWidth + 20, mouseX + 10);
+        const by = Math.max(padT + 10, curYPos - 12);
+        hoverBadge.setAttribute("transform", `translate(${bx}, ${by})`);
+      }
+      if (badgePct) badgePct.textContent = `${curVal.toFixed(1)}%`;
+      if (badgeDelta && showsIdeal) {
+        badgeDelta.textContent = `${delta >= 0 ? '+' : ''}${delta.toFixed(1)}%`;
+        badgeDelta.setAttribute("fill", tone);
       }
 
-      // Anti-rebond (Debounce 50 ms) pour requêtes complémentaires
-      clearTimeout(debouncePeriodTimer);
-      debouncePeriodTimer = setTimeout(async () => {
-        if (currentTab === "projects") {
-          await loadProjects();
-        } else if (currentTab === "antigravity") {
-          await loadAntigravity();
-        } else if (currentTab === "summary") {
-          await loadData();
-        } else if (currentTab !== "settings") {
-          renderHarnessView(currentTab);
-        }
-      }, 50);
+      // Date dynamique en haut à droite façon macOS
+      const hoverTime = new Date(cycleStartTime.getTime() + ratio * totalWindowMins * 60000);
+      const isObserved = mouseX <= curX;
+      if (projectedText) {
+        projectedText.textContent = isObserved
+          ? `Recorded · ${formatMacChartDate(hoverTime)}`
+          : `Projected · ${formatMacChartDate(hoverTime)}`;
+      }
+
+      // Légende dynamique en temps réel
+      const recLabel = document.querySelector("#burndown-legend-recorded .legend-label-text");
+      const fcastLabel = document.querySelector("#burndown-legend-forecast .legend-label-text");
+      const paceLabel = document.querySelector("#burndown-legend-pace .legend-label-text");
+      if (recLabel && isObserved) recLabel.textContent = `Recorded ${curVal.toFixed(1)}%`;
+      if (fcastLabel && !isObserved) fcastLabel.textContent = `Forecast ${curVal.toFixed(1)}%`;
+      if (paceLabel) paceLabel.textContent = `Pace ${idealVal.toFixed(1)}%`;
+    });
+
+    svgEl.addEventListener("mouseleave", () => {
+      if (hoverLine) {
+        hoverLine.setAttribute("x1", curX);
+        hoverLine.setAttribute("x2", curX);
+      }
+      if (hoverDot) {
+        hoverDot.setAttribute("cx", curX);
+        hoverDot.setAttribute("cy", curY);
+        hoverDot.setAttribute("fill", lineColor);
+      }
+      if (hoverBadge) {
+        const bx = Math.min(chartW - (showsIdeal ? 125 : 65) + 20, curX + 10);
+        const by = Math.max(padT + 10, curY - 12);
+        hoverBadge.setAttribute("transform", `translate(${bx}, ${by})`);
+      }
+      if (badgePct) badgePct.textContent = `${remaining.toFixed(1)}%`;
+      if (badgeDelta && showsIdeal) {
+        badgeDelta.textContent = deltaBadgeText;
+        badgeDelta.setAttribute("fill", lineColor);
+      }
+      if (projectedText) {
+        projectedText.textContent = showsForecast
+          ? `Projected · ${formatMacChartDate(cycleEndTime)}`
+          : `Recorded · ${formatMacChartDate(nowTime)}`;
+      }
+
+      const recLabel = document.querySelector("#burndown-legend-recorded .legend-label-text");
+      const fcastLabel = document.querySelector("#burndown-legend-forecast .legend-label-text");
+      const paceLabel = document.querySelector("#burndown-legend-pace .legend-label-text");
+      if (recLabel) recLabel.textContent = `Recorded ${remaining.toFixed(1)}%`;
+      if (fcastLabel) fcastLabel.textContent = `Forecast ${(subAgent?.estimate?.projectedUsePercent != null ? Math.max(0, 100 - subAgent.estimate.projectedUsePercent).toFixed(1) : remaining.toFixed(1))}%`;
+      if (paceLabel) paceLabel.textContent = `Pace ${currentIdeal.toFixed(1)}%`;
+    });
+  }
+}
+
+// ==========================================================================
+// Vrai Regroupement Temporel (bucketDailyUsage sans aucun mock)
+// ==========================================================================
+function bucketDailyUsage(days, granularity) {
+  if (!days || days.length === 0) return [];
+  if (granularity === "daily") {
+    return [...days].sort((a, b) => a.date.localeCompare(b.date));
+  }
+
+  const costByKey = {};
+  const tokensByKey = {};
+
+  for (const d of days) {
+    if (!d.date) continue;
+    const parts = d.date.split("-");
+    if (parts.length < 3) continue;
+
+    let key;
+    if (granularity === "monthly") {
+      // YYYY-MM
+      key = `${parts[0]}-${parts[1]}`;
+    } else if (granularity === "weekly") {
+      // Regroupement par semaine (Lundi)
+      const year = parseInt(parts[0], 10);
+      const month = parseInt(parts[1], 10) - 1;
+      const day = parseInt(parts[2], 10);
+      const dt = new Date(Date.UTC(year, month, day));
+      const dayOfWeek = dt.getUTCDay();
+      const diffToMonday = (dayOfWeek + 6) % 7;
+      const monday = new Date(dt.getTime() - diffToMonday * 86400000);
+      key = monday.toISOString().slice(0, 10);
+    }
+
+    costByKey[key] = (costByKey[key] || 0) + (d.cost || 0);
+    tokensByKey[key] = (tokensByKey[key] || 0) + (d.tokens || 0);
+  }
+
+  return Object.keys(costByKey).sort().map((k) => ({
+    date: k,
+    cost: costByKey[k],
+    tokens: tokensByKey[k],
+  }));
+}
+
+// ==========================================================================
+// Tooltip au survol façon macOS : "Aug 17 – Aug 23 · $511.71"
+// ==========================================================================
+function spendBucketTooltip(dateKey, granularity, cost) {
+  const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  const parts = dateKey.split("-");
+  const costStr = formatCurrency(cost);
+
+  if (granularity === "monthly") {
+    const m = parseInt(parts[1], 10) - 1;
+    return `${months[m]} ${parts[0]} · ${costStr}`;
+  }
+
+  if (granularity === "weekly") {
+    const startYear = parseInt(parts[0], 10);
+    const startMonth = parseInt(parts[1], 10) - 1;
+    const startDay = parseInt(parts[2], 10);
+    const startDt = new Date(Date.UTC(startYear, startMonth, startDay));
+    const endDt = new Date(startDt.getTime() + 6 * 86400000);
+    const endMonth = endDt.getUTCMonth();
+    const endDay = endDt.getUTCDate();
+
+    const startStr = `${months[startMonth]} ${startDay}`;
+    const endStr = `${months[endMonth]} ${endDay}`;
+    return `${startStr} – ${endStr} · ${costStr}`;
+  }
+
+  // Daily : "Sep 14 · $42.10"
+  if (parts.length >= 3) {
+    const m = parseInt(parts[1], 10) - 1;
+    const d = parseInt(parts[2], 10);
+    return `${months[m]} ${d} · ${costStr}`;
+  }
+
+  return `${dateKey} · ${costStr}`;
+}
+
+// Formatage du label d'axe X selon la granularité (ex. "Sep 2025", "Jun 1", "14 Sep")
+function formatAxisLabel(key, granularity) {
+  const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  const parts = key.split("-");
+  if (granularity === "monthly") {
+    const m = parseInt(parts[1], 10) - 1;
+    return `${months[m]} ${parts[0]}`;
+  }
+  if (parts.length >= 3) {
+    const m = parseInt(parts[1], 10) - 1;
+    const d = parseInt(parts[2], 10);
+    return `${months[m]} ${d}`;
+  }
+  return key;
+}
+
+// ==========================================================================
+// Remplissage temporel continu pour les périodes (jours vides à $0 façon macOS)
+// ==========================================================================
+function fillContinuousDays(days, period) {
+  if (!days || days.length === 0) return [];
+  const map = new Map();
+  days.forEach((d) => {
+    if (d.date) map.set(d.date, d);
+  });
+
+  const now = new Date();
+  const todayStr = now.toISOString().slice(0, 10);
+
+  let startDateStr = null;
+  let endDateStr = todayStr;
+
+  if (period === "today") {
+    startDateStr = todayStr;
+  } else if (period === "yesterday") {
+    const yest = new Date(now.getTime() - 86400000);
+    startDateStr = yest.toISOString().slice(0, 10);
+    endDateStr = startDateStr;
+  } else if (period === "week") {
+    const d = new Date(now.getTime() - 6 * 86400000);
+    startDateStr = d.toISOString().slice(0, 10);
+  } else if (period === "month") {
+    const d = new Date(now.getTime() - 29 * 86400000);
+    startDateStr = d.toISOString().slice(0, 10);
+  } else if (period === "mtd") {
+    const y = now.getUTCFullYear();
+    const m = String(now.getUTCMonth() + 1).padStart(2, "0");
+    startDateStr = `${y}-${m}-01`;
+  } else {
+    // all and reset-to-date use the first available source day.
+    const sorted = [...days].filter((d) => d.date).sort((a, b) => a.date.localeCompare(b.date));
+    if (sorted.length > 0) {
+      startDateStr = sorted[0].date;
+    } else {
+      startDateStr = todayStr;
+    }
+  }
+
+  const explicitStart = timelineStartDate(period, now);
+  if (explicitStart) startDateStr = explicitStart;
+
+  const startDt = new Date(startDateStr + "T00:00:00Z");
+  const endDt = new Date(endDateStr + "T00:00:00Z");
+  const result = [];
+  let cur = new Date(startDt.getTime());
+
+  while (cur <= endDt) {
+    const curStr = cur.toISOString().slice(0, 10);
+    if (map.has(curStr)) {
+      result.push(map.get(curStr));
+    } else {
+      result.push({ date: curStr, cost: 0, tokens: 0 });
+    }
+    cur = new Date(cur.getTime() + 86400000);
+  }
+
+  return result;
+}
+
+// ==========================================================================
+// Calcul robuste de l'axe Y (Zéro doublon, graduations claires même à $1 max)
+// ==========================================================================
+function computeYAxis(rawMax) {
+  const safeMax = Math.max(rawMax, 0.001);
+  let maxSpend;
+  let isCurrencyDecimals = false;
+
+  if (safeMax <= 0.1) {
+    maxSpend = 0.1;
+    isCurrencyDecimals = true;
+  } else if (safeMax <= 0.5) {
+    maxSpend = 0.5;
+    isCurrencyDecimals = true;
+  } else if (safeMax <= 1.0) {
+    maxSpend = 1.0;
+    isCurrencyDecimals = true;
+  } else if (safeMax <= 2.0) {
+    maxSpend = 2.0;
+    isCurrencyDecimals = true;
+  } else if (safeMax <= 3.0) {
+    maxSpend = 3.0;
+    isCurrencyDecimals = true;
+  } else if (safeMax <= 10.0) {
+    // Forcer un plafond pair pour que max / 2 soit un entier distinct (4 -> 2, 6 -> 3, 8 -> 4, 10 -> 5)
+    maxSpend = Math.ceil(safeMax / 2) * 2;
+    if (maxSpend < 4) maxSpend = 4;
+  } else if (safeMax <= 50.0) {
+    maxSpend = Math.ceil(safeMax / 10) * 10;
+  } else if (safeMax <= 200.0) {
+    maxSpend = Math.ceil(safeMax / 20) * 20;
+  } else {
+    const magnitude = Math.pow(10, Math.floor(Math.log10(safeMax)));
+    maxSpend = Math.ceil(safeMax / magnitude) * magnitude;
+    if ((maxSpend / (magnitude / 2)) % 2 !== 0) {
+      maxSpend += magnitude / 2;
+    }
+  }
+
+  let topLabel, midLabel, bottomLabel;
+  if (isCurrencyDecimals) {
+    topLabel = "$" + maxSpend.toFixed(2);
+    midLabel = "$" + (maxSpend / 2).toFixed(2);
+    bottomLabel = "$0";
+  } else {
+    topLabel = Math.round(maxSpend).toLocaleString();
+    midLabel = Math.round(maxSpend / 2).toLocaleString();
+    bottomLabel = "0";
+  }
+
+  return { maxSpend, topLabel, midLabel, bottomLabel };
+}
+
+// ==========================================================================
+// Gestionnaire intelligent des boutons de granularité (Daily | Weekly | Monthly)
+// Masquage automatique selon la timeline (pas de monthly sur 30j/7j/today)
+// ==========================================================================
+function setupGranularityPicker(pickerId, svgId, titleId, days, singleColor) {
+  const picker = document.getElementById(pickerId);
+  if (!picker) return;
+
+  const isOneDay = ["today", "yesterday"].includes(currentPeriod);
+  const isSevenDays = currentPeriod === "week";
+  const isMonthOrLess = ["week", "wtd", "month", "mtd"].includes(currentPeriod);
+
+  const dailyBtn = picker.querySelector('[data-gran="daily"]');
+  const weeklyBtn = picker.querySelector('[data-gran="weekly"]');
+  const monthlyBtn = picker.querySelector('[data-gran="monthly"]');
+
+  if (dailyBtn) dailyBtn.style.display = "inline-flex";
+
+  if (isOneDay) {
+    if (weeklyBtn) weeklyBtn.style.display = "none";
+    if (monthlyBtn) monthlyBtn.style.display = "none";
+    currentSpendGranularity = "daily";
+  } else if (isSevenDays) {
+    if (weeklyBtn) weeklyBtn.style.display = "inline-flex";
+    if (monthlyBtn) monthlyBtn.style.display = "none";
+    if (currentSpendGranularity === "monthly") currentSpendGranularity = "daily";
+  } else if (isMonthOrLess) {
+    if (weeklyBtn) weeklyBtn.style.display = "inline-flex";
+    if (monthlyBtn) monthlyBtn.style.display = "none";
+    if (currentSpendGranularity === "monthly") currentSpendGranularity = "weekly";
+  } else {
+    if (weeklyBtn) weeklyBtn.style.display = "inline-flex";
+    if (monthlyBtn) monthlyBtn.style.display = "inline-flex";
+  }
+
+  picker.querySelectorAll(".gran-btn").forEach((btn) => {
+    btn.classList.toggle("active", btn.dataset.gran === currentSpendGranularity);
+    const newBtn = btn.cloneNode(true);
+    btn.parentNode.replaceChild(newBtn, btn);
+
+    newBtn.addEventListener("click", () => {
+      picker.querySelectorAll(".gran-btn").forEach((b) => b.classList.remove("active"));
+      newBtn.classList.add("active");
+      currentSpendGranularity = newBtn.dataset.gran;
+      renderActivityChart(svgId, titleId, days, singleColor);
     });
   });
 }
 
+// ==========================================================================
+// Rendu SVG de l'histogramme d'activité (ActivityChart 100% réel)
+// Correction géométrique des barres (ancrage au sol) et suppression des doublons Y
+// ==========================================================================
+function renderActivityChart(svgId, titleId, days, singleColor) {
+  const container = document.getElementById(svgId);
+  if (!container) return;
 
+  const heading = document.getElementById(titleId);
+  if (heading) {
+    const gran = currentSpendGranularity;
+    heading.textContent = gran === "daily" ? "Daily spend" : gran === "weekly" ? "Weekly spend" : "Monthly spend";
+  }
+
+  // Échelle temporelle continue avec comblement des jours à $0
+  const continuousDays = fillContinuousDays(days, currentPeriod);
+
+  // Vrai regroupement mathématique sans coupure
+  const aggregated = bucketDailyUsage(continuousDays, currentSpendGranularity);
+
+  const width = container.clientWidth || 550;
+  const height = 180;
+  const padL = 48;
+  const padR = 20;
+  const padT = 16;
+  const padB = 24;
+
+  const chartW = width - padL - padR;
+  const chartH = height - padT - padB;
+  const baselineY = padT + chartH;
+
+  if (aggregated.length === 0 || aggregated.every((d) => (d.cost || 0) === 0)) {
+    container.innerHTML = `<div style="display:flex;align-items:center;justify-content:center;height:${height}px;color:var(--text-muted);font-size:12px;">No activity logged for this period.</div>`;
+    return;
+  }
+
+  // Échelle Y robuste sans doublon
+  const rawMax = Math.max(...aggregated.map((d) => d.cost || 0), 0.001);
+  const { maxSpend, topLabel, midLabel, bottomLabel } = computeYAxis(rawMax);
+
+  const count = aggregated.length;
+  const step = chartW / count;
+  const barWidth = Math.max(2, Math.min(32, step - (count > 60 ? 0.5 : count > 20 ? 1.5 : 3)));
+
+  let barsSvg = "";
+  let xLabelsSvg = "";
+  const labelInterval = Math.max(1, Math.floor(count / 5));
+
+  const cardParent = container.closest(".activity-card") || container.closest(".groupbox");
+  const currencyLabel = cardParent?.querySelector(".currency-label");
+
+  aggregated.forEach((d, i) => {
+    const cost = d.cost || 0;
+    const barH = (cost / maxSpend) * chartH;
+    // La barre monte TOUJOURS depuis la ligne de base vers le haut (aucun dépassement sous l'axe X)
+    const effectiveBarH = cost > 0 ? Math.max(2, barH) : 0;
+    const x = padL + i * step + (step - barWidth) / 2;
+    const y = baselineY - effectiveBarH;
+    const color = singleColor || "#22c55e";
+
+    barsSvg += `
+      <rect class="activity-bar" data-index="${i}" x="${x}" y="${y}" width="${barWidth}" height="${effectiveBarH}" rx="2" fill="${color}" opacity="${cost > 0 ? '0.9' : '0.15'}" style="cursor: crosshair;">
+      </rect>
+    `;
+
+    // Étiquettes régulières de l'axe X
+    if (i % labelInterval === 0 || i === count - 1) {
+      const labelText = formatAxisLabel(d.date, currentSpendGranularity);
+      xLabelsSvg += `
+        <text x="${x + barWidth / 2}" y="${padT + chartH + 16}" fill="#8e8e93" font-size="10" text-anchor="middle">${labelText}</text>
+      `;
+    }
+  });
+
+  // Lignes de repère Y et libellés sans doublon
+  const yAxisLabels = `
+    <text x="${padL - 8}" y="${padT + 8}" fill="#8e8e93" font-size="10" text-anchor="end">${topLabel}</text>
+    <text x="${padL - 8}" y="${padT + chartH / 2 + 4}" fill="#8e8e93" font-size="10" text-anchor="end">${midLabel}</text>
+    <text x="${padL - 8}" y="${baselineY}" fill="#8e8e93" font-size="10" text-anchor="end">${bottomLabel}</text>
+  `;
+
+  const yAxisSvg = `
+    <line x1="${padL}" y1="${baselineY}" x2="${padL + chartW}" y2="${baselineY}" stroke="rgba(255,255,255,0.08)" stroke-width="1" />
+    <line x1="${padL}" y1="${padT + chartH / 2}" x2="${padL + chartW}" y2="${padT + chartH / 2}" stroke="rgba(255,255,255,0.04)" stroke-dasharray="3,4" stroke-width="0.8" />
+    <line x1="${padL}" y1="${padT}" x2="${padL + chartW}" y2="${padT}" stroke="rgba(255,255,255,0.04)" stroke-dasharray="3,4" stroke-width="0.8" />
+    ${yAxisLabels}
+  `;
+
+  container.innerHTML = `
+    <svg id="${svgId}-svg" width="100%" height="${height}" viewBox="0 0 ${width} ${height}" style="overflow: visible;">
+      ${yAxisSvg}
+      ${barsSvg}
+      ${xLabelsSvg}
+      <line id="${svgId}-hover-line" x1="0" y1="${padT}" x2="0" y2="${padT + chartH}" stroke="#3b82f6" stroke-width="1.5" opacity="0" pointer-events="none" />
+    </svg>
+  `;
+
+  // Interactivité au survol de la souris : ligne verticale et tooltip en haut à droite
+  const svgEl = document.getElementById(`${svgId}-svg`);
+  const hoverLine = document.getElementById(`${svgId}-hover-line`);
+
+  if (svgEl) {
+    svgEl.addEventListener("mousemove", (e) => {
+      const rect = svgEl.getBoundingClientRect();
+      const mouseX = ((e.clientX - rect.left) / rect.width) * width;
+
+      if (mouseX < padL || mouseX > padL + chartW) {
+        if (hoverLine) hoverLine.setAttribute("opacity", "0");
+        if (currencyLabel) {
+          currencyLabel.textContent = "USD";
+          currencyLabel.classList.remove("active-hover");
+        }
+        return;
+      }
+
+      const relX = mouseX - padL;
+      const idx = Math.min(count - 1, Math.max(0, Math.floor(relX / step)));
+      const target = aggregated[idx];
+
+      if (target) {
+        const barCenterX = padL + idx * step + step / 2;
+        if (hoverLine) {
+          hoverLine.setAttribute("x1", barCenterX);
+          hoverLine.setAttribute("x2", barCenterX);
+          hoverLine.setAttribute("opacity", "0.75");
+        }
+        if (currencyLabel) {
+          currencyLabel.textContent = spendBucketTooltip(target.date, currentSpendGranularity, target.cost || 0);
+          currencyLabel.classList.add("active-hover");
+        }
+      }
+    });
+
+    svgEl.addEventListener("mouseleave", () => {
+      if (hoverLine) hoverLine.setAttribute("opacity", "0");
+      if (currencyLabel) {
+        currencyLabel.textContent = "USD";
+        currencyLabel.classList.remove("active-hover");
+      }
+    });
+  }
+}
+
+
+// État de tri par défaut (Spend descendant)
+let modelsSortState = {
+  column: "spend",
+  direction: "desc"
+};
+
+// ==========================================================================
+// Rendu du tableau des modèles avec tri interactif et filtre de recherche
+// ==========================================================================
+function renderModelsTable(models, totalCost, tbodyId, countId, searchInputId) {
+  const tbody = document.getElementById(tbodyId);
+  if (!tbody) return;
+
+  const table = tbody.closest("table");
+
+  if (countId) {
+    const badge = document.getElementById(countId);
+    if (badge) badge.textContent = models.length.toString();
+  }
+
+  function updateHeaders() {
+    if (!table) return;
+    table.querySelectorAll("th.sortable").forEach((th) => {
+      const col = th.dataset.sort;
+      const indicator = th.querySelector(".sort-indicator");
+      if (indicator) {
+        if (col === modelsSortState.column) {
+          indicator.textContent = modelsSortState.direction === "desc" ? "↓" : "↑";
+        } else {
+          indicator.textContent = "";
+        }
+      }
+    });
+  }
+
+  function updateRows(filterText = "") {
+    tbody.innerHTML = "";
+    const q = filterText.toLowerCase().trim();
+    let filtered = models.filter((m) => !q || m.model.toLowerCase().includes(q));
+
+    // Application du tri interactif
+    filtered.sort((a, b) => {
+      let res = 0;
+      if (modelsSortState.column === "spend" || modelsSortState.column === "share") {
+        res = (a.totalCost || 0) - (b.totalCost || 0);
+      } else if (modelsSortState.column === "tokens") {
+        res = (a.totalTokens || 0) - (b.totalTokens || 0);
+      } else if (modelsSortState.column === "model") {
+        res = (a.model || "").localeCompare(b.model || "");
+      }
+      return modelsSortState.direction === "desc" ? -res : res;
+    });
+
+    if (filtered.length === 0) {
+      tbody.innerHTML = `<tr><td colspan="4" style="text-align:center;color:var(--text-muted);padding:18px;">No models match your filter.</td></tr>`;
+      return;
+    }
+
+    filtered.forEach((m) => {
+      const share = totalCost > 0 ? ((m.totalCost || 0) / totalCost) * 100 : m.percentage || 0;
+      const tr = document.createElement("tr");
+      tr.innerHTML = `
+        <td class="col-model" title="${escapeHtml(m.model)}">${escapeHtml(m.model)}</td>
+        <td class="col-tokens text-right">${formatCompactTokens(m.totalTokens)}</td>
+        <td class="col-spend text-right">${formatCurrency(m.totalCost)}</td>
+        <td class="col-share text-right">${share.toFixed(1)}%</td>
+      `;
+      tbody.appendChild(tr);
+    });
+
+    updateHeaders();
+  }
+
+  // Écouteurs de clic sur les en-têtes de colonnes
+  if (table && !table.dataset.sortInitialized) {
+    table.dataset.sortInitialized = "true";
+    table.querySelectorAll("th.sortable").forEach((th) => {
+      th.addEventListener("click", () => {
+        const col = th.dataset.sort;
+        if (modelsSortState.column === col) {
+          modelsSortState.direction = modelsSortState.direction === "desc" ? "asc" : "desc";
+        } else {
+          modelsSortState.column = col;
+          modelsSortState.direction = col === "model" ? "asc" : "desc";
+        }
+        const currentInput = document.getElementById(searchInputId);
+        updateRows(currentInput ? currentInput.value : "");
+      });
+    });
+  }
+
+  updateRows();
+
+  const input = document.getElementById(searchInputId);
+  if (input) {
+    input.value = "";
+    input.oninput = (e) => updateRows(e.target.value);
+  }
+}
+
+// ==========================================================================
+// Rendu des abonnements
+// ==========================================================================
+function renderSubscriptions() {
+  const card = document.getElementById("summary-subscriptions-card");
+  const list = document.getElementById("summary-subscriptions-list");
+  if (!card || !list) return;
+
+  const subs = reportData?.subscription?.agents || [];
+  if (subs.length === 0) {
+    card.style.display = "none";
+    return;
+  }
+
+  card.style.display = "block";
+  list.innerHTML = "";
+
+  subs.forEach((sub) => {
+    const presentation = subscriptionPresentation(sub);
+    const div = document.createElement("div");
+    div.style.display = "flex";
+    div.style.justifyContent = "space-between";
+    div.style.fontSize = "12px";
+    div.style.padding = "6px 0";
+    div.innerHTML = `
+      <span><strong>${escapeHtml(getAgentDisplayName(sub.agent))}</strong> · ${escapeHtml(presentation.plan)}</span>
+      <span style="font-weight:600;">${presentation.monthlyPrice === null ? "Monthly price unavailable" : formatCurrency(presentation.monthlyPrice) + " / mo"}</span>
+    `;
+    list.appendChild(div);
+  });
+}
+
+// ==========================================================================
+// Paramètres (Settings)
+// ==========================================================================
+function initSettings() {
+  document.getElementById("settings-btn")?.addEventListener("click", () => {
+    switchTab("settings");
+  });
+
+  document.getElementById("settings-open-folder-btn")?.addEventListener("click", async () => {
+    try {
+      await invokeTauri("open_data_folder");
+    } catch (e) {
+      console.error(e);
+    }
+  });
+
+  // Autostart
+  invokeTauri("get_autostart_status")
+    .then((enabled) => {
+      const toggle = document.getElementById("settings-autostart-toggle");
+      if (toggle) {
+        toggle.checked = !!enabled;
+        toggle.onchange = async () => {
+          await invokeTauri("set_autostart", { enabled: toggle.checked });
+        };
+      }
+    })
+    .catch((error) => showStatusError(`Autostart status unavailable: ${error}`));
+
+  invokeTauri("get_cli_status")
+    .then((status) => {
+      const badge = document.getElementById("settings-cli-status");
+      const path = document.getElementById("settings-cli-path");
+      if (badge) {
+        badge.textContent = status.available ? "Operational" : "Unavailable";
+        badge.className = status.available ? "status-badge-ok" : "status-badge-error";
+      }
+      if (path) path.textContent = status.path || "No agent-burn executable found";
+    })
+    .catch((error) => showStatusError(`CLI status unavailable: ${error}`));
+
+  invokeTauri("get_settings")
+    .then((settings) => {
+      appSettings = settings;
+      applySettingsToControls();
+    })
+    .catch((error) => showStatusError(`Settings unavailable: ${error}`));
+
+  for (const id of [
+    "settings-cli-input",
+    "settings-codex-homes-input",
+    "settings-offline-toggle",
+    "settings-refresh-select",
+    "settings-quota-source-select",
+    "settings-antigravity-ultra-price",
+  ]) {
+    document.getElementById(id)?.addEventListener("change", saveSettingsFromControls);
+  }
+}
+
+function applySettingsToControls() {
+  if (!appSettings) return;
+  const cli = document.getElementById("settings-cli-input");
+  const homes = document.getElementById("settings-codex-homes-input");
+  const offline = document.getElementById("settings-offline-toggle");
+  const refresh = document.getElementById("settings-refresh-select");
+  const ultraPrice = document.getElementById("settings-antigravity-ultra-price");
+  if (cli) cli.value = appSettings.customCliPath || "";
+  if (homes) homes.value = appSettings.codexHomes || "";
+  if (offline) offline.checked = !!appSettings.offline;
+  if (refresh) refresh.value = String(appSettings.refreshMinutes || 1);
+  if (ultraPrice) ultraPrice.value = appSettings.antigravityUltraPrice ? String(appSettings.antigravityUltraPrice) : "";
+}
+
+async function saveSettingsFromControls() {
+  const settings = {
+    customCliPath: document.getElementById("settings-cli-input")?.value.trim() || null,
+    codexHomes: document.getElementById("settings-codex-homes-input")?.value.trim() || "",
+    offline: !!document.getElementById("settings-offline-toggle")?.checked,
+    refreshMinutes: Number(document.getElementById("settings-refresh-select")?.value || 1),
+    quotaSource: document.getElementById("settings-quota-source-select")?.value || "codex",
+    antigravityUltraPrice: Number(document.getElementById("settings-antigravity-ultra-price")?.value) || null,
+  };
+  appSettings = await invokeTauri("set_settings", { settings });
+  for (const key in periodCache) delete periodCache[key];
+  for (const key in harnessCache) delete harnessCache[key];
+  await loadData(true);
+}
+
+function renderSettings() {
+  const ultraRow = document.getElementById("settings-antigravity-ultra-row");
+  const antigravityPlan = (reportData?.subscription?.agents || []).find(
+    (agent) => agent.agent?.toLowerCase() === "antigravity"
+  );
+  if (ultraRow) ultraRow.hidden = !shouldShowAntigravityUltraSetting(antigravityPlan);
+
+  // 1. Quota source picker (uniquement les agents avec quota détecté !)
+  const select = document.getElementById("settings-quota-source-select");
+  if (select) {
+    select.innerHTML = "";
+    const agentsWithQuota = (reportData?.subscription?.agents || []).filter(
+      (a) => a.liveLimits || a.window != null
+    );
+
+    if (agentsWithQuota.length === 0) {
+      select.innerHTML = `<option value="none">No live quota agents detected</option>`;
+    } else {
+      agentsWithQuota.forEach((a) => {
+        const opt = document.createElement("option");
+        opt.value = a.agent;
+        opt.textContent = getAgentDisplayName(a.agent);
+        select.appendChild(opt);
+      });
+      select.value = appSettings?.quotaSource || agentsWithQuota[0].agent;
+    }
+  }
+
+  // 2. Liste des harnais détectés (aucun harnais non détecté !)
+  const list = document.getElementById("settings-detected-agents-list");
+  if (list) {
+    list.innerHTML = "";
+    if (detectedAgents.length === 0) {
+      list.innerHTML = `<div style="color:var(--text-muted);font-size:12px;">No active agents detected yet.</div>`;
+    } else {
+      detectedAgents.forEach((agent) => {
+        const row = document.createElement("div");
+        row.className = "detected-agent-row";
+        row.innerHTML = `
+          <div style="display:flex;align-items:center;gap:10px;">
+            <img src="${getAgentBrandIcon(agent)}" width="22" height="22" style="border-radius:4px;" />
+            <strong>${escapeHtml(getAgentDisplayName(agent))}</strong>
+          </div>
+          <span class="status-badge-ok">Active & detected</span>
+        `;
+        list.appendChild(row);
+      });
+    }
+  }
+}
+
+// ==========================================================================
+// Bouton de rafraîchissement
+// ==========================================================================
 function initRefresh() {
   document.getElementById("refresh-btn")?.addEventListener("click", async () => {
     for (const k in periodCache) delete periodCache[k];
     for (const k in harnessCache) delete harnessCache[k];
-    for (const k in projectsCache) delete projectsCache[k];
-    for (const k in antigravityCache) delete antigravityCache[k];
-    
-    if (currentTab === "projects") {
-      await loadProjects(true);
-    } else if (currentTab === "antigravity") {
-      await loadAntigravity(true);
+    await loadData(true);
+  });
+}
+
+// ==========================================================================
+// Timer de pied de page ("Updated 11 sec ago")
+// ==========================================================================
+function initFooterTimer() {
+  const el = document.getElementById("footer-status-text");
+  if (!el) return;
+
+  setInterval(() => {
+    const sec = Math.floor((Date.now() - lastUpdatedTime) / 1000);
+    const staleAfter = (appSettings?.refreshMinutes || 1) * 60 + 30;
+    const pillText = document.getElementById("quota-pill-text");
+    const dot = document.querySelector("#quota-menu-pill .quota-dot");
+    if (sec > staleAfter && pillText?.textContent.includes("· live")) {
+      pillText.textContent = pillText.textContent.replace("· live", "· saved");
+      if (dot) dot.className = "quota-dot";
+    }
+    if (sec < 5) {
+      el.textContent = "Updated just now";
+    } else if (sec < 60) {
+      el.textContent = `Updated ${sec} sec ago`;
     } else {
-      await loadData(true);
-      if (currentTab !== "summary" && currentTab !== "settings") {
-        renderHarnessView(currentTab);
-      }
+      const min = Math.floor(sec / 60);
+      el.textContent = `Updated ${min} min ago`;
     }
-  });
+  }, 1000);
 }
-
-function initSearch() {
-  // Recherche en direct dans les projets
-  document.getElementById("projects-search")?.addEventListener("input", (e) => {
-    const q = e.target.value.toLowerCase().trim();
-    filterTableRows("#projects-tbody", q, 7, "Aucun projet ne correspond à votre recherche");
-  });
-
-  // Recherche en direct dans les modèles
-  document.getElementById("models-search")?.addEventListener("input", (e) => {
-    const q = e.target.value.toLowerCase().trim();
-    filterTableRows("#models-tbody", q, 3, "Aucun modèle ne correspond");
-  });
-}
-
-function filterTableRows(tbodySelector, query, colSpan, emptyMsg) {
-  const tbody = document.querySelector(tbodySelector);
-  if (!tbody) return;
-  const rows = tbody.querySelectorAll("tr");
-  let visible = 0;
-
-  rows.forEach((tr) => {
-    if (tr.classList.contains("no-match-row")) return;
-    const txt = tr.textContent.toLowerCase();
-    const match = !query || txt.includes(query);
-    tr.style.display = match ? "" : "none";
-    if (match) visible++;
-  });
-
-  let noMatch = tbody.querySelector(".no-match-row");
-  if (visible === 0 && rows.length > 0) {
-    if (!noMatch) {
-      noMatch = document.createElement("tr");
-      noMatch.className = "no-match-row";
-      noMatch.innerHTML = `<td colspan="${colSpan}" style="text-align: center; color: var(--text-muted); padding: 20px;">${emptyMsg}</td>`;
-      tbody.appendChild(noMatch);
-    }
-  } else if (noMatch) {
-    noMatch.remove();
-  }
-}
-
-
-function initTauriEvents() {
-  if (window.__TAURI__?.event) {
-    window.__TAURI__.event.listen("quotas_updated", (event) => {
-      console.log("Mise à jour en tâche de fond reçue", event.payload);
-      if (event.payload) {
-        reportData = event.payload;
-        renderSummary();
-      }
-    });
-
-    window.__TAURI__.event.listen("refresh_requested", () => {
-      loadData();
-    });
-  }
-}
-
-async function checkCliStatus() {
-  try {
-    const status = await invokeTauri("get_cli_status");
-    const ind = document.getElementById("cli-status-indicator");
-    const path = document.getElementById("cli-path-display");
-    const dirEl = document.getElementById("data-dir-display");
-    if (status?.available) {
-      ind.textContent = "Opérationnel (Binaire natif)";
-      ind.classList.add("active");
-      path.textContent = status.path || "agent-burn.exe";
-    } else {
-      ind.textContent = "Mode NPX automatique";
-      path.textContent = "npx agent-burn@latest";
-    }
-    if (status?.dataDir && dirEl) {
-      dirEl.textContent = status.dataDir;
-    }
-  } catch (err) {
-    console.error("Erreur détection CLI:", err);
-  }
-}
-
-let currentSummaryRequestId = 0;
-let currentProjectsRequestId = 0;
-let warmupDone = false;
-
-function renderCurrentTabContent() {
-  if (currentTab === "summary") {
-    renderSummary();
-  } else if (currentTab === "projects") {
-    renderProjectsView(projectsData);
-  } else if (currentTab === "antigravity") {
-    renderAntigravityView(antigravityData);
-  } else if (currentTab !== "settings") {
-    renderHarnessView(currentTab);
-  }
-}
-
-function updateStatusSynced() {
-  const statusBar = document.getElementById("status-text");
-  const statusDot = document.querySelector(".status-dot");
-  if (statusBar) {
-    const now = new Date().toLocaleTimeString();
-    statusBar.textContent = `Données réelles synchronisées (${now})`;
-    if (statusDot) statusDot.style.background = "var(--accent-green)";
-  }
-}
-
-let fullReportData = null;
-
-function sliceSummaryData(fullData, period) {
-  if (!fullData || !fullData.daily) return fullData;
-  if (period === "all") return fullData;
-
-  const now = new Date();
-  const todayStr = now.toISOString().split("T")[0];
-
-  const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
-  const weekStr = sevenDaysAgo.toISOString().split("T")[0];
-
-  const mtdStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-01`;
-
-  const dateFilter = (dateStr) => {
-    if (period === "today") return dateStr === todayStr;
-    if (period === "week") return dateStr >= weekStr;
-    if (period === "mtd") return dateStr >= mtdStr;
-    return true;
-  };
-
-  const filteredDaily = (fullData.daily || []).filter((d) => dateFilter(d.date));
-  const totalCost = filteredDaily.reduce((acc, d) => acc + (d.cost || 0), 0);
-  const totalTokens = filteredDaily.reduce((acc, d) => acc + (d.tokens || 0), 0);
-
-  const filteredAgents = (fullData.agents || []).map((ag) => {
-    const agDaily = (ag.daily || []).filter((d) => dateFilter(d.date));
-    const agCost = agDaily.reduce((acc, d) => acc + (d.cost || 0), 0);
-    const agTokens = agDaily.reduce((acc, d) => acc + (d.tokens || 0), 0);
-    return {
-      ...ag,
-      daily: agDaily,
-      totalCost: agCost,
-      totalTokens: agTokens,
-    };
-  });
-
-  return {
-    ...fullData,
-    daily: filteredDaily,
-    agents: filteredAgents,
-    totals: {
-      totalCost,
-      totalTokens,
-    },
-  };
-}
-
-function autoDetectCursor(data) {
-  const hasCursor =
-    data?.subscription?.agents?.some((a) => a.agent?.toLowerCase() === "cursor") ||
-    data?.models?.some((m) => m.model?.toLowerCase().includes("cursor")) ||
-    data?.agents?.some((a) => a.agent === "cursor");
-  if (hasCursor) {
-    const saved = localStorage.getItem("agent_burn_visible_tabs");
-    let visibleTabs = { summary: true, projects: true, antigravity: true, codex: true, claude: false, cursor: true };
-    if (saved) {
-      try {
-        visibleTabs = Object.assign(visibleTabs, JSON.parse(saved));
-        if (visibleTabs.cursor === undefined) {
-          visibleTabs.cursor = true;
-          localStorage.setItem("agent_burn_visible_tabs", JSON.stringify(visibleTabs));
-        }
-      } catch (_) {}
-    } else {
-      localStorage.setItem("agent_burn_visible_tabs", JSON.stringify(visibleTabs));
-    }
-    applyTabVisibility("cursor", visibleTabs.cursor !== false);
-    const cb = document.querySelector(`input[data-tab-target="cursor"]`);
-    if (cb) cb.checked = visibleTabs.cursor !== false;
-  }
-}
-
-async function loadData(force = false) {
-  const statusBar = document.getElementById("status-text");
-  const reqId = ++currentSummaryRequestId;
-  const targetPeriod = currentPeriod;
-
-  // 1. Découpage instantané en 0 ms si données complètes en mémoire
-  if (!force && fullReportData) {
-    reportData = sliceSummaryData(fullReportData, targetPeriod);
-    periodCache[targetPeriod] = reportData;
-    renderCurrentTabContent();
-    updateStatusSynced();
-    return;
-  }
-
-  // 2. Si déjà en cache pour cette période précise
-  if (!force && periodCache[targetPeriod]) {
-    reportData = periodCache[targetPeriod];
-    renderCurrentTabContent();
-    updateStatusSynced();
-    return;
-  }
-
-  if (statusBar) statusBar.textContent = `Calcul et analyse des logs (${getPeriodLabel(targetPeriod)})...`;
-
-  try {
-    const data = await invokeTauri("get_summary", { period: targetPeriod });
-
-    if (targetPeriod === "all") {
-      fullReportData = data;
-    }
-
-    reportData = data;
-    periodCache[targetPeriod] = data;
-
-    autoDetectCursor(reportData);
-
-    // Charger ou synchroniser Antigravity en arrière-plan
-    if (!antigravityCache[targetPeriod]) {
-      invokeTauri("get_antigravity_summary", { period: targetPeriod }).then((agd) => {
-        antigravityCache[targetPeriod] = agd;
-        if (currentTab === "summary") renderSummary();
-      }).catch(() => {});
-    }
-
-    // Garde-fou d'affichage : on ne modifie l'écran que si l'utilisateur est toujours sur cette timeline
-    if (reqId === currentSummaryRequestId && targetPeriod === currentPeriod) {
-      renderCurrentTabContent();
-      updateStatusSynced();
-      await persistCache();
-    }
-
-    // Lancer le pré-chargement en arrière-plan des autres périodes pour que tout soit instantané
-    if (!warmupDone) {
-      warmupDone = true;
-      setTimeout(warmupAllPeriods, 1000);
-    }
-  } catch (error) {
-    console.error("Échec chargement des données:", error);
-    if (reqId === currentSummaryRequestId) {
-      if (statusBar) statusBar.textContent = `Erreur: ${error.message || error}`;
-      const statusDot = document.querySelector(".status-dot");
-      if (statusDot) statusDot.style.background = "#ef4444";
-    }
-  }
-}
-
-async function warmupAllPeriods() {
-  const periods = ["today", "week", "mtd", "all"];
-  for (const p of periods) {
-    if (!periodCache[p]) {
-      try {
-        const d = await invokeTauri("get_summary", { period: p });
-        periodCache[p] = d;
-      } catch (_) {}
-    }
-    if (!projectsCache[p]) {
-      try {
-        const pd = await invokeTauri("get_projects_usage", { period: p });
-        projectsCache[p] = pd;
-      } catch (_) {}
-    }
-  }
-  if (!harnessCache["codex"]) {
-    try {
-      harnessCache["codex"] = await invokeTauri("get_harness", { agent: "codex" });
-    } catch (_) {}
-  }
-  await persistCache();
-  console.log("⚡ Pré-chargement de toutes les timelines terminé en mémoire !");
-}
-
-async function persistCache() {
-  try {
-    await invokeTauri("save_report_cache", {
-      data: {
-        summary: reportData,
-        projects: projectsCache[currentPeriod] || projectsData,
-        antigravity: antigravityCache[currentPeriod] || antigravityData,
-        updatedAt: new Date().toISOString(),
-      },
-    });
-  } catch (e) {
-    console.debug("Persistance cache disque ignorée", e);
-  }
-}
-
-async function loadProjects(force = false) {
-  const statusBar = document.getElementById("status-text");
-  const reqId = ++currentProjectsRequestId;
-  const targetPeriod = currentPeriod;
-
-  if (!force && projectsCache[targetPeriod]) {
-    projectsData = projectsCache[targetPeriod];
-    renderProjectsView(projectsData);
-    updateStatusSynced();
-    return;
-  }
-
-  if (statusBar) statusBar.textContent = `Analyse des projets locaux (${getPeriodLabel(targetPeriod)})...`;
-
-  try {
-    const data = await invokeTauri("get_projects_usage", { period: targetPeriod });
-
-    // TOUJOURS sauvegarder en mémoire
-    projectsCache[targetPeriod] = data;
-
-    // Garde-fou d'affichage
-    if (reqId === currentProjectsRequestId && targetPeriod === currentPeriod) {
-      projectsData = data;
-      renderProjectsView(data);
-      updateStatusSynced();
-      await persistCache();
-    }
-  } catch (err) {
-    console.error("Échec analyse projets:", err);
-    if (reqId === currentProjectsRequestId) {
-      if (statusBar) statusBar.textContent = `Erreur analyse projets: ${err}`;
-      const statusDot = document.querySelector(".status-dot");
-      if (statusDot) statusDot.style.background = "#ef4444";
-    }
-  }
-}
-
-
-function renderProjectsView(data) {
-  if (!data) return;
-
-  const countEl = document.getElementById("projects-count");
-  const topNameEl = document.getElementById("projects-top-name");
-  const topSubEl = document.getElementById("projects-top-sub");
-  const totalCostEl = document.getElementById("projects-total-cost");
-  const totalTokensEl = document.getElementById("projects-total-tokens");
-  const tbody = document.getElementById("projects-tbody");
-
-  if (countEl) countEl.textContent = data.totalProjects || 0;
-  if (totalCostEl) totalCostEl.textContent = formatCurrency(data.totalCost || 0);
-  if (totalTokensEl) totalTokensEl.textContent = `${formatNumber(data.totalTokens || 0)} tokens`;
-
-  const projects = data.projects || [];
-  if (projects.length > 0) {
-    if (topNameEl) topNameEl.textContent = projects[0].name;
-    if (topSubEl) topSubEl.textContent = `${formatNumber(projects[0].total_tokens)} tokens (${formatCurrency(projects[0].estimated_cost)})`;
-  } else {
-    if (topNameEl) topNameEl.textContent = "Aucun";
-    if (topSubEl) topSubEl.textContent = "0 token sur cette période";
-  }
-
-  if (!tbody) return;
-  tbody.innerHTML = "";
-
-  if (projects.length === 0) {
-    tbody.innerHTML = `
-      <tr class="no-match-row">
-        <td colspan="7" style="padding: 24px; text-align: center; color: var(--text-muted);">
-          Aucune session détectée pour les projets locaux sur la période sélectionnée (${currentPeriod}).
-        </td>
-      </tr>
-    `;
-    return;
-  }
-
-  projects.forEach((proj) => {
-    const tr = document.createElement("tr");
-
-    let formattedDate = "-";
-    if (proj.last_active) {
-      try {
-        const d = new Date(proj.last_active);
-        formattedDate = d.toLocaleDateString("fr-FR", {
-          day: "2-digit",
-          month: "2-digit",
-          year: "numeric",
-          hour: "2-digit",
-          minute: "2-digit",
-        });
-      } catch (_) {
-        formattedDate = proj.last_active;
-      }
-    }
-
-    const fillWidth = Math.max(3, Math.min(100, proj.relative_percent || 0));
-
-    tr.innerHTML = `
-      <td>
-        <div class="project-name-cell">
-          <strong>${escapeHtml(proj.name)}</strong>
-        </div>
-      </td>
-      <td>
-        <div class="project-path-cell" title="${escapeHtml(proj.path)}">
-          ${escapeHtml(proj.path)}
-        </div>
-      </td>
-      <td>
-        <span class="project-sessions-badge">${proj.session_count} session${proj.session_count > 1 ? "s" : ""}</span>
-      </td>
-      <td style="color: var(--text-muted); font-size: 11px;">
-        ${formattedDate}
-      </td>
-      <td>
-        <div class="token-progress-wrapper">
-          <span class="token-val">${formatNumber(proj.total_tokens)}</span>
-          <div class="token-progress-bar">
-            <div class="token-progress-fill" style="width: ${fillWidth}%;"></div>
-          </div>
-        </div>
-      </td>
-      <td>
-        <strong style="color: var(--accent-flame);">${formatCurrency(proj.estimated_cost)}</strong>
-      </td>
-      <td>
-        <button class="btn-open-project" data-path="${escapeHtml(proj.path)}" title="Ouvrir dans l'Explorateur Windows">
-          📂 Ouvrir
-        </button>
-      </td>
-    `;
-
-    tbody.appendChild(tr);
-  });
-
-  // Brancher les boutons d'ouverture de dossier Windows Explorer
-  tbody.querySelectorAll(".btn-open-project").forEach((btn) => {
-    btn.addEventListener("click", async (e) => {
-      e.stopPropagation();
-      const path = btn.getAttribute("data-path");
-      try {
-        await invokeTauri("open_project_folder", { path });
-      } catch (err) {
-        alert("Impossible d'ouvrir le dossier: " + err);
-      }
-    });
-  });
-
-  // Réappliquer la recherche si une requête est en cours
-  const searchInput = document.getElementById("projects-search");
-  if (searchInput && searchInput.value.trim()) {
-    filterTableRows("#projects-tbody", searchInput.value.toLowerCase().trim(), 7, "Aucun projet ne correspond");
-  }
-}
-
-let antigravityData = null;
-const antigravityCache = {};
-let currentAntigravityRequestId = 0;
-
-async function loadAntigravity(force = false) {
-  const container = document.getElementById("antigravity-content");
-  if (!container) return;
-
-  const targetPeriod = currentPeriod;
-  const reqId = ++currentAntigravityRequestId;
-
-  if (!force && antigravityCache[targetPeriod]) {
-    antigravityData = antigravityCache[targetPeriod];
-    renderAntigravityView(antigravityData);
-    updateStatusSynced();
-    return;
-  }
-
-  container.innerHTML = `<div style="padding: 40px; text-align: center; color: var(--text-muted);">
-    <div>Analyse des 56 sessions Google Antigravity (${getPeriodLabel(targetPeriod)})...</div>
-  </div>`;
-
-  try {
-    const data = await invokeTauri("get_antigravity_summary", { period: targetPeriod });
-    antigravityCache[targetPeriod] = data;
-
-    if (reqId === currentAntigravityRequestId && targetPeriod === currentPeriod) {
-      antigravityData = data;
-      renderAntigravityView(data);
-      updateStatusSynced();
-    }
-  } catch (err) {
-    console.error("Échec chargement Antigravity:", err);
-    if (reqId === currentAntigravityRequestId) {
-      container.innerHTML = `
-        <div class="card settings-card">
-          <h3 style="color: #ef4444;">Erreur de chargement Antigravity</h3>
-          <p style="color: var(--text-muted); margin-top: 8px;">${escapeHtml(err.message || err)}</p>
-        </div>
-      `;
-    }
-  }
-}
-
-function renderAntigravityView(data) {
-  const container = document.getElementById("antigravity-content");
-  if (!container) return;
-
-  if (!data || data.session_count === 0) {
-    container.innerHTML = `
-      <div class="card settings-card">
-        <div style="display: flex; justify-content: space-between; align-items: center;">
-          <h3 style="color: var(--accent-flame); font-size: 18px;">GOOGLE ANTIGRAVITY</h3>
-          <span class="badge">0 session</span>
-        </div>
-        <p style="color: var(--text-muted); margin-top: 12px;">
-          Aucune session Antigravity enregistrée pour la période sélectionnée (<strong>${getPeriodLabel(currentPeriod)}</strong>).
-          Sélectionnez « Tout l'historique » ou « Ce mois-ci » pour explorer vos 56 sessions antérieures.
-        </p>
-      </div>
-    `;
-    return;
-  }
-
-  const topModel = data.top_models && data.top_models.length > 0 ? data.top_models[0].model : "gemini-2.5-pro";
-
-  let modelsTableHtml = "";
-  if (data.top_models && data.top_models.length > 0) {
-    modelsTableHtml = `
-      <div class="section-title" style="margin-top: 24px;">Modèles Google Gemini utilisés (${getPeriodLabel(currentPeriod)})</div>
-      <div class="table-container">
-        <table>
-          <thead>
-            <tr>
-              <th>Modèle</th>
-              <th>Tokens</th>
-              <th>Coût équivalent API (Source officielle LiteLLM)</th>
-            </tr>
-          </thead>
-          <tbody>
-            ${data.top_models.map(m => `
-              <tr>
-                <td><strong>${escapeHtml(m.model)}</strong></td>
-                <td>${formatNumber(m.tokens)}</td>
-                <td><strong style="color: var(--accent-flame);">${formatCurrency(m.cost)}</strong></td>
-              </tr>
-            `).join("")}
-          </tbody>
-        </table>
-      </div>
-    `;
-  }
-
-  let sessionsTableHtml = "";
-  if (data.sessions && data.sessions.length > 0) {
-    sessionsTableHtml = `
-      <div class="section-title" style="margin-top: 24px;">Historique détaillé des sessions Antigravity (${data.sessions.length} session${data.sessions.length > 1 ? "s" : ""})</div>
-      <div class="table-container">
-        <table>
-          <thead>
-            <tr>
-              <th>Projet</th>
-              <th>Répertoire</th>
-              <th>Dernière activité</th>
-              <th>Étapes</th>
-              <th>Tokens totaux</th>
-              <th>Coût équivalent API</th>
-            </tr>
-          </thead>
-          <tbody>
-            ${data.sessions.map(s => {
-              let formattedDate = "-";
-              if (s.date) {
-                try {
-                  const d = new Date(s.date);
-                  formattedDate = d.toLocaleDateString("fr-FR", {
-                    day: "2-digit",
-                    month: "2-digit",
-                    year: "numeric",
-                    hour: "2-digit",
-                    minute: "2-digit",
-                  });
-                } catch (_) {
-                  formattedDate = s.date;
-                }
-              }
-              return `
-                <tr>
-                  <td>
-                    <div class="project-name-cell">
-                      <strong>${escapeHtml(s.project_name)}</strong>
-                    </div>
-                  </td>
-                  <td>
-                    <div class="project-path-cell" title="${escapeHtml(s.project_path)}">
-                      ${escapeHtml(s.project_path)}
-                    </div>
-                  </td>
-                  <td style="color: var(--text-muted); font-size: 11px;">${formattedDate}</td>
-                  <td><span class="project-sessions-badge">${s.steps_count} étapes</span></td>
-                  <td><strong>${formatNumber(s.total_tokens)}</strong> <span style="font-size: 10px; color: var(--text-muted);">(${formatNumber(s.input_tokens)} in / ${formatNumber(s.output_tokens)} out)</span></td>
-                  <td><strong style="color: var(--accent-flame);">${formatCurrency(s.cost)}</strong></td>
-                </tr>
-              `;
-            }).join("")}
-          </tbody>
-        </table>
-      </div>
-    `;
-  }
-
-  container.innerHTML = `
-    <div class="card settings-card">
-      <div style="display: flex; justify-content: space-between; align-items: center;">
-        <h3 style="color: var(--accent-flame); font-size: 18px;">GOOGLE ANTIGRAVITY</h3>
-        <span class="badge active">${data.session_count} session${data.session_count > 1 ? "s" : ""}</span>
-      </div>
-
-      <div class="metrics-grid" style="margin-top: 16px;">
-        <div class="metric-card highlight">
-          <div class="metric-label">Valeur consommée API · ${getPeriodLabel(currentPeriod)}</div>
-          <div class="metric-value">${formatCurrency(data.total_cost)}</div>
-          <div class="metric-sub">Tarif officiel LiteLLM Vertex/AI Studio</div>
-        </div>
-        <div class="metric-card">
-          <div class="metric-label">Tokens consommés · ${getPeriodLabel(currentPeriod)}</div>
-          <div class="metric-value" style="color: var(--accent-flame);">${formatNumber(data.total_tokens)}</div>
-          <div class="metric-sub">${formatNumber(data.input_tokens)} in · ${formatNumber(data.output_tokens)} out</div>
-        </div>
-        <div class="metric-card">
-          <div class="metric-label">Modèle principal</div>
-          <div class="metric-value" style="font-size: 18px; margin-top: 4px;">${escapeHtml(topModel)}</div>
-          <div class="metric-sub">Antigravity Autonomous Coding Agent</div>
-        </div>
-      </div>
-    </div>
-
-    ${modelsTableHtml}
-    ${sessionsTableHtml}
-  `;
-}
-
-
-function escapeHtml(str) {
-  if (!str) return "";
-  return String(str)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#039;");
-}
-
-
-function renderSummary() {
-  if (!reportData) return;
-
-  const agData = antigravityCache[currentPeriod] || antigravityData;
-  const agCost = agData?.total_cost || 0;
-  const agTokens = agData?.total_tokens || 0;
-
-  // Métriques globales unifiées (Codex + Cursor + Antigravity)
-  const baseCost = reportData.totals?.totalCost ?? reportData.totalCost ?? 0;
-  const baseTokens = reportData.totals?.totalTokens ?? reportData.totalTokens ?? 0;
-  const totalCost = baseCost + agCost;
-  const totalTokens = baseTokens + agTokens;
-
-  document.getElementById("metric-spend").textContent = formatCurrency(totalCost);
-  document.getElementById("metric-tokens").textContent = formatNumber(totalTokens);
-
-  const sub = reportData.subscription;
-  const agentWithEstimate = (sub?.agents || []).find((a) => a.estimate?.valueMultiple != null);
-  if (agentWithEstimate && agentWithEstimate.estimate) {
-    document.getElementById("metric-value-mult").textContent = `${agentWithEstimate.estimate.valueMultiple.toFixed(1)}×`;
-    document.getElementById("metric-plan-name").textContent = `${agentWithEstimate.agent.toUpperCase()} ${agentWithEstimate.plan || "Plus"} ($${agentWithEstimate.pricePerMonth || 20}/mo)`;
-  } else if (sub?.valueMultiple) {
-    document.getElementById("metric-value-mult").textContent = `${sub.valueMultiple.toFixed(1)}×`;
-    document.getElementById("metric-plan-name").textContent = `${sub.planName || "Forfait actif"} ($${sub.monthlyPrice || 0}/mo)`;
-  } else {
-    document.getElementById("metric-value-mult").textContent = "-";
-  }
-
-  // Rendu du graphique d'évolution journalière
-  renderDailyChart(reportData.daily || []);
-
-  // Quotas par agent et statut direct
-  const quotasContainer = document.getElementById("quotas-container");
-  if (quotasContainer) {
-    quotasContainer.innerHTML = "";
-    const agents = sub?.agents || reportData.agents || [];
-    if (agents.length === 0 && (!agData || agData.session_count === 0)) {
-      quotasContainer.innerHTML = `<div class="quota-card" style="grid-column: 1/-1; color: var(--text-muted);">Aucun quota d'agent en cours détecté.</div>`;
-    } else {
-      agents.forEach((agent) => {
-        let remaining = agent.window?.usedPercent != null ? (100 - agent.window.usedPercent) : (agent.quota?.remainingPercent ?? 100);
-        let reset = agent.window?.elapsedMinutes != null ? `${(agent.window.elapsedMinutes / 60).toFixed(1)}h écoulées` : (agent.quota?.resetCountdown ?? "Dans le cycle");
-        let plan = agent.plan || "Défaut";
-
-        if (agent.agent === "cursor" && reportData.cursorAccount) {
-          const ca = reportData.cursorAccount;
-          if (ca.activePercentUsed != null) {
-            remaining = Math.max(0, 100 - ca.activePercentUsed);
-            reset = `${ca.activePercentUsed}% quota utilisé`;
-            plan = "Usage direct";
-          }
-        }
-
-        const costVal = agent.periodUsage ?? agent.periodCost ?? 0;
-        const card = document.createElement("div");
-        card.className = "quota-card";
-        card.innerHTML = `
-          <div class="quota-header">
-            <span class="quota-title">${escapeHtml(agent.agent.toUpperCase())} (${escapeHtml(plan)})</span>
-            <span class="quota-percent">${remaining.toFixed(0)}% restant</span>
-          </div>
-          <div class="progress-bar-bg">
-            <div class="progress-bar-fill" style="width: ${remaining}%;"></div>
-          </div>
-          <div class="quota-footer">
-            <span>Consommation : ${formatCurrency(costVal)}</span>
-            <span>Statut : ${escapeHtml(reset)}</span>
-          </div>
-        `;
-        quotasContainer.appendChild(card);
-      });
-
-      // Carte de statut direct Google Antigravity
-      if (agData && agData.session_count > 0) {
-        const topModel = agData.top_models?.[0]?.model || "gemini-3.8-flash";
-        const agCard = document.createElement("div");
-        agCard.className = "quota-card";
-        agCard.innerHTML = `
-          <div class="quota-header">
-            <span class="quota-title">ANTIGRAVITY (${topModel})</span>
-            <span class="quota-percent">${agData.session_count} session${agData.session_count > 1 ? "s" : ""}</span>
-          </div>
-          <div class="progress-bar-bg">
-            <div class="progress-bar-fill" style="width: 100%;"></div>
-          </div>
-          <div class="quota-footer">
-            <span>Consommation : ${formatCurrency(agData.total_cost || 0)}</span>
-            <span>Activité : ${formatNumber(agData.total_tokens || 0)} tokens</span>
-          </div>
-        `;
-        quotasContainer.appendChild(agCard);
-      }
-    }
-  }
-
-  // Modèles les plus utilisés (fusion Codex, Cursor et Gemini Antigravity)
-  const tbody = document.getElementById("models-tbody");
-  if (tbody) {
-    tbody.innerHTML = "";
-    let mergedModels = [...(reportData.models || [])];
-    if (agData?.top_models) {
-      for (const agm of agData.top_models) {
-        mergedModels.push({
-          model: agm.model,
-          totalTokens: agm.tokens,
-          totalCost: agm.cost,
-        });
-      }
-    }
-    mergedModels.sort((a, b) => (b.totalTokens ?? b.tokens ?? 0) - (a.totalTokens ?? a.tokens ?? 0));
-
-    if (mergedModels.length === 0) {
-      tbody.innerHTML = `<tr><td colspan="3" style="text-align: center; color: var(--text-muted);">Aucune donnée de modèle disponible pour cette période.</td></tr>`;
-    } else {
-      mergedModels.forEach((m) => {
-        const tr = document.createElement("tr");
-        const modelName = m.model || m.name || "Inconnu";
-        const modelTokens = m.totalTokens ?? m.tokens ?? 0;
-        const modelCost = m.totalCost ?? m.cost ?? 0;
-        tr.innerHTML = `
-          <td><strong>${escapeHtml(modelName)}</strong></td>
-          <td>${formatNumber(modelTokens)}</td>
-          <td>${formatCurrency(modelCost)}</td>
-        `;
-        tbody.appendChild(tr);
-      });
-    }
-  }
-}
-
-async function renderHarnessView(agentName) {
-  const container = document.getElementById("harness-content");
-  if (!container) return;
-
-  container.innerHTML = `<div style="padding: 24px; text-align: center; color: var(--text-muted);">Chargement des données détaillées pour ${agentName.toUpperCase()}...</div>`;
-
-  if (agentName === "cursor") {
-    const subAgent = (reportData?.subscription?.agents || []).find((a) => a.agent?.toLowerCase() === "cursor");
-    const cursorModels = (reportData?.models || []).filter((m) => m.model?.toLowerCase().includes("cursor"));
-    const cursorTokens = cursorModels.reduce((acc, m) => acc + (m.totalTokens || m.tokens || 0), 0);
-    const cursorCost = subAgent?.periodUsage ?? cursorModels.reduce((acc, m) => acc + (m.totalCost || m.cost || 0), 0);
-    renderCursorHarness(container, subAgent, cursorModels, cursorCost, cursorTokens);
-    return;
-  }
-
-  let hData = null;
-  if (agentName === "codex" || agentName === "claude") {
-    try {
-      if (!harnessCache[agentName]) {
-        harnessCache[agentName] = await invokeTauri("get_harness", { agent: agentName });
-      }
-      hData = harnessCache[agentName];
-    } catch (e) {
-      console.warn("Échec récupération harness pour", agentName, e);
-    }
-  }
-
-  if (!hData || (!hData.plan && (!hData.topModels || hData.topModels.length === 0))) {
-    container.innerHTML = `
-      <div class="card settings-card">
-        <h3>${agentName.toUpperCase()}</h3>
-        <p style="color: var(--text-muted); margin-top: 10px;">
-          Aucune session récente trouvée pour ${agentName} sur cette machine. Vérifiez que vous êtes bien connecté à l'assistant.
-        </p>
-      </div>
-    `;
-    return;
-  }
-
-  const econ = hData.economics || {};
-  const win = hData.window || {};
-  const remainingPct = win.usedPercent != null ? Math.max(0, 100 - win.usedPercent) : 100;
-  const elapsedHrs = win.windowMinutes ? ((win.windowMinutes * (win.elapsedPercent || 0)) / 100 / 60).toFixed(1) : "0";
-
-  // Consommation dynamique de l'agent sur la période active
-  const agentPeriod = (periodCache[currentPeriod]?.agents || reportData?.agents || []).find((a) => a.agent === agentName);
-  let agentCost = agentPeriod?.totalCost ?? 0;
-  let agentTokens = agentPeriod?.totalTokens ?? 0;
-  let agentModels = agentPeriod?.models || [];
-
-  if (agentName === "codex" && agentTokens === 0) {
-    const codexModels = (reportData?.models || []).filter((m) => !m.model?.toLowerCase().includes("cursor") && !m.model?.toLowerCase().includes("gemini"));
-    agentTokens = codexModels.reduce((acc, m) => acc + (m.totalTokens || m.tokens || 0), 0);
-    agentCost = codexModels.reduce((acc, m) => acc + (m.totalCost || m.cost || 0), 0);
-    agentModels = codexModels;
-  }
-
-  const periodActivityHtml = `
-    <div class="section-title-row" style="margin-top: 24px;">
-      <div class="section-title">Consommation ${agentName.toUpperCase()} · <span style="color: var(--accent-flame);">${getPeriodLabel(currentPeriod)}</span></div>
-    </div>
-    <div class="metrics-grid">
-      <div class="metric-card">
-        <div class="metric-label">Tokens (${getPeriodLabel(currentPeriod)})</div>
-        <div class="metric-value">${formatNumber(agentTokens)}</div>
-        <div class="metric-sub">${agentTokens > 0 ? "Activité enregistrée" : "Aucune consommation sur cette timeline"}</div>
-      </div>
-      <div class="metric-card highlight">
-        <div class="metric-label">Valeur consommée API</div>
-        <div class="metric-value">${formatCurrency(agentCost)}</div>
-        <div class="metric-sub">Coût équivalent au token API</div>
-      </div>
-      <div class="metric-card">
-        <div class="metric-label">Modèles actifs (${getPeriodLabel(currentPeriod)})</div>
-        <div class="metric-value">${agentModels.length}</div>
-        <div class="metric-sub">${agentModels.map(m => m.model).slice(0, 2).join(", ") || "Aucun"}</div>
-      </div>
-    </div>
-  `;
-
-  let spendMixHtml = "";
-  if (hData.spendMix && hData.spendMix.length > 0) {
-    spendMixHtml = `
-      <div class="section-title" style="margin-top: 24px;">Répartition globale des tokens (${agentName.toUpperCase()})</div>
-      <div class="metrics-grid">
-        ${hData.spendMix.map(m => `
-          <div class="metric-card">
-            <div class="metric-label">${m.label.toUpperCase()}</div>
-            <div class="metric-value">${formatCurrency(m.costUSD)}</div>
-            <div class="metric-sub">${formatNumber(m.tokens)} tokens (${m.tokenPercent.toFixed(1)}%)</div>
-          </div>
-        `).join("")}
-      </div>
-    `;
-  }
-
-  // Modèles sur la période active si disponibles, sinon modèles favoris globaux
-  const displayModels = agentModels.length > 0 ? agentModels : (hData.topModels || []);
-  const modelsTitle = agentModels.length > 0
-    ? `Modèles utilisés par ${agentName.toUpperCase()} (${getPeriodLabel(currentPeriod)})`
-    : `Modèles favoris de ${agentName.toUpperCase()}`;
-
-  let topModelsHtml = "";
-  if (displayModels.length > 0) {
-    topModelsHtml = `
-      <div class="section-title" style="margin-top: 24px;">${modelsTitle}</div>
-      <div class="table-container">
-        <table>
-          <thead>
-            <tr>
-              <th>Modèle</th>
-              <th>Tokens</th>
-              <th>Coût équivalent</th>
-            </tr>
-          </thead>
-          <tbody>
-            ${displayModels.map(m => `
-              <tr>
-                <td><strong>${m.model || m.name}</strong></td>
-                <td>${formatNumber(m.tokens ?? m.totalTokens ?? 0)}</td>
-                <td>${formatCurrency(m.cost ?? m.totalCost ?? 0)}</td>
-              </tr>
-            `).join("")}
-          </tbody>
-        </table>
-      </div>
-    `;
-  }
-
-  let weeklyTrendHtml = "";
-  if (hData.weeklyTrend && hData.weeklyTrend.length > 0) {
-    weeklyTrendHtml = `
-      <div class="section-title" style="margin-top: 24px;">Historique d'utilisation hebdomadaire (8 semaines)</div>
-      <div class="table-container">
-        <table>
-          <thead>
-            <tr>
-              <th>Semaine débutant le</th>
-              <th>Dépense équivalente</th>
-            </tr>
-          </thead>
-          <tbody>
-            ${hData.weeklyTrend.map(w => `
-              <tr>
-                <td>${w.weekStart}</td>
-                <td><strong style="color: var(--accent-flame);">${formatCurrency(w.cost)}</strong></td>
-              </tr>
-            `).join("")}
-          </tbody>
-        </table>
-      </div>
-    `;
-  }
-
-  container.innerHTML = `
-    <div class="card settings-card">
-      <div style="display: flex; justify-content: space-between; align-items: center;">
-        <h3 style="color: var(--accent-flame); font-size: 18px;">Compte ${agentName.toUpperCase()} (${hData.plan || "Plus"})</h3>
-        <span class="badge active">${econ.pricePerMonth ? `$${econ.pricePerMonth}/mois` : "Actif"}</span>
-      </div>
-
-      <div class="metrics-grid" style="margin-top: 16px;">
-        <div class="metric-card">
-          <div class="metric-label">Quota hebdomadaire restant (Direct)</div>
-          <div class="metric-value" style="color: var(--accent-flame);">${remainingPct.toFixed(0)}%</div>
-          <div class="metric-sub">${win.usedPercent ?? 0}% utilisé (~${elapsedHrs}h écoulées)</div>
-        </div>
-        <div class="metric-card">
-          <div class="metric-label">Dépense sur la fenêtre active</div>
-          <div class="metric-value">${formatCurrency(win.apiEquivalentSpent || 0)}</div>
-          <div class="metric-sub">${hData.resetCreditsAvailable != null ? `${hData.resetCreditsAvailable} crédits de reset` : "Dans le cycle"}</div>
-        </div>
-        <div class="metric-card highlight">
-          <div class="metric-label">Multiplicateur de valeur (ROI)</div>
-          <div class="metric-value">${econ.valueMultiple ? `${econ.valueMultiple.toFixed(1)}×` : "-"}</div>
-          <div class="metric-sub">Subvention : ${formatCurrency(econ.subsidyPerMonth || 0)}/mois</div>
-        </div>
-      </div>
-    </div>
-
-    ${periodActivityHtml}
-    ${spendMixHtml}
-    ${topModelsHtml}
-    ${weeklyTrendHtml}
-  `;
-}
-
-function renderCursorHarness(container, subAgent, models, totalCost, totalTokens) {
-  const planName = subAgent?.plan || "Usage détecté";
-  container.innerHTML = `
-    <div class="card settings-card">
-      <div style="display: flex; justify-content: space-between; align-items: center;">
-        <h3 style="color: var(--accent-flame); font-size: 18px;">Compte CURSOR</h3>
-        <span class="badge active">${escapeHtml(planName)}</span>
-      </div>
-
-      <div class="metrics-grid" style="margin-top: 16px;">
-        <div class="metric-card">
-          <div class="metric-label">Consommation · ${getPeriodLabel(currentPeriod)}</div>
-          <div class="metric-value" style="color: var(--accent-flame);">${formatCurrency(totalCost)}</div>
-          <div class="metric-sub">Coût équivalent API calculé</div>
-        </div>
-        <div class="metric-card">
-          <div class="metric-label">Tokens consommés</div>
-          <div class="metric-value">${formatNumber(totalTokens)}</div>
-          <div class="metric-sub">${models.length} modèle${models.length > 1 ? "s" : ""} actif${models.length > 1 ? "s" : ""}</div>
-        </div>
-      </div>
-    </div>
-
-    ${models.length > 0 ? `
-      <div class="section-title" style="margin-top: 24px;">Modèles Cursor (${getPeriodLabel(currentPeriod)})</div>
-      <div class="table-container">
-        <table>
-          <thead>
-            <tr>
-              <th>Modèle</th>
-              <th>Tokens</th>
-              <th>Coût équivalent</th>
-            </tr>
-          </thead>
-          <tbody>
-            ${models.map(m => `
-              <tr>
-                <td><strong>${escapeHtml(m.model || m.name)}</strong></td>
-                <td>${formatNumber(m.totalTokens ?? m.tokens ?? 0)}</td>
-                <td><strong style="color: var(--accent-flame);">${formatCurrency(m.totalCost ?? m.cost ?? 0)}</strong></td>
-              </tr>
-            `).join("")}
-          </tbody>
-        </table>
-      </div>
-    ` : `
-      <div class="card settings-card" style="margin-top: 20px;">
-        <p style="color: var(--text-muted);">Aucun modèle spécifique Cursor n'a été utilisé sur cette timeline.</p>
-      </div>
-    `}
-  `;
-}
-
-function formatCurrency(num) {
-
-  return "$" + Number(num).toFixed(2);
-}
-
-function formatNumber(num) {
-  return Number(num).toLocaleString("fr-FR");
-}
-
-function renderDailyChart(daily) {
-  const container = document.getElementById("chart-svg-container");
-  if (!container) return;
-
-  if (!daily || daily.length === 0) {
-    container.innerHTML = `<div style="display:flex;height:100%;align-items:center;justify-content:center;color:var(--text-muted);font-size:13px;">Aucune donnée journalière disponible pour cette période.</div>`;
-    return;
-  }
-
-  // Trier par date croissante
-  const sorted = [...daily].sort((a, b) => a.date.localeCompare(b.date));
-
-  const width = container.clientWidth || 980;
-  const height = 200;
-  const padLeft = 60;
-  const padRight = 30;
-  const padTop = 20;
-  const padBottom = 30;
-
-  const chartW = width - padLeft - padRight;
-  const chartH = height - padTop - padBottom;
-
-  const maxCost = Math.max(...sorted.map((d) => d.cost || 0), 1);
-
-  // Calcul des coordonnées
-  const points = sorted.map((d, i) => {
-    const x = padLeft + (i / Math.max(sorted.length - 1, 1)) * chartW;
-    const y = padTop + chartH - ((d.cost || 0) / maxCost) * chartH;
-    return { x, y, data: d };
-  });
-
-  // Lignes de grille horizontales et labels d'ordonnées
-  let gridLines = "";
-  for (let step = 0; step <= 3; step++) {
-    const ratio = step / 3;
-    const yVal = padTop + chartH - ratio * chartH;
-    const costLabel = "$" + (ratio * maxCost).toFixed(step === 0 ? 0 : 2);
-    gridLines += `
-      <line x1="${padLeft}" y1="${yVal}" x2="${padLeft + chartW}" y2="${yVal}" class="chart-grid-line" />
-      <text x="${padLeft - 8}" y="${yVal + 3}" text-anchor="end" class="chart-axis-text">${costLabel}</text>
-    `;
-  }
-
-  // Labels d'abscisses (dates)
-  let xLabels = "";
-  const stepX = Math.max(1, Math.ceil(sorted.length / 8));
-  sorted.forEach((d, i) => {
-    if (i % stepX === 0 || i === sorted.length - 1) {
-      const pt = points[i];
-      const parts = d.date.split("-");
-      const shortDate = parts.length === 3 ? `${parts[2]}/${parts[1]}` : d.date;
-      xLabels += `<text x="${pt.x}" y="${height - 8}" text-anchor="middle" class="chart-axis-text">${shortDate}</text>`;
-    }
-  });
-
-  // Tracé de courbe lissée
-  let pathD = "";
-  if (points.length === 1) {
-    pathD = `M ${points[0].x} ${points[0].y} L ${padLeft + chartW} ${points[0].y}`;
-  } else {
-    pathD = `M ${points[0].x} ${points[0].y}`;
-    for (let i = 0; i < points.length - 1; i++) {
-      const p0 = points[i];
-      const p1 = points[i + 1];
-      const mx = (p0.x + p1.x) / 2;
-      pathD += ` C ${mx} ${p0.y}, ${mx} ${p1.y}, ${p1.x} ${p1.y}`;
-    }
-  }
-
-  // Polygone d'aire fermée
-  const lastPt = points[points.length - 1];
-  const firstPt = points[0];
-  const areaD = `${pathD} L ${lastPt.x} ${padTop + chartH} L ${firstPt.x} ${padTop + chartH} Z`;
-
-  // Points interactifs
-  let dots = "";
-  points.forEach((pt, i) => {
-    dots += `<circle cx="${pt.x}" cy="${pt.y}" r="4" class="chart-dot" data-idx="${i}" />`;
-  });
-
-  container.innerHTML = `
-    <svg class="chart-svg" viewBox="0 0 ${width} ${height}">
-      <defs>
-        <linearGradient id="spendGradient" x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%" stop-color="#f97316" stop-opacity="0.35" />
-          <stop offset="100%" stop-color="#f97316" stop-opacity="0.0" />
-        </linearGradient>
-      </defs>
-      ${gridLines}
-      ${xLabels}
-      <path d="${areaD}" class="chart-area-spend" />
-      <path d="${pathD}" class="chart-line-spend" />
-      ${dots}
-    </svg>
-  `;
-
-  // Écouteurs de survol
-  const infoEl = document.getElementById("chart-hover-info");
-  container.querySelectorAll(".chart-dot").forEach((dot) => {
-    const idx = parseInt(dot.dataset.idx, 10);
-    const d = sorted[idx];
-    dot.addEventListener("mouseenter", () => {
-      if (infoEl) {
-        infoEl.textContent = `${d.date} : ${formatCurrency(d.cost || 0)} (${formatNumber(d.tokens || 0)} tokens)`;
-      }
-    });
-    dot.addEventListener("mouseleave", () => {
-      if (infoEl) {
-        infoEl.textContent = "Survolez un point pour voir le détail";
-      }
-    });
-  });
-}
-
-async function initAutostart() {
-  const toggle = document.getElementById("autostart-toggle");
-  if (!toggle) return;
-
-  try {
-    const isEnabled = await invokeTauri("get_autostart_status");
-    toggle.checked = !!isEnabled;
-  } catch (err) {
-    console.warn("Erreur lecture autostart:", err);
-  }
-
-  toggle.addEventListener("change", async () => {
-    try {
-      const newState = await invokeTauri("set_autostart", { enabled: toggle.checked });
-      toggle.checked = !!newState;
-    } catch (err) {
-      console.error("Erreur écriture autostart:", err);
-      alert("Erreur lors de la modification du démarrage automatique: " + err);
-    }
-  });
-}
-
-function initDataFolder() {
-  const btn = document.getElementById("open-folder-btn");
-  if (btn) {
-    btn.addEventListener("click", async () => {
-      try {
-        await invokeTauri("open_data_folder");
-      } catch (err) {
-        console.error("Erreur ouverture dossier:", err);
-      }
-    });
-  }
-}
-
-function initCustomization() {
-  // 1. Préférences des onglets (Cursor, Codex, Projets, Antigravity actifs par défaut)
-  let visibleTabs = {
-    summary: true,
-    projects: true,
-    antigravity: true,
-    codex: true,
-    claude: false,
-    cursor: true,
-  };
-
-  try {
-    const savedTabs = localStorage.getItem("agent_burn_visible_tabs");
-    if (savedTabs) {
-      visibleTabs = Object.assign(visibleTabs, JSON.parse(savedTabs));
-      if (visibleTabs.cursor === undefined) {
-        visibleTabs.cursor = true;
-      }
-    }
-  } catch (_) {}
-
-  // Appliquer sur les checkboxes et les boutons d'onglets
-  document.querySelectorAll("#tabs-custom-container input[data-tab-target]").forEach((cb) => {
-    const tabName = cb.dataset.tabTarget;
-    if (visibleTabs[tabName] !== undefined) {
-      cb.checked = !!visibleTabs[tabName];
-    }
-    applyTabVisibility(tabName, cb.checked);
-
-    cb.addEventListener("change", () => {
-      visibleTabs[tabName] = cb.checked;
-      applyTabVisibility(tabName, cb.checked);
-      try {
-        localStorage.setItem("agent_burn_visible_tabs", JSON.stringify(visibleTabs));
-      } catch (_) {}
-    });
-  });
-
-  // 2. Préférences des timelines
-  let visiblePeriods = {
-    mtd: true,
-    today: true,
-    week: true,
-    all: true,
-  };
-
-  try {
-    const savedPeriods = localStorage.getItem("agent_burn_visible_periods");
-    if (savedPeriods) {
-      visiblePeriods = Object.assign(visiblePeriods, JSON.parse(savedPeriods));
-    }
-  } catch (_) {}
-
-  document.querySelectorAll("#periods-custom-container input[data-period-target]").forEach((cb) => {
-    const pName = cb.dataset.periodTarget;
-    if (visiblePeriods[pName] !== undefined) {
-      cb.checked = !!visiblePeriods[pName];
-    }
-    applyPeriodVisibility(pName, cb.checked);
-
-    cb.addEventListener("change", () => {
-      visiblePeriods[pName] = cb.checked;
-      applyPeriodVisibility(pName, cb.checked);
-      try {
-        localStorage.setItem("agent_burn_visible_periods", JSON.stringify(visiblePeriods));
-      } catch (_) {}
-    });
-  });
-}
-
-function applyTabVisibility(tabName, isVisible) {
-  const btn = document.querySelector(`.tab-btn[data-tab="${tabName}"]`);
-  if (btn) {
-    btn.style.display = isVisible ? "" : "none";
-  }
-}
-
-function applyPeriodVisibility(periodName, isVisible) {
-  const btn = document.querySelector(`.period-btn[data-period="${periodName}"]`);
-  if (btn) {
-    btn.style.display = isVisible ? "" : "none";
-  }
-}
-
-

@@ -1,12 +1,13 @@
+use crate::pricing::get_model_pricing;
+use chrono::{DateTime, Datelike, Duration, Local, TimeZone, Utc};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use std::{
     collections::HashMap,
     fs::{self, File},
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
 };
-use chrono::{DateTime, Datelike, Duration, Local, Utc, TimeZone};
-use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ProjectSummary {
@@ -32,6 +33,7 @@ struct ProjectAccumulator {
     input_tokens: i64,
     output_tokens: i64,
     cached_tokens: i64,
+    total_cost: f64,
 }
 
 pub fn get_projects_usage(period_str: Option<&str>) -> Result<Value, String> {
@@ -39,7 +41,7 @@ pub fn get_projects_usage(period_str: Option<&str>) -> Result<Value, String> {
     let now = Utc::now();
 
     // Déterminer la borne minimale temporelle selon la période
-    let min_date: Option<DateTime<Utc>> = match period {
+    let (min_date, max_date): (Option<DateTime<Utc>>, Option<DateTime<Utc>>) = match period {
         "today" => {
             let local_now = Local::now();
             let start_of_day = local_now
@@ -47,19 +49,49 @@ pub fn get_projects_usage(period_str: Option<&str>) -> Result<Value, String> {
                 .and_hms_opt(0, 0, 0)
                 .and_then(|naive| local_now.offset().from_local_datetime(&naive).single())
                 .map(|dt| dt.with_timezone(&Utc));
-            start_of_day
+            (start_of_day, None)
         }
-        "week" => Some(now - Duration::days(7)),
+        "yesterday" => {
+            let local_now = Local::now();
+            let today = local_now.date_naive();
+            let midnight = |date: chrono::NaiveDate| {
+                date.and_hms_opt(0, 0, 0)
+                    .and_then(|naive| local_now.offset().from_local_datetime(&naive).single())
+                    .map(|dt| dt.with_timezone(&Utc))
+            };
+            (midnight(today - Duration::days(1)), midnight(today))
+        }
+        "week" | "rtd" => (Some(now - Duration::days(7)), None),
+        "month" => (Some(now - Duration::days(30)), None),
+        "wtd" => {
+            let local_now = Local::now();
+            let date = local_now.date_naive()
+                - Duration::days(i64::from(local_now.weekday().num_days_from_monday()));
+            (
+                date.and_hms_opt(0, 0, 0)
+                    .and_then(|naive| local_now.offset().from_local_datetime(&naive).single())
+                    .map(|dt| dt.with_timezone(&Utc)),
+                None,
+            )
+        }
         "mtd" => {
             let local_now = Local::now();
-            let start_of_month = chrono::NaiveDate::from_ymd_opt(local_now.year(), local_now.month(), 1)
+            let start_of_month =
+                chrono::NaiveDate::from_ymd_opt(local_now.year(), local_now.month(), 1)
+                    .and_then(|date| date.and_hms_opt(0, 0, 0))
+                    .and_then(|naive| local_now.offset().from_local_datetime(&naive).single())
+                    .map(|dt| dt.with_timezone(&Utc));
+            (start_of_month, None)
+        }
+        "ytd" => {
+            let local_now = Local::now();
+            let start = chrono::NaiveDate::from_ymd_opt(local_now.year(), 1, 1)
                 .and_then(|date| date.and_hms_opt(0, 0, 0))
                 .and_then(|naive| local_now.offset().from_local_datetime(&naive).single())
                 .map(|dt| dt.with_timezone(&Utc));
-            start_of_month
+            (start, None)
         }
-        "all" => None,
-        _ => None,
+        _ => (None, None),
     };
 
     let mut projects_map: HashMap<String, ProjectAccumulator> = HashMap::new();
@@ -82,33 +114,38 @@ pub fn get_projects_usage(period_str: Option<&str>) -> Result<Value, String> {
     }
 
     for file_path in session_files {
-        process_codex_session(&file_path, min_date, &mut projects_map);
+        process_codex_session(&file_path, min_date, max_date, &mut projects_map);
     }
 
-    // Agrégation des sessions Google Antigravity
+    // Agrégation des sessions Google Antigravity (avec les coûts exacts LiteLLM déjà calculés)
     if let Ok(agy) = crate::antigravity::get_antigravity_data(period_str) {
         for s in agy.sessions {
             if s.project_path.starts_with("Projet général") {
                 continue;
             }
-            let key = s.project_path.to_lowercase();
-            let entry = projects_map.entry(key).or_insert_with(|| ProjectAccumulator {
-                name: s.project_name.clone(),
-                path: s.project_path.clone(),
-                session_count: 0,
-                last_active: None,
-                total_tokens: 0,
-                input_tokens: 0,
-                output_tokens: 0,
-                cached_tokens: 0,
-            });
+            let key = s.project_path.to_lowercase().replace('/', "\\");
+            let entry = projects_map
+                .entry(key)
+                .or_insert_with(|| ProjectAccumulator {
+                    name: s.project_name.clone(),
+                    path: s.project_path.clone(),
+                    session_count: 0,
+                    last_active: None,
+                    total_tokens: 0,
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cached_tokens: 0,
+                    total_cost: 0.0,
+                });
             entry.session_count += 1;
             entry.total_tokens += s.total_tokens;
             entry.input_tokens += s.input_tokens;
             entry.output_tokens += s.output_tokens;
+            entry.cached_tokens += s.cache_read_tokens;
+            entry.total_cost += s.cost;
             if let Ok(dt) = DateTime::parse_from_rfc3339(&s.date) {
                 let utc_dt = dt.with_timezone(&Utc);
-                if entry.last_active.map_or(true, |cur| utc_dt > cur) {
+                if entry.last_active.is_none_or(|cur| utc_dt > cur) {
                     entry.last_active = Some(utc_dt);
                 }
             }
@@ -126,16 +163,7 @@ pub fn get_projects_usage(period_str: Option<&str>) -> Result<Value, String> {
             max_tokens = acc.total_tokens;
         }
         total_tokens_all += acc.total_tokens;
-
-        // Formule de tarification pondérée réaliste OpenAI/Codex :
-        // Input net = (input - cached) @ $2.50/M
-        // Cached = cached @ $0.70/M
-        // Output = output @ $10.00/M
-        let net_input = (acc.input_tokens - acc.cached_tokens).max(0) as f64;
-        let cached = acc.cached_tokens as f64;
-        let output = acc.output_tokens as f64;
-        let cost = (net_input * 2.50 + cached * 0.70 + output * 10.00) / 1_000_000.0;
-        total_cost_all += cost;
+        total_cost_all += acc.total_cost;
 
         let last_active_str = acc
             .last_active
@@ -151,7 +179,7 @@ pub fn get_projects_usage(period_str: Option<&str>) -> Result<Value, String> {
             input_tokens: acc.input_tokens,
             output_tokens: acc.output_tokens,
             cached_tokens: acc.cached_tokens,
-            estimated_cost: (cost * 100.0).round() / 100.0,
+            estimated_cost: (acc.total_cost * 100.0).round() / 100.0,
             relative_percent: 0.0,
         });
     }
@@ -164,7 +192,7 @@ pub fn get_projects_usage(period_str: Option<&str>) -> Result<Value, String> {
     }
 
     // Trier par tokens décroissants
-    project_list.sort_by(|a, b| b.total_tokens.cmp(&a.total_tokens));
+    project_list.sort_by_key(|project| std::cmp::Reverse(project.total_tokens));
 
     Ok(json!({
         "period": period,
@@ -199,6 +227,7 @@ fn collect_jsonl_files(dir: &Path, files: &mut Vec<PathBuf>) {
 fn process_codex_session(
     path: &Path,
     min_date: Option<DateTime<Utc>>,
+    max_date: Option<DateTime<Utc>>,
     projects_map: &mut HashMap<String, ProjectAccumulator>,
 ) {
     let Ok(file) = File::open(path) else {
@@ -227,6 +256,11 @@ fn process_codex_session(
             return;
         }
     }
+    if let (Some(max), Some(sess_ts)) = (max_date, session_timestamp) {
+        if sess_ts >= max {
+            return;
+        }
+    }
 
     // Extraire cwd
     let cwd_str = meta
@@ -249,7 +283,14 @@ fn process_codex_session(
         .unwrap_or(&cwd)
         .to_string();
 
-    // Parcourir le reste du fichier pour trouver les tokens
+    // Modèle de la session (si spécifié dans le header)
+    let mut session_model = meta
+        .get("payload")
+        .and_then(|p| p.get("model"))
+        .and_then(|m| m.as_str())
+        .map(str::to_string);
+
+    // Parcourir le reste du fichier pour trouver les tokens et le modèle
     let mut line = String::new();
     let mut max_total_tokens: i64 = 0;
     let mut max_input_tokens: i64 = 0;
@@ -262,6 +303,26 @@ fn process_codex_session(
         if bytes == 0 {
             break;
         }
+
+        if session_model.is_none() && line.contains("\"model\"") {
+            if let Ok(entry) = serde_json::from_str::<Value>(&line) {
+                if let Some(m) = entry
+                    .get("payload")
+                    .and_then(|p| p.get("model"))
+                    .and_then(|s| s.as_str())
+                {
+                    session_model = Some(m.to_string());
+                } else if let Some(m) = entry
+                    .get("payload")
+                    .and_then(|p| p.get("turn_context"))
+                    .and_then(|tc| tc.get("model"))
+                    .and_then(|s| s.as_str())
+                {
+                    session_model = Some(m.to_string());
+                }
+            }
+        }
+
         if line.contains("\"total_token_usage\"") {
             if let Ok(entry) = serde_json::from_str::<Value>(&line) {
                 if let Some(ts_str) = entry.get("timestamp").and_then(|t| t.as_str()) {
@@ -278,9 +339,18 @@ fn process_codex_session(
                     .and_then(|p| p.get("info"))
                     .and_then(|i| i.get("total_token_usage"))
                 {
-                    let total = info.get("total_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
-                    let input = info.get("input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
-                    let output = info.get("output_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let total = info
+                        .get("total_tokens")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+                    let input = info
+                        .get("input_tokens")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+                    let output = info
+                        .get("output_tokens")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
                     let cached = info
                         .get("cached_input_tokens")
                         .and_then(|v| v.as_i64())
@@ -298,22 +368,41 @@ fn process_codex_session(
         line.clear();
     }
 
-    let entry = projects_map.entry(normalized_key).or_insert_with(|| ProjectAccumulator {
-        name: folder_name,
-        path: cwd,
-        session_count: 0,
-        last_active: None,
-        total_tokens: 0,
-        input_tokens: 0,
-        output_tokens: 0,
-        cached_tokens: 0,
-    });
+    // Calcul du coût exact basé sur le modèle réel LiteLLM de la session
+    let net_input = (max_input_tokens - max_cached_tokens).max(0) as f64;
+    let cached = max_cached_tokens as f64;
+    let output = max_output_tokens as f64;
+    let session_cost = session_model
+        .as_deref()
+        .and_then(get_model_pricing)
+        .map(|price| {
+            (net_input * price.input_per_m
+                + cached * price.cache_read_per_m
+                + output * price.output_per_m)
+                / 1_000_000.0
+        })
+        .unwrap_or(0.0);
+
+    let entry = projects_map
+        .entry(normalized_key)
+        .or_insert_with(|| ProjectAccumulator {
+            name: folder_name,
+            path: cwd,
+            session_count: 0,
+            last_active: None,
+            total_tokens: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_tokens: 0,
+            total_cost: 0.0,
+        });
 
     entry.session_count += 1;
     entry.total_tokens += max_total_tokens;
     entry.input_tokens += max_input_tokens;
     entry.output_tokens += max_output_tokens;
     entry.cached_tokens += max_cached_tokens;
+    entry.total_cost += session_cost;
 
     if let Some(ts) = last_event_ts {
         if entry.last_active.map(|curr| ts > curr).unwrap_or(true) {
@@ -343,7 +432,9 @@ pub fn open_folder_in_explorer(path: &str) -> Result<(), String> {
                     return Ok(());
                 }
             }
-            Err(format!("Le dossier n'existe pas ou n'est plus accessible: {path}"))
+            Err(format!(
+                "Le dossier n'existe pas ou n'est plus accessible: {path}"
+            ))
         }
     }
     #[cfg(not(windows))]
@@ -361,7 +452,7 @@ mod tests {
         let res = get_projects_usage(Some("mtd"));
         assert!(res.is_ok(), "L'extraction des projets ne doit pas échouer");
         let val = res.unwrap();
-        println!("Résultat projets MTD: {}", serde_json::to_string_pretty(&val).unwrap());
+        println!("Résultat projets MTD: totalCost=${}", val["totalCost"]);
         assert!(val.get("projects").is_some());
     }
 
@@ -370,9 +461,19 @@ mod tests {
         let res = get_projects_usage(Some("all"));
         assert!(res.is_ok(), "L'extraction totale ne doit pas échouer");
         let val = res.unwrap();
-        let count = val.get("totalProjects").and_then(|v| v.as_i64()).unwrap_or(0);
-        println!("Nombre total de projets détectés: {}", count);
-        assert!(count > 0, "Au moins un projet doit être extrait des 180 sessions");
+        let count = val
+            .get("totalProjects")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let cost = val.get("totalCost").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        println!(
+            "Nombre total de projets détectés: {}, coût total: ${}",
+            count, cost
+        );
+        assert!(
+            count > 0,
+            "Au moins un projet doit être extrait des sessions"
+        );
+        assert!(cost > 0.0, "Le coût calculé doit être strictement positif");
     }
 }
-

@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="fr">
+<html lang="en">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -7,273 +7,291 @@
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
-  <div class="app-container">
-    <!-- Barre latérale / En-tête -->
-    <header class="topbar">
-      <div class="brand">
-        <span class="flame-icon">🔥</span>
-        <span class="brand-title">Agent Burn</span>
-        <span class="platform-badge">Windows</span>
+  <div class="app-window">
+    <!-- Barre supérieure / Header façon macOS Toolbar -->
+    <header class="window-header">
+      <div class="header-left">
+        <button id="quota-menu-pill" class="quota-pill" title="Quota hebdomadaire en direct">
+          <span class="quota-dot live"></span>
+          <span id="quota-pill-text">--% · live</span>
+          <span class="chevron">▾</span>
+        </button>
+        <span class="window-title">Agent Burn</span>
       </div>
-      <div class="period-selector">
-        <button class="period-btn active" data-period="mtd">Ce mois</button>
-        <button class="period-btn" data-period="today">Aujourd'hui</button>
-        <button class="period-btn" data-period="week">7 derniers jours</button>
-        <button class="period-btn" data-period="all">Tout</button>
-      </div>
-      <div class="actions">
-        <button id="refresh-btn" class="icon-btn" title="Actualiser">↻</button>
+
+      <!-- Onglets d'agents (Segmented Control macOS) injectés dynamiquement -->
+      <nav class="harness-tabs" id="harness-tabs">
+        <button class="harness-tab active" data-tab="summary">General</button>
+        <!-- Les onglets d'agents DÉTECTÉS UNIQUEMENT (ex. Codex, Cursor, Antigravity) et le menu More ▾ sont injectés ici -->
+      </nav>
+
+      <div class="header-right">
+        <button id="refresh-btn" class="toolbar-btn" title="Refresh usage and live quotas">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="23 4 23 10 17 10"></polyline>
+            <polyline points="1 20 1 14 7 14"></polyline>
+            <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path>
+          </svg>
+        </button>
+        <button id="settings-btn" class="toolbar-btn" title="Settings">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="3"></circle>
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+          </svg>
+        </button>
       </div>
     </header>
 
-    <!-- Navigation par agent -->
-    <nav class="tabs">
-      <button class="tab-btn active" data-tab="summary">Vue globale</button>
-      <button class="tab-btn" data-tab="projects">Projets</button>
-      <button class="tab-btn" data-tab="antigravity">Antigravity</button>
-      <button class="tab-btn" data-tab="codex">Codex</button>
-      <button class="tab-btn" data-tab="claude">Claude Code</button>
-      <button class="tab-btn" data-tab="cursor">Cursor</button>
-      <button class="tab-btn" data-tab="settings">Paramètres</button>
-    </nav>
+    <!-- Zone déroulante principale -->
+    <main class="content-scroll">
 
-
-    <!-- Contenu principal -->
-    <main class="main-content">
-      <!-- Indicateur de statut -->
-      <div id="status-bar" class="status-bar">
-        <span class="status-dot"></span>
-        <span id="status-text">Chargement des données...</span>
-      </div>
-
-      <!-- Vue Globale (Summary) -->
+      <!-- Vue Générale (General / All harnesses) -->
       <section id="view-summary" class="view-panel active">
-        <div class="metrics-grid">
-          <div class="metric-card">
-            <div class="metric-label">Valeur consommée (API équivalent)</div>
-            <div id="metric-spend" class="metric-value">$0.00</div>
-            <div class="metric-sub">Coût si facturé au token API</div>
-          </div>
-          <div class="metric-card">
-            <div class="metric-label">Tokens consommés</div>
-            <div id="metric-tokens" class="metric-value">0</div>
-            <div id="metric-tokens-breakdown" class="metric-sub">Prompt / Cache / Output</div>
-          </div>
-          <div class="metric-card highlight">
-            <div class="metric-label">Retour sur investissement (ROI)</div>
-            <div id="metric-value-mult" class="metric-value">-</div>
-            <div id="metric-plan-name" class="metric-sub">Comparé aux forfaits actifs</div>
-          </div>
-        </div>
-
-        <!-- Graphique d'Évolution Temporelle -->
-        <div class="section-title">Évolution des dépenses et de l'activité</div>
-        <div class="chart-card">
-          <div class="chart-header">
-            <div class="chart-legend">
-              <span class="legend-item"><span class="legend-dot spend-dot"></span>Dépenses quotidiennes ($)</span>
-              <span class="legend-item"><span class="legend-dot token-dot"></span>Tokens consommés</span>
+        <!-- En-tête de page -->
+        <div class="page-header">
+          <div class="header-titles">
+            <div class="header-icon-box general-icon">
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <line x1="18" y1="20" x2="18" y2="10"></line>
+                <line x1="12" y1="20" x2="12" y2="4"></line>
+                <line x1="6" y1="20" x2="6" y2="14"></line>
+              </svg>
             </div>
-            <div id="chart-hover-info" class="chart-hover-info">Survolez un point pour voir le détail</div>
+            <div>
+              <h1 class="page-title">All harnesses</h1>
+              <p class="page-subtitle"><span class="period-subtitle">All time</span> · usage from your logs and connected providers</p>
+            </div>
           </div>
-          <div class="chart-svg-container" id="chart-svg-container">
-            <!-- Rendu SVG dynamique injecté par app.js -->
+
+          <!-- Sélecteur de période macOS (Top-Right) -->
+          <div class="period-picker-box">
+            <select class="macos-period-select" id="summary-period-select">
+              <option value="all" selected>All time</option>
+              <option value="today">Today</option>
+              <option value="yesterday">Yesterday</option>
+              <option value="rtd">Reset to date</option>
+              <option value="wtd">Week to date</option>
+              <option value="mtd">This month</option>
+              <option value="week">Last 7 days</option>
+              <option value="month">Last 30 days</option>
+              <option value="ytd">Year to date</option>
+            </select>
           </div>
         </div>
 
-        <!-- Quotas et jauges hebdomadaires -->
-        <div class="section-title">Quotas hebdomadaires et statut en direct</div>
-        <div id="quotas-container" class="quotas-grid">
-          <!-- Injecté dynamiquement par app.js -->
-        </div>
-
-        <!-- Répartition par modèle -->
-        <div class="section-title-row">
-          <div class="section-title">Modèles les plus utilisés</div>
-          <div class="search-box">
-            <span class="search-icon">🔍</span>
-            <input type="text" id="models-search" class="search-input" placeholder="Filtrer les modèles..." />
+        <!-- 4 Cartes de métriques (GroupBox avec séparateurs) -->
+        <div class="groupbox metrics-groupbox">
+          <div class="metric-col">
+            <span class="metric-title">Total spend</span>
+            <span class="metric-value" id="summary-metric-spend">$0.00</span>
+            <span class="metric-detail">API-equivalent value</span>
+          </div>
+          <div class="metric-divider"></div>
+          <div class="metric-col">
+            <span class="metric-title">Tokens</span>
+            <span class="metric-value" id="summary-metric-tokens">0</span>
+            <span class="metric-detail">Input, output and cache</span>
+          </div>
+          <div class="metric-divider"></div>
+          <div class="metric-col">
+            <span class="metric-title">Avg tokens / $</span>
+            <span class="metric-value" id="summary-metric-tokens-dollar">—</span>
+            <span class="metric-detail period-subtitle">All time</span>
+          </div>
+          <div class="metric-divider"></div>
+          <div class="metric-col">
+            <span class="metric-title">Models</span>
+            <span class="metric-value" id="summary-metric-models">0</span>
+            <span class="metric-detail">Across all harnesses</span>
           </div>
         </div>
-        <div class="table-container">
-          <table id="models-table">
-            <thead>
-              <tr>
-                <th>Modèle</th>
-                <th>Tokens</th>
-                <th>Coût équivalent</th>
-              </tr>
-            </thead>
-            <tbody id="models-tbody">
-              <!-- Injecté par app.js -->
-            </tbody>
-          </table>
+
+        <!-- Rangée centrale : Histogramme (gauche) et By Harness (droite) -->
+        <div class="general-middle-row">
+          <!-- Histogramme d'activité -->
+          <div class="groupbox activity-card">
+            <div class="chart-top-bar">
+              <span class="chart-heading" id="summary-chart-title">Monthly spend</span>
+              <div class="granularity-pill-group" id="summary-granularity">
+                <button class="gran-btn" data-gran="daily">Daily</button>
+                <button class="gran-btn" data-gran="weekly">Weekly</button>
+                <button class="gran-btn active" data-gran="monthly">Monthly</button>
+              </div>
+              <span class="currency-label">USD</span>
+            </div>
+            <div class="chart-svg-container" id="summary-activity-svg">
+              <!-- Rendu SVG dynamique -->
+            </div>
+          </div>
+
+          <!-- Panneau By harness (Harnais détectés) -->
+          <div class="groupbox by-harness-card">
+            <h2 class="card-heading">By harness</h2>
+            <div class="by-harness-list" id="by-harness-list">
+              <!-- Liste dynamique des agents avec logos, tokens et spend -->
+            </div>
+          </div>
+        </div>
+
+        <!-- Tableau des modèles : Models · available source data -->
+        <div class="groupbox models-card">
+          <div class="models-header-row">
+            <div class="models-title-wrap">
+              <span class="card-heading">Models · available source data</span>
+              <span class="count-badge" id="summary-models-count">0</span>
+            </div>
+            <div class="search-wrap">
+              <input type="text" class="macos-filter-input" id="summary-filter-input" placeholder="Filter models" />
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table class="macos-table" id="summary-models-table">
+              <thead>
+                <tr>
+                  <th class="col-model sortable" data-sort="model">Model <span class="sort-indicator"></span></th>
+                  <th class="col-tokens text-right sortable" data-sort="tokens">Tokens <span class="sort-indicator"></span></th>
+                  <th class="col-spend text-right sortable" data-sort="spend">Spend <span class="sort-indicator">↓</span></th>
+                  <th class="col-share text-right sortable" data-sort="share">Share <span class="sort-indicator"></span></th>
+                </tr>
+              </thead>
+              <tbody id="summary-models-tbody">
+                <!-- Rangs injectés par app.js -->
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- Section Abonnements si détectés -->
+        <div class="groupbox subscriptions-card" id="summary-subscriptions-card" style="display: none;">
+          <h2 class="card-heading">Subscriptions</h2>
+          <div class="subscriptions-list" id="summary-subscriptions-list"></div>
         </div>
       </section>
 
-      <!-- Vue Projets Dédiée (Explorateur de Projets Locaux) -->
-      <section id="view-projects" class="view-panel">
-        <div class="metrics-grid">
-          <div class="metric-card">
-            <div class="metric-label">Projets actifs locaux</div>
-            <div id="projects-count" class="metric-value">0</div>
-            <div class="metric-sub">Dossiers de travail détectés</div>
-          </div>
-          <div class="metric-card">
-            <div class="metric-label">Projet le plus consommateur</div>
-            <div id="projects-top-name" class="metric-value">-</div>
-            <div id="projects-top-sub" class="metric-sub">0 tokens</div>
-          </div>
-          <div class="metric-card highlight">
-            <div class="metric-label">Valeur consommée totale</div>
-            <div id="projects-total-cost" class="metric-value">$0.00</div>
-            <div id="projects-total-tokens" class="metric-sub">0 tokens</div>
-          </div>
-        </div>
-
-        <div class="section-title-row">
-          <div class="section-title">Consommation par projet de développement</div>
-          <div class="search-box">
-            <span class="search-icon">🔍</span>
-            <input type="text" id="projects-search" class="search-input" placeholder="Rechercher par nom de projet ou dossier..." />
-          </div>
-        </div>
-
-        <div class="table-container">
-          <table id="projects-table">
-            <thead>
-              <tr>
-                <th>Projet</th>
-                <th>Dossier local</th>
-                <th>Sessions</th>
-                <th>Dernière activité</th>
-                <th>Tokens consommés</th>
-                <th>Coût équivalent</th>
-                <th>Action</th>
-              </tr>
-            </thead>
-            <tbody id="projects-tbody">
-              <!-- Injecté dynamiquement par app.js -->
-            </tbody>
-          </table>
-        </div>
-      </section>
-
-
-      <!-- Vue Dédiée Google Antigravity -->
-      <section id="view-antigravity" class="view-panel">
-        <div id="antigravity-content">
-          <!-- Injecté dynamiquement par app.js -->
-        </div>
-      </section>
-
-      <!-- Vue Agent Dédiée (Claude / Codex / Cursor) -->
+      <!-- Vue Agent Spécifique (Codex, Cursor, Antigravity, etc.) -->
       <section id="view-harness" class="view-panel">
-        <div id="harness-content">
-          <!-- Injecté par app.js -->
+        <div id="harness-view-content">
+          <!-- Rendu dynamique complet selon l'agent sélectionné -->
         </div>
       </section>
 
-      <!-- Vue Paramètres -->
+      <!-- Vue Paramètres (Settings) -->
       <section id="view-settings" class="view-panel">
-        <div class="card settings-card">
-          <h3>Configuration Agent Burn</h3>
-          <div class="setting-row">
-            <label>Statut de la CLI native :</label>
-            <span id="cli-status-indicator" class="badge">Détection en cours...</span>
-          </div>
-          <div class="setting-row">
-            <label>Chemin de la CLI détectée :</label>
-            <code id="cli-path-display">Recherche...</code>
-          </div>
-          <div class="setting-row">
-            <label>Lancer au démarrage de Windows :</label>
-            <label class="toggle-switch">
-              <input type="checkbox" id="autostart-toggle" />
-              <span class="toggle-slider"></span>
-            </label>
-          </div>
-          <div class="setting-row">
-            <label>Dossier des archives locales :</label>
-            <div style="display: flex; gap: 8px; align-items: center;">
-              <code id="data-dir-display">%LOCALAPPDATA%\Agent Burn</code>
-              <button id="open-folder-btn" class="secondary-btn">Ouvrir</button>
+        <div class="settings-container">
+          <h1 class="page-title" style="margin-bottom: 20px;">Settings</h1>
+
+          <div class="groupbox settings-box">
+            <h2 class="settings-sec-title">Data source</h2>
+            <div class="setting-item">
+              <div class="setting-labels">
+                <span class="setting-name">Native CLI status</span>
+                <span class="setting-desc" id="settings-cli-path">Bundled agent-burn executable</span>
+              </div>
+              <span class="status-badge-ok" id="settings-cli-status">Operational</span>
+            </div>
+            <div class="setting-item setting-item-stacked">
+              <div class="setting-labels">
+                <label class="setting-name" for="settings-cli-input">Custom CLI executable</label>
+                <span class="setting-desc">Leave blank to use the bundled agent-burn.exe.</span>
+              </div>
+              <input class="macos-filter-input settings-text-input" id="settings-cli-input" type="text" placeholder="C:\path\to\agent-burn.exe" />
+            </div>
+            <div class="setting-item setting-item-stacked">
+              <div class="setting-labels">
+                <label class="setting-name" for="settings-codex-homes-input">Codex homes</label>
+                <span class="setting-desc">Comma-separated folders forwarded through CODEX_HOME.</span>
+              </div>
+              <input class="macos-filter-input settings-text-input" id="settings-codex-homes-input" type="text" placeholder="C:\Users\you\.codex" />
+            </div>
+            <div class="setting-item">
+              <div class="setting-labels">
+                <span class="setting-name">Local archive directory</span>
+                <span class="setting-desc">%LOCALAPPDATA%\Agent Burn</span>
+              </div>
+              <button class="secondary-macos-btn" id="settings-open-folder-btn">Open Folder</button>
+            </div>
+            <div class="setting-item">
+              <div class="setting-labels">
+                <span class="setting-name">Use cached pricing and limits</span>
+                <span class="setting-desc">Disables live provider and pricing requests.</span>
+              </div>
+              <label class="switch">
+                <input type="checkbox" id="settings-offline-toggle" />
+                <span class="slider"></span>
+              </label>
+            </div>
+            <div class="setting-item">
+              <div class="setting-labels">
+                <label class="setting-name" for="settings-refresh-select">Automatically refresh</label>
+                <span class="setting-desc">Controls reports, quota history and tray updates.</span>
+              </div>
+              <select class="macos-select" id="settings-refresh-select">
+                <option value="1">Every minute</option>
+                <option value="5">Every 5 minutes</option>
+                <option value="15">Every 15 minutes</option>
+                <option value="30">Every 30 minutes</option>
+              </select>
             </div>
           </div>
-          <div class="setting-row">
-            <label>Collecte en arrière-plan :</label>
-            <span class="badge active">Activée (toutes les 60s)</span>
-          </div>
-          <div class="setting-row">
-            <label>Version de l'application :</label>
-            <span>v20.0.20 (Windows Edition)</span>
-          </div>
-        </div>
 
-        <!-- Personnalisation des Onglets et Agents -->
-        <div class="card settings-card" style="margin-top: 16px;">
-          <h3>Affichage des onglets d'agents</h3>
-          <p style="color: var(--text-muted); font-size: 12px; margin-bottom: 12px;">
-            Choisissez quels assistants et vues afficher dans votre barre de navigation. Les agents non détectés sont masqués par défaut.
-          </p>
-          <div class="custom-toggles-grid" id="tabs-custom-container">
-            <label class="checkbox-row">
-              <input type="checkbox" data-tab-target="summary" checked />
-              <span>Vue globale</span>
-            </label>
-            <label class="checkbox-row">
-              <input type="checkbox" data-tab-target="projects" checked />
-              <span>Projets récents</span>
-            </label>
-            <label class="checkbox-row">
-              <input type="checkbox" data-tab-target="antigravity" checked />
-              <span>Google Antigravity</span>
-            </label>
-            <label class="checkbox-row">
-              <input type="checkbox" data-tab-target="codex" checked />
-              <span>Codex (OpenAI)</span>
-            </label>
-            <label class="checkbox-row">
-              <input type="checkbox" data-tab-target="claude" />
-              <span>Claude Code (Anthropic)</span>
-            </label>
-            <label class="checkbox-row">
-              <input type="checkbox" data-tab-target="cursor" checked />
-              <span>Cursor</span>
-            </label>
+          <div class="groupbox settings-box">
+            <h2 class="settings-sec-title">General</h2>
+            <div class="setting-item">
+              <div class="setting-labels">
+                <span class="setting-name">Launch at Windows startup</span>
+                <span class="setting-desc">Keep background quota monitoring active</span>
+              </div>
+              <label class="switch">
+                <input type="checkbox" id="settings-autostart-toggle" />
+                <span class="slider"></span>
+              </label>
+            </div>
+            <div class="setting-item">
+              <div class="setting-labels">
+                <span class="setting-name">Menu bar quota source</span>
+                <span class="setting-desc">Agent displayed in the top bar pill</span>
+              </div>
+              <select class="macos-select" id="settings-quota-source-select">
+                <!-- Seuls les harnais DÉTECTÉS avec quota sont injectés ici -->
+              </select>
+            </div>
+            <div class="setting-item" id="settings-antigravity-ultra-row" hidden>
+              <div class="setting-labels">
+                <label class="setting-name" for="settings-antigravity-ultra-price">Antigravity Ultra price</label>
+                <span class="setting-desc">Only needed for Ultra. Pro is automatically priced at $20/month.</span>
+              </div>
+              <select class="macos-select" id="settings-antigravity-ultra-price">
+                <option value="">Choose for Ultra</option>
+                <option value="100">$100 / month</option>
+                <option value="200">$200 / month</option>
+              </select>
+            </div>
           </div>
-        </div>
 
-        <!-- Personnalisation des Timelines -->
-        <div class="card settings-card" style="margin-top: 16px;">
-          <h3>Sélecteurs de période (Barre supérieure)</h3>
-          <p style="color: var(--text-muted); font-size: 12px; margin-bottom: 12px;">
-            Activez ou désactivez les filtres de timeline selon vos besoins d'analyse.
-          </p>
-          <div class="custom-toggles-grid" id="periods-custom-container">
-            <label class="checkbox-row">
-              <input type="checkbox" data-period-target="mtd" checked />
-              <span>Ce mois-ci (mtd)</span>
-            </label>
-            <label class="checkbox-row">
-              <input type="checkbox" data-period-target="today" checked />
-              <span>Aujourd'hui (today)</span>
-            </label>
-            <label class="checkbox-row">
-              <input type="checkbox" data-period-target="week" checked />
-              <span>7 derniers jours (week)</span>
-            </label>
-            <label class="checkbox-row">
-              <input type="checkbox" data-period-target="all" checked />
-              <span>Tout l'historique (all)</span>
-            </label>
+          <div class="groupbox settings-box">
+            <h2 class="settings-sec-title">Detected coding harnesses</h2>
+            <p class="setting-desc" style="margin-bottom: 12px;">Only active agents with detected logs or connected accounts appear in navigation.</p>
+            <div class="detected-agents-list" id="settings-detected-agents-list">
+              <!-- Liste en direct des harnais détectés uniquement -->
+            </div>
           </div>
         </div>
       </section>
 
     </main>
+
+    <!-- Barre de pied de page (Footer StatusBar) -->
+    <footer class="window-footer">
+      <div class="footer-left">
+        <span class="footer-dot"></span>
+        <span id="footer-status-text">Updated 11 sec ago</span>
+      </div>
+      <div class="footer-right">
+        <span>v0.1.13 (Windows)</span>
+      </div>
+    </footer>
   </div>
 
-  <script src="app.js"></script>
+    <script type="module" src="app.js"></script>
 </body>
 </html>

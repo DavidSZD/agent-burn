@@ -2,11 +2,11 @@
 
 # Run development mode
 run:
-    cargo tauri dev
+    powershell -ExecutionPolicy Bypass -File ./build.ps1
 
 # Build production executable
 build:
-    cargo tauri build
+    powershell -ExecutionPolicy Bypass -File ./build.ps1 -Release
 
 # Clean artifacts
 clean:
