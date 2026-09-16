@@ -1,6 +1,6 @@
 # Agent Burn
 
-Native macOS app and local CLI for coding-agent usage, limits, and subscription value.
+Native desktop apps (macOS & Windows) and local CLI for coding-agent usage, limits, and subscription value.
 
 Site: [agent-burn.melvynx.dev](https://agent-burn.melvynx.dev)
 
@@ -9,6 +9,8 @@ Site: [agent-burn.melvynx.dev](https://agent-burn.melvynx.dev)
 ## Install
 
 **Mac app:** [Download](https://agent-burn.melvynx.dev/download), unzip, move to Applications. macOS 14+, Apple Silicon and Intel. The app bundles the CLI.
+
+**Windows app:** Download the installer (`Agent Burn_<version>_x64-setup.exe`) from [Releases](https://github.com/DavidSZD/agent-burn/releases). Windows 10/11 (x64). Integrates into the system tray and bundles the CLI. Build locally with `pnpm --prefix apps/windows build`. Details: [apps/windows](https://github.com/DavidSZD/agent-burn/tree/main/apps/windows).
 
 **CLI:**
 
@@ -32,6 +34,8 @@ agent-burn summary --json
 
 macOS app: menu-bar quota for Codex, Claude, and Cursor, plus a dashboard across detected harnesses. Build locally with `just macos::run`. Details: [apps/macos](https://github.com/Melvynx/agent-burn/tree/main/apps/macos).
 
+Windows app: system-tray quota tooltip, live background polling, and responsive dashboard for Claude, Codex, Cursor, Antigravity, and Gemini. Build locally with `pnpm --prefix apps/windows build` or `just windows::run`. Details: [apps/windows](https://github.com/DavidSZD/agent-burn/tree/main/apps/windows).
+
 ## Subscription Value
 
 `--value` compares local API-equivalent usage with known or supplied monthly plan prices.
@@ -48,6 +52,7 @@ Plan overrides:
 - Claude: `pro`, `max-5x`, `max-20x`, or a monthly price
 - Codex: `plus`, `pro`, or a monthly price
 - Cursor: `pro`, `pro+`, `ultra`, or a monthly price
+- Antigravity: `pro` ($20), `ultra` ($100 or $200), or a monthly price
 
 ## Shared Options
 
@@ -74,6 +79,7 @@ Reads local logs. Nothing is uploaded.
 | Claude Code | `~/.claude`, `~/.config/claude/projects` |
 | Codex | `${CODEX_HOME:-~/.codex}` |
 | Cursor | Cursor `state.vscdb` plus the signed-in dashboard usage API |
+| Antigravity | `%APPDATA%\Antigravity`, `~/.gemini/antigravity/brain` |
 
 ## Acknowledgments
 
