@@ -32,6 +32,11 @@
   -webkit-user-select: none;
 }
 
+[hidden],
+.setting-item[hidden] {
+  display: none !important;
+}
+
 body {
   font-family: var(--font-system);
   background: var(--bg-app);
@@ -89,7 +94,13 @@ body {
   gap: 12px;
 }
 
-/* Pilule de quota en haut à gauche (46% · stale ▾) */
+.quota-dropdown-wrap {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+}
+
+/* Pilule de quota en haut à gauche (ex: Antigravity 93% ▾) */
 .quota-pill {
   display: inline-flex;
   align-items: center;
@@ -106,9 +117,57 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
-.quota-pill:hover {
+.quota-pill:hover,
+.quota-dropdown-wrap:hover .quota-pill {
   background: rgba(255, 255, 255, 0.12);
   border-color: rgba(255, 255, 255, 0.15);
+}
+
+.quota-menu {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  margin-top: 6px;
+  background: #222227;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+  min-width: 170px;
+  display: none;
+  flex-direction: column;
+  padding: 4px;
+  z-index: 100;
+}
+
+.quota-menu.open,
+.quota-dropdown-wrap:hover .quota-menu:not(:empty) {
+  display: flex;
+}
+
+.quota-menu-item {
+  background: transparent;
+  border: none;
+  color: var(--text-main);
+  padding: 7px 10px;
+  font-size: 12px;
+  text-align: left;
+  border-radius: 5px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-family: inherit;
+}
+
+.quota-menu-item:hover {
+  background: var(--macos-blue);
+  color: #fff;
+}
+
+.quota-menu-item.selected {
+  font-weight: 600;
+  color: #fff;
 }
 
 .quota-dot {

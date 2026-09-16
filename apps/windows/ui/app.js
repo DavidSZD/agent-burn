@@ -197,13 +197,18 @@ function initBackendEvents() {
     await loadData(true);
   });
   listen("quotas_updated", async (event) => {
-    // The collector already performed a full CLI scan. Reuse its payload for
-    // the lightweight quota indicator instead of immediately scanning again.
     if (event?.payload) {
+      lastUpdatedTime = Date.now();
+      const footerEl = document.getElementById("footer-status-text");
+      if (footerEl) footerEl.textContent = "Updated just now";
       updateTopBarQuotaPill(event.payload);
       try {
         quotaHistoryData = await invokeTauri("get_quota_history");
-        if (currentTab !== "summary" && currentTab !== "settings") {
+        if (currentTab === "summary") {
+          reportData = event.payload;
+          computeDetectedAgents(reportData, antigravityData);
+          renderSummary();
+        } else if (currentTab !== "settings") {
           const subAgent = (event.payload?.subscription?.agents || []).find((a) => a.agent === currentTab);
           if (subAgent?.window) {
             renderBurndownSVG("burndown-svg-wrapper", subAgent);
@@ -233,6 +238,7 @@ async function initColdStart() {
         fullReportData = startupSummary;
         computeDetectedAgents(reportData, antigravityData);
         renderHarnessTabs();
+        updateTopBarQuotaPill(reportData);
         renderSummary();
       }
     }
@@ -513,22 +519,76 @@ async function loadData(force = false) {
 
 // Mise à jour de la pilule de quota dans le header
 function updateTopBarQuotaPill(data) {
+  const wrap = document.getElementById("quota-dropdown-wrap");
+  const pillBtn = document.getElementById("quota-menu-pill");
   const pillText = document.getElementById("quota-pill-text");
+  const chevron = document.getElementById("quota-pill-chevron");
+  const menu = document.getElementById("quota-menu");
   const dot = document.querySelector("#quota-menu-pill .quota-dot");
-  if (!pillText) return;
+  if (!pillText || !wrap) return;
 
   const agents = data?.subscription?.agents || [];
-  const quotaSource = appSettings?.quotaSource || "codex";
-  const selectedAgent = agents.find((agent) => agent.agent === quotaSource);
+  // Filtrer uniquement les agents avec quota détecté
+  const agentsWithQuota = agents.filter(
+    (a) => (a.window && typeof a.window.usedPercent === "number") || (a.liveLimits && a.liveLimits.length > 0)
+  );
 
-  if (selectedAgent && selectedAgent.window) {
-    const used = selectedAgent.window.usedPercent || 0;
-    const remaining = Math.max(0, 100 - used);
-    pillText.textContent = `${remaining.toFixed(0)}% · live`;
-    if (dot) dot.className = "quota-dot live";
+  // Si aucun quota n'est détecté, masquer totalement le tag
+  if (agentsWithQuota.length === 0) {
+    wrap.style.display = "none";
+    return;
+  }
+
+  wrap.style.display = "inline-flex";
+
+  // Trouver l'agent sélectionné, ou le premier disponible ayant un quota
+  let selectedAgent = agentsWithQuota.find((a) => a.agent === appSettings?.quotaSource);
+  if (!selectedAgent) {
+    selectedAgent = agentsWithQuota[0];
+  }
+
+  const agentName = selectedAgent.agent;
+  const displayName = getAgentDisplayName(agentName);
+  const used = selectedAgent.window?.usedPercent ?? 0;
+  const remaining = Math.max(0, 100 - used);
+
+  // Affichage : nom du harnais + pourcentage (ex: "Antigravity 93%")
+  pillText.textContent = `${displayName} ${remaining.toFixed(0)}%`;
+  if (dot) dot.className = "quota-dot live";
+
+  // Menu déroulant si plusieurs agents avec quota
+  if (agentsWithQuota.length > 1) {
+    if (chevron) chevron.style.display = "inline";
+    if (menu) {
+      menu.innerHTML = "";
+      agentsWithQuota.forEach((a) => {
+        const item = document.createElement("button");
+        const aDisp = getAgentDisplayName(a.agent);
+        const aUsed = a.window?.usedPercent ?? 0;
+        const aRem = Math.max(0, 100 - aUsed);
+        const isSelected = a.agent === selectedAgent.agent;
+        item.className = `quota-menu-item${isSelected ? " selected" : ""}`;
+        item.innerHTML = `<span>${isSelected ? "✓ " : ""}${aDisp}</span><span style="color:var(--text-muted);">${aRem.toFixed(0)}%</span>`;
+        item.addEventListener("click", async (e) => {
+          e.stopPropagation();
+          menu.classList.remove("open");
+          if (!appSettings) appSettings = {};
+          appSettings.quotaSource = a.agent;
+          await invokeTauri("set_settings", { settings: appSettings }).catch(() => {});
+          updateTopBarQuotaPill(data);
+        });
+        menu.appendChild(item);
+      });
+    }
+
+    pillBtn.onclick = (e) => {
+      e.stopPropagation();
+      menu?.classList.toggle("open");
+    };
   } else {
-    pillText.textContent = "Quota tracker";
-    if (dot) dot.className = "quota-dot";
+    if (chevron) chevron.style.display = "none";
+    if (menu) menu.innerHTML = "";
+    pillBtn.onclick = null;
   }
 }
 
@@ -677,9 +737,9 @@ function renderHarnessView(agent) {
     const remaining = quota.remainingPercent;
 
     // Calculs de reset et d'allure 100% RÉELS basés sur les données CLI et l'archive
-    const elapsed = subscriptionAgent.window.elapsedMinutes || 0;
     const totalMinutes = 7 * 24 * 60; // 10,080 minutes hebdomadaires
-    const minutesLeft = quota.resetInMinutes ?? Math.max(0, totalMinutes - elapsed);
+    const minutesLeft = quota.resetInMinutes ?? Math.max(0, totalMinutes - (subscriptionAgent.window.elapsedMinutes || 0));
+    const elapsed = subscriptionAgent.window.elapsedMinutes ?? Math.max(0, totalMinutes - minutesLeft);
     const daysLeft = Math.floor(minutesLeft / 1440);
     const hoursLeft = Math.floor((minutesLeft % 1440) / 60);
     const resetInText = `${daysLeft}d ${hoursLeft}h`;
@@ -690,10 +750,12 @@ function renderHarnessView(agent) {
     const idealRemaining = Math.max(0, 100 - (elapsed / totalMinutes) * 100);
     const paceDeltaVal = remaining - idealRemaining;
     const isAhead = paceDeltaVal >= -0.05;
-    const paceDeltaText = (paceDeltaVal >= 0 ? "+" : "") + paceDeltaVal.toFixed(1) + "% " + (isAhead ? "ahead" : "behind");
+    const paceDeltaText = Math.abs(paceDeltaVal) < 0.05
+      ? "On pace"
+      : (paceDeltaVal >= 0 ? "+" : "−") + Math.abs(paceDeltaVal).toFixed(1) + "% " + (isAhead ? "ahead" : "behind");
     const paceClass = isAhead ? "ahead" : "behind";
     const resetsAvail = subscriptionAgent.resetCreditsAvailable ?? 0;
-    const dailyAllowance = (remaining / Math.max(1, daysLeft)).toFixed(1) + "% / day";
+    const dailyAllowance = (remaining / Math.max(1 / 1440, minutesLeft / 1440)).toFixed(1) + "% / day";
 
     const apiSpent = subscriptionAgent.window.apiEquivalentSpent || 0;
     const avgDollarsPerPct = "$" + (used > 0 ? (apiSpent / used).toFixed(2) : "0.00") + " / %";
@@ -1056,7 +1118,7 @@ function renderBurndownSVG(containerId, subAgent) {
 
   // Noms réels des repères pour l'axe X (façon macOS)
   let daysNames = [];
-  const numGridX = 7;
+  const numGridX = (currentQuotaHorizon === "rte" || currentQuotaHorizon === "week") ? 8 : 7;
   for (let i = 0; i < numGridX; i++) {
     const d = new Date(windowStart.getTime() + (i / (numGridX - 1)) * windowDurationMs);
     if (currentQuotaHorizon === "today") {
@@ -1096,9 +1158,21 @@ function renderBurndownSVG(containerId, subAgent) {
   const paceX2 = timeToX(cycleEndTime);
   const paceY2 = yToCoord(0);
 
-  // Projection Forecast
-  const projPct = subAgent?.estimate?.projectedUsePercent != null ? Math.max(0, 100 - subAgent.estimate.projectedUsePercent) : Math.max(0, remaining - (currentIdeal - 0));
-  const forecastY = yToCoord(projPct);
+  // Projection Forecast fidèle à macOS (Usage.swift:340-353)
+  const elapsedFraction = Math.max(0.0001, curCycleElapsedMs / cycleTotalMs);
+  const usedPercent = Math.max(0, 100 - remaining);
+  const projectedUse = subAgent?.estimate?.projectedUsePercent != null
+    ? subAgent.estimate.projectedUsePercent
+    : (usedPercent > 0 && elapsedFraction > 0 ? usedPercent / elapsedFraction : 0);
+
+  const projectedRemaining = Math.max(0, 100 - projectedUse);
+
+  // Date et position où le quota atteint 0% si la consommation est excessive (>100%)
+  const projectedEndMs = projectedUse > 100
+    ? cycleStartTime.getTime() + cycleTotalMs * (100 / projectedUse)
+    : cycleEndTime.getTime();
+  const projectedEndDate = new Date(projectedEndMs);
+  const projEndX = Math.min(paceX2, Math.max(curX, timeToX(projectedEndDate)));
 
   // Extraction et filtrage des échantillons réels de l'historique des quotas
   const rawSamples = [];
@@ -1177,7 +1251,7 @@ function renderBurndownSVG(containerId, subAgent) {
   // Initialisation du texte temporel en haut à droite
   const projectedText = container.closest(".burndown-chart-col")?.querySelector(".projected-time-text");
   if (projectedText) {
-    projectedText.textContent = showsForecast ? `Projected · ${formatMacChartDate(cycleEndTime)}` : `Recorded · ${formatMacChartDate(nowTime)}`;
+    projectedText.textContent = `Recorded · ${formatMacChartDate(nowTime)}`;
   }
 
   // Synchronisation dynamique de la légende en haut selon l'horizon
@@ -1194,7 +1268,7 @@ function renderBurndownSVG(containerId, subAgent) {
       legendHtml += `
         <div class="legend-item" id="burndown-legend-forecast">
           <span class="legend-stroke dashed" style="color: var(--text-muted);"></span>
-          <span class="legend-label-text">Forecast ${(subAgent?.estimate?.projectedUsePercent != null ? Math.max(0, 100 - subAgent.estimate.projectedUsePercent).toFixed(1) : remaining.toFixed(1))}%</span>
+          <span class="legend-label-text">Forecast ${projectedRemaining.toFixed(1)}%</span>
         </div>
       `;
     }
@@ -1256,9 +1330,18 @@ function renderBurndownSVG(containerId, subAgent) {
   ` : "";
 
   // 6. Projection Forecast (si applicable pour l'horizon : rte uniquement)
-  const forecastSvg = showsForecast ? `
-    <line x1="${curX}" y1="${curY}" x2="${paceX2}" y2="${forecastY}" stroke="${lineColor}" stroke-dasharray="5,5" stroke-width="2" opacity="0.8" />
-  ` : "";
+  let forecastSvg = "";
+  if (showsForecast) {
+    if (projectedUse > 100) {
+      forecastSvg = `
+        <line x1="${curX.toFixed(1)}" y1="${curY.toFixed(1)}" x2="${projEndX.toFixed(1)}" y2="${yToCoord(0).toFixed(1)}" stroke="${lineColor}" stroke-dasharray="5,5" stroke-width="2" opacity="0.8" />
+      `;
+    } else {
+      forecastSvg = `
+        <line x1="${curX.toFixed(1)}" y1="${curY.toFixed(1)}" x2="${paceX2.toFixed(1)}" y2="${yToCoord(projectedRemaining).toFixed(1)}" stroke="${lineColor}" stroke-dasharray="5,5" stroke-width="2" opacity="0.8" />
+      `;
+    }
+  }
 
   // 7. Ligne de Reset (rte uniquement)
   const resetSvg = showsForecast ? `
@@ -1328,8 +1411,19 @@ function renderBurndownSVG(containerId, subAgent) {
       } else if (mouseX <= curX) {
         curVal = remaining;
       } else {
-        const forecastProgress = (mouseX - curX) / (paceX2 - curX || 1);
-        curVal = Math.max(0, remaining - forecastProgress * (remaining - projPct));
+        if (projectedUse > 100) {
+          if (mouseX <= projEndX) {
+            const spanX = Math.max(0.001, projEndX - curX);
+            const progress = (mouseX - curX) / spanX;
+            curVal = Math.max(0, remaining - progress * remaining);
+          } else {
+            curVal = 0;
+          }
+        } else {
+          const spanX = Math.max(0.001, paceX2 - curX);
+          const progress = (mouseX - curX) / spanX;
+          curVal = Math.max(0, remaining + progress * (projectedRemaining - remaining));
+        }
       }
 
       const curYPos = yToCoord(curVal);
@@ -1400,16 +1494,14 @@ function renderBurndownSVG(containerId, subAgent) {
         badgeDelta.setAttribute("fill", lineColor);
       }
       if (projectedText) {
-        projectedText.textContent = showsForecast
-          ? `Projected · ${formatMacChartDate(cycleEndTime)}`
-          : `Recorded · ${formatMacChartDate(nowTime)}`;
+        projectedText.textContent = `Recorded · ${formatMacChartDate(nowTime)}`;
       }
 
       const recLabel = document.querySelector("#burndown-legend-recorded .legend-label-text");
       const fcastLabel = document.querySelector("#burndown-legend-forecast .legend-label-text");
       const paceLabel = document.querySelector("#burndown-legend-pace .legend-label-text");
       if (recLabel) recLabel.textContent = `Recorded ${remaining.toFixed(1)}%`;
-      if (fcastLabel) fcastLabel.textContent = `Forecast ${(subAgent?.estimate?.projectedUsePercent != null ? Math.max(0, 100 - subAgent.estimate.projectedUsePercent).toFixed(1) : remaining.toFixed(1))}%`;
+      if (fcastLabel) fcastLabel.textContent = `Forecast ${projectedRemaining.toFixed(1)}%`;
       if (paceLabel) paceLabel.textContent = `Pace ${currentIdeal.toFixed(1)}%`;
     });
   }
@@ -1954,6 +2046,23 @@ function renderSubscriptions() {
 }
 
 // ==========================================================================
+// Rafraîchissement automatique réel
+// ==========================================================================
+let refreshIntervalTimer = null;
+function setupAutoRefresh() {
+  if (refreshIntervalTimer) {
+    clearInterval(refreshIntervalTimer);
+    refreshIntervalTimer = null;
+  }
+  const mins = Math.max(1, appSettings?.refreshMinutes || 1);
+  refreshIntervalTimer = setInterval(async () => {
+    for (const key in periodCache) delete periodCache[key];
+    for (const key in harnessCache) delete harnessCache[key];
+    await loadData(true);
+  }, mins * 60 * 1000);
+}
+
+// ==========================================================================
 // Paramètres (Settings)
 // ==========================================================================
 function initSettings() {
@@ -1998,6 +2107,7 @@ function initSettings() {
     .then((settings) => {
       appSettings = settings;
       applySettingsToControls();
+      setupAutoRefresh();
     })
     .catch((error) => showStatusError(`Settings unavailable: ${error}`));
 
@@ -2006,11 +2116,15 @@ function initSettings() {
     "settings-codex-homes-input",
     "settings-offline-toggle",
     "settings-refresh-select",
-    "settings-quota-source-select",
     "settings-antigravity-ultra-price",
   ]) {
     document.getElementById(id)?.addEventListener("change", saveSettingsFromControls);
   }
+
+  // Fermeture du menu quota au clic externe
+  document.addEventListener("click", () => {
+    document.getElementById("quota-menu")?.classList.remove("open");
+  });
 }
 
 function applySettingsToControls() {
@@ -2033,10 +2147,11 @@ async function saveSettingsFromControls() {
     codexHomes: document.getElementById("settings-codex-homes-input")?.value.trim() || "",
     offline: !!document.getElementById("settings-offline-toggle")?.checked,
     refreshMinutes: Number(document.getElementById("settings-refresh-select")?.value || 1),
-    quotaSource: document.getElementById("settings-quota-source-select")?.value || "codex",
+    quotaSource: appSettings?.quotaSource || "antigravity",
     antigravityUltraPrice: Number(document.getElementById("settings-antigravity-ultra-price")?.value) || null,
   };
   appSettings = await invokeTauri("set_settings", { settings });
+  setupAutoRefresh();
   for (const key in periodCache) delete periodCache[key];
   for (const key in harnessCache) delete harnessCache[key];
   await loadData(true);
@@ -2047,27 +2162,10 @@ function renderSettings() {
   const antigravityPlan = (reportData?.subscription?.agents || []).find(
     (agent) => agent.agent?.toLowerCase() === "antigravity"
   );
-  if (ultraRow) ultraRow.hidden = !shouldShowAntigravityUltraSetting(antigravityPlan);
-
-  // 1. Quota source picker (uniquement les agents avec quota détecté !)
-  const select = document.getElementById("settings-quota-source-select");
-  if (select) {
-    select.innerHTML = "";
-    const agentsWithQuota = (reportData?.subscription?.agents || []).filter(
-      (a) => a.liveLimits || a.window != null
-    );
-
-    if (agentsWithQuota.length === 0) {
-      select.innerHTML = `<option value="none">No live quota agents detected</option>`;
-    } else {
-      agentsWithQuota.forEach((a) => {
-        const opt = document.createElement("option");
-        opt.value = a.agent;
-        opt.textContent = getAgentDisplayName(a.agent);
-        select.appendChild(opt);
-      });
-      select.value = appSettings?.quotaSource || agentsWithQuota[0].agent;
-    }
+  if (ultraRow) {
+    const show = shouldShowAntigravityUltraSetting(antigravityPlan);
+    ultraRow.hidden = !show;
+    ultraRow.style.display = show ? "" : "none";
   }
 
   // 2. Liste des harnais détectés (aucun harnais non détecté !)
@@ -2114,11 +2212,9 @@ function initFooterTimer() {
   setInterval(() => {
     const sec = Math.floor((Date.now() - lastUpdatedTime) / 1000);
     const staleAfter = (appSettings?.refreshMinutes || 1) * 60 + 30;
-    const pillText = document.getElementById("quota-pill-text");
     const dot = document.querySelector("#quota-menu-pill .quota-dot");
-    if (sec > staleAfter && pillText?.textContent.includes("· live")) {
-      pillText.textContent = pillText.textContent.replace("· live", "· saved");
-      if (dot) dot.className = "quota-dot";
+    if (sec > staleAfter && dot) {
+      dot.className = "quota-dot stale";
     }
     if (sec < 5) {
       el.textContent = "Updated just now";
