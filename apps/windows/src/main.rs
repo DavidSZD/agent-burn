@@ -49,6 +49,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_summary,
+            commands::get_summary_since,
             commands::get_harness,
             commands::get_cli_status,
             commands::get_settings,
@@ -56,6 +57,7 @@ fn main() {
             commands::get_autostart_status,
             commands::set_autostart,
             commands::get_quota_history,
+            commands::get_refresh_snapshot,
             commands::open_data_folder,
             commands::get_projects_usage,
             commands::open_project_folder,

@@ -3,6 +3,7 @@ import {
   escapeHtml,
   getRestoredPeriod,
   isTimelineCacheFresh,
+  resetWindowStartDate,
   timelineSelection,
   timelinePreloadOrder,
   timelineStartDate,
@@ -13,6 +14,7 @@ import {
   persistQuotaSource,
   subscriptionPresentation,
   visibleTokenBreakdownEntries,
+  updateCachedReportsFromToday,
 } from "./ui-utils.js";
 
 // Agent Burn Windows - Client Web / Tauri v2
@@ -57,6 +59,7 @@ let currentSpendGranularity = "monthly"; // "Monthly" actif par défaut sur les 
 let detectedAgents = [];
 const allKnownAgents = new Set();
 let lastUpdatedTime = Date.now();
+let lastBackendRefreshMs = 0;
 let appSettings = null;
 let settingsLoadPromise = Promise.resolve(null);
 const periodCache = {};
@@ -183,11 +186,13 @@ function getAgentDisplayName(agent) {
 window.addEventListener("DOMContentLoaded", async () => {
   const savedPeriod = localStorage.getItem("agent-burn-period");
   currentPeriod = getRestoredPeriod(savedPeriod, Object.keys(PERIOD_LABELS));
+  if (currentPeriod === "rtd") currentPeriod = "all";
   initPeriods();
   initRefresh();
   initSettings();
   initFooterTimer();
   initBackendEvents();
+  initBackendRefreshPolling();
 
   // Démarrage rapide avec le cache
   await initColdStart();
@@ -206,24 +211,51 @@ function initBackendEvents() {
   });
   listen("quotas_updated", async (event) => {
     if (event?.payload) {
-      latestLiveQuotaReport = event.payload;
-      lastUpdatedTime = Date.now();
-      const footerEl = document.getElementById("footer-status-text");
-      if (footerEl) footerEl.textContent = "Updated just now";
-      updateTopBarQuotaPill(event.payload);
-      try {
-        quotaHistoryData = await invokeTauri("get_quota_history");
-      } catch (_) {}
-
-      reportData = mergeLiveSubscription(reportData, latestLiveQuotaReport);
-      computeDetectedAgents(reportData, antigravityData);
-      if (currentTab === "summary") {
-        renderSummary();
-      } else if (currentTab !== "settings") {
-        renderHarnessView(currentTab);
-      }
+      await syncBackendRefresh(event.payload, Date.now());
     }
   });
+}
+
+function applyBackendRefresh(data, refreshedAtMs) {
+  if (!data || refreshedAtMs <= lastBackendRefreshMs) return false;
+  lastBackendRefreshMs = refreshedAtMs;
+  lastUpdatedTime = refreshedAtMs;
+  latestLiveQuotaReport = data;
+  updateTopBarQuotaPill(data);
+
+  if (currentPeriod === "all") {
+    const entry = { reportData: structuredClone(data), antigravityData: null, updatedAt: refreshedAtMs };
+    periodCache.all = entry;
+    reportData = entry.reportData;
+    fullReportData = entry.reportData;
+  } else {
+    reportData = mergeLiveSubscription(reportData, data);
+  }
+  computeDetectedAgents(reportData, antigravityData);
+  renderHarnessTabs();
+  if (currentTab === "summary") renderSummary();
+  else if (currentTab !== "settings") renderHarnessView(currentTab);
+  return true;
+}
+
+async function syncBackendRefresh(data, refreshedAtMs) {
+  if (!applyBackendRefresh(data, refreshedAtMs)) return;
+  try {
+    quotaHistoryData = await invokeTauri("get_quota_history");
+  } catch (_) {}
+  if (currentTab === "summary") renderSummary();
+  else if (currentTab !== "settings") renderHarnessView(currentTab);
+}
+
+function initBackendRefreshPolling() {
+  const poll = async () => {
+    try {
+      const snapshot = await invokeTauri("get_refresh_snapshot");
+      if (snapshot?.report) await syncBackendRefresh(snapshot.report, Number(snapshot.refreshedAtMs));
+    } catch (_) {}
+  };
+  setTimeout(poll, 3000);
+  setInterval(poll, 5000);
 }
 
 // Cache au démarrage (0 ms)
@@ -232,6 +264,10 @@ async function initColdStart() {
     const cached = await invokeTauri("get_report_cache");
     if (cached?.periods && typeof cached.periods === "object") {
       Object.assign(periodCache, cached.periods);
+      const restoredAt = Date.now();
+      for (const entry of Object.values(periodCache)) {
+        if (entry && !Number.isFinite(entry.updatedAt)) entry.updatedAt = restoredAt;
+      }
     }
     if (cached?.currentPeriod) {
       currentPeriod = getRestoredPeriod(cached.currentPeriod, Object.keys(PERIOD_LABELS));
@@ -262,6 +298,7 @@ async function initColdStart() {
 async function preloadTimelines(refreshExisting = false) {
   const periods = timelinePreloadOrder(Object.keys(PERIOD_LABELS), currentPeriod);
   for (const period of periods) {
+    if (period === "rtd") continue;
     if (!refreshExisting && periodCache[period]) continue;
     try {
       await requestTimeline(period, refreshExisting);
@@ -381,6 +418,12 @@ function renderHarnessTabs() {
 }
 
 function switchTab(tabId) {
+  if (currentPeriod === "rtd" && tabId !== currentTab) {
+    currentPeriod = "all";
+    localStorage.setItem("agent-burn-period", currentPeriod);
+    const cached = periodCache.all;
+    if (cached) reportData = mergeLiveSubscription(cached.reportData, latestLiveQuotaReport);
+  }
   currentTab = tabId;
 
   // Mise à jour de la classe active sur les onglets
@@ -424,7 +467,8 @@ async function switchPeriod(newPeriod) {
   const hSelect = document.getElementById("harness-period-select");
   if (hSelect) hSelect.value = currentPeriod;
 
-  const selection = timelineSelection(periodCache, currentPeriod, reportData, antigravityData);
+  const cacheKey = timelineCacheKey(currentPeriod);
+  const selection = timelineSelection(periodCache, cacheKey, reportData, antigravityData);
   if (!selection.pending) {
     setTimelineRefreshing(false);
     reportData = mergeLiveSubscription(selection.reportData, latestLiveQuotaReport);
@@ -433,7 +477,7 @@ async function switchPeriod(newPeriod) {
     renderHarnessTabs();
     if (currentTab === "summary") renderSummary();
     else if (currentTab !== "settings") renderHarnessView(currentTab);
-    if (!isTimelineCacheFresh(periodCache[currentPeriod])) {
+    if (!isTimelineCacheFresh(periodCache[cacheKey])) {
       setTimelineRefreshing(true);
       void loadData(true);
     }
@@ -453,27 +497,57 @@ function setTimelineRefreshing(refreshing) {
 function updateTimelineAvailability() {
   document.querySelectorAll(".macos-period-select").forEach((select) => {
     for (const option of select.options) {
-      option.disabled = option.value !== currentPeriod && !periodCache[option.value];
+      if (option.value !== "rtd") {
+        option.disabled = false;
+        continue;
+      }
+      const subscription = (reportData?.subscription?.agents || []).find(
+        (agent) => agent.agent?.toLowerCase() === currentTab.toLowerCase(),
+      );
+      option.disabled = currentTab === "summary" || !resetWindowStartDate(
+        subscription?.window?.resetDate,
+        subscription?.window?.elapsedMinutes,
+      );
     }
   });
 }
 
-function requestTimeline(period, force = false) {
-  if (!force && periodCache[period]) return Promise.resolve(periodCache[period]);
-  if (periodRequests.has(period)) return periodRequests.get(period);
+function timelineCacheKey(period) {
+  return period === "rtd" ? `rtd:${currentTab}` : period;
+}
 
-  const request = invokeTauri("get_summary", { range: period === "all" ? null : period })
+function requestTimeline(period, force = false) {
+  const key = timelineCacheKey(period);
+  if (!force && periodCache[key]) return Promise.resolve(periodCache[key]);
+  if (periodRequests.has(key)) return periodRequests.get(key);
+
+  let invocation;
+  if (period === "rtd") {
+    const subscription = (reportData?.subscription?.agents || []).find(
+      (agent) => agent.agent?.toLowerCase() === currentTab.toLowerCase(),
+    );
+    const since = resetWindowStartDate(
+      subscription?.window?.resetDate,
+      subscription?.window?.elapsedMinutes,
+    );
+    if (!since) return Promise.reject(new Error("No reset window was detected for this harness."));
+    invocation = invokeTauri("get_summary_since", { since });
+  } else {
+    invocation = invokeTauri("get_summary", { range: period === "all" ? null : period });
+  }
+
+  const request = invocation
     .then((summary) => {
       const entry = {
         reportData: JSON.parse(JSON.stringify(summary)),
         antigravityData: null,
         updatedAt: Date.now(),
       };
-      periodCache[period] = entry;
+      periodCache[key] = entry;
       return entry;
     })
-    .finally(() => periodRequests.delete(period));
-  periodRequests.set(period, request);
+    .finally(() => periodRequests.delete(key));
+  periodRequests.set(key, request);
   return request;
 }
 
@@ -481,7 +555,7 @@ function requestTimeline(period, force = false) {
 // Chargement principal des données CLI
 // ==========================================================================
 async function loadData(force = false) {
-  const cacheKey = currentPeriod;
+  const cacheKey = timelineCacheKey(currentPeriod);
   const requestGeneration = summaryRequestGate.begin();
   if (!force && periodCache[cacheKey]) {
     const cached = periodCache[cacheKey];
@@ -496,12 +570,12 @@ async function loadData(force = false) {
 
   try {
     // 1. Récupération du résumé CLI et de l'historique des quotas
-    const loaded = await requestTimeline(cacheKey, force);
+    const loaded = await requestTimeline(currentPeriod, force);
     try {
       quotaHistoryData = await invokeTauri("get_quota_history");
     } catch (_) {}
 
-    if (!summaryRequestGate.isCurrent(requestGeneration) || currentPeriod !== cacheKey) return;
+    if (!summaryRequestGate.isCurrent(requestGeneration) || timelineCacheKey(currentPeriod) !== cacheKey) return;
 
     reportData = mergeLiveSubscription(loaded.reportData, latestLiveQuotaReport);
     antigravityData = loaded.antigravityData;
@@ -537,6 +611,37 @@ async function loadData(force = false) {
     showStatusError(`Unable to load usage: ${err}`);
   } finally {
     if (summaryRequestGate.isCurrent(requestGeneration)) setTimelineRefreshing(false);
+  }
+}
+
+async function refreshAllTimelineCaches(showIndicator = false) {
+  if (showIndicator) setTimelineRefreshing(true);
+  try {
+    const previousToday = periodCache.today;
+    const summary = await invokeTauri("get_summary", { range: "today" });
+    if (previousToday) periodCache.today = previousToday;
+    updateCachedReportsFromToday(periodCache, summary);
+    latestLiveQuotaReport = summary;
+    lastUpdatedTime = Date.now();
+    lastBackendRefreshMs = Math.max(lastBackendRefreshMs, lastUpdatedTime);
+
+    const selected = periodCache[timelineCacheKey(currentPeriod)];
+    if (selected) {
+      reportData = mergeLiveSubscription(selected.reportData, latestLiveQuotaReport);
+      computeDetectedAgents(reportData, antigravityData);
+      renderHarnessTabs();
+      updateTopBarQuotaPill(reportData);
+      if (currentTab === "summary") renderSummary();
+      else if (currentTab !== "settings") renderHarnessView(currentTab);
+    }
+    await invokeTauri("save_report_cache", {
+      data: { summary: reportData, periods: periodCache, currentPeriod },
+    });
+    void preloadTimelines();
+  } catch (error) {
+    showStatusError(`Unable to refresh timelines: ${error}`);
+  } finally {
+    if (showIndicator) setTimelineRefreshing(false);
   }
 }
 
@@ -2091,7 +2196,7 @@ function setupAutoRefresh() {
   const mins = Math.max(1, appSettings?.refreshMinutes || 1);
   refreshIntervalTimer = setInterval(async () => {
     for (const key in harnessCache) delete harnessCache[key];
-    await loadData(true);
+    await refreshAllTimelineCaches(false);
   }, mins * 60 * 1000);
 }
 
@@ -2234,8 +2339,7 @@ function renderSettings() {
 function initRefresh() {
   document.getElementById("refresh-btn")?.addEventListener("click", async () => {
     for (const k in harnessCache) delete harnessCache[k];
-    await loadData(true);
-    void preloadTimelines();
+    await refreshAllTimelineCaches(true);
   });
 }
 

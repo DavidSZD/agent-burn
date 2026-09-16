@@ -13,6 +13,8 @@ import {
   timelineSelection,
   timelinePreloadOrder,
   isTimelineCacheFresh,
+  resetWindowStartDate,
+  updateCachedReportsFromToday,
   subscriptionPresentation,
   visibleTokenBreakdownEntries,
 } from "./ui-utils.js";
@@ -40,6 +42,55 @@ test("refreshes a selected timeline only after its five minute freshness window"
   assert.equal(isTimelineCacheFresh({ updatedAt: 1_000 }, 300_999), true);
   assert.equal(isTimelineCacheFresh({ updatedAt: 1_000 }, 301_001), false);
   assert.equal(isTimelineCacheFresh({ reportData: {} }, 2_000), false);
+});
+
+test("derives reset-to-date start from a weekly provider reset", () => {
+  assert.equal(resetWindowStartDate("2026-09-23T04:34:22Z"), "2026-09-16");
+  assert.equal(resetWindowStartDate(null, 48 * 60, new Date("2026-09-16T12:00:00Z")), "2026-09-14");
+  assert.equal(resetWindowStartDate(null), null);
+});
+
+test("a fresh today report advances every timeline that contains today", () => {
+  const cache = {
+    today: { reportData: { totals: { totalCost: 2, totalTokens: 20 }, daily: [{ date: "2026-09-16", cost: 2, tokens: 20 }], agents: [], models: [] }, updatedAt: 1 },
+    ytd: { reportData: { totals: { totalCost: 12, totalTokens: 120 }, daily: [{ date: "2026-09-16", cost: 2, tokens: 20 }], agents: [], models: [] }, updatedAt: 1 },
+    yesterday: { reportData: { totals: { totalCost: 5, totalTokens: 50 }, daily: [], agents: [], models: [] }, updatedAt: 1 },
+  };
+  const freshToday = { totals: { totalCost: 3, totalTokens: 30 }, daily: [{ date: "2026-09-16", cost: 3, tokens: 30 }], agents: [], models: [], subscription: { agents: [] } };
+
+  updateCachedReportsFromToday(cache, freshToday, 500);
+
+  assert.deepEqual(cache.ytd.reportData.totals, { totalCost: 13, totalTokens: 130 });
+  assert.deepEqual(cache.ytd.reportData.daily, [{ date: "2026-09-16", cost: 3, tokens: 30 }]);
+  assert.equal(cache.ytd.updatedAt, 500);
+  assert.deepEqual(cache.yesterday.reportData.totals, { totalCost: 5, totalTokens: 50 });
+  assert.equal(cache.yesterday.updatedAt, 1);
+});
+
+test("a newly detected agent is copied once into older timeline caches", () => {
+  const cache = {
+    today: { reportData: { totals: {}, daily: [], agents: [], models: [] }, updatedAt: 1 },
+    ytd: { reportData: { totals: {}, daily: [], agents: [], models: [] }, updatedAt: 1 },
+  };
+  const freshToday = {
+    totals: { totalCost: 2, totalTokens: 20 },
+    daily: [{ date: "2026-09-16", cost: 2, tokens: 20 }],
+    models: [{ model: "new-model", totalCost: 2, totalTokens: 20, percentage: 100 }],
+    agents: [{
+      agent: "new-agent",
+      totalCost: 2,
+      totalTokens: 20,
+      models: [{ model: "new-model", totalCost: 2, totalTokens: 20, percentage: 100 }],
+      daily: [{ date: "2026-09-16", cost: 2, tokens: 20 }],
+      tokenBreakdown: { input: 20 },
+    }],
+  };
+
+  updateCachedReportsFromToday(cache, freshToday, 500);
+
+  assert.equal(cache.ytd.reportData.agents[0].totalTokens, 20);
+  assert.equal(cache.ytd.reportData.agents[0].models[0].totalTokens, 20);
+  assert.equal(cache.ytd.reportData.agents[0].tokenBreakdown.input, 20);
 });
 
 test("preloads inactive timelines in their normal display order", () => {

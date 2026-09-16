@@ -1,24 +1,24 @@
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
-use tokio::time::sleep;
+use tokio::time::{sleep, Instant};
 
-use crate::app::{resolve_cli_path_with_override, AppState};
+use crate::app::{resolve_cli_path_with_override, AppState, RefreshSnapshot};
 
 pub fn spawn_quota_collector(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         // Relevé initial rapide après 2 secondes pour archiver et mettre à jour le tray
         sleep(Duration::from_secs(2)).await;
-        collect_and_archive(&app).await;
-
         loop {
+            let cycle_started = Instant::now();
+            collect_and_archive(&app).await;
             let minutes = app
                 .state::<AppState>()
                 .settings
                 .read()
                 .map(|settings| settings.refresh_minutes)
                 .unwrap_or(1);
-            sleep(Duration::from_secs(minutes.max(1) * 60)).await;
-            collect_and_archive(&app).await;
+            let cadence = Duration::from_secs(minutes.max(1) * 60);
+            sleep(cadence.saturating_sub(cycle_started.elapsed())).await;
         }
     });
 }
@@ -32,6 +32,13 @@ async fn collect_and_archive(app: &AppHandle) {
     let cli = resolve_cli_path_with_override(settings.custom_cli_path.as_deref())
         .or_else(|| state.cli_path.clone());
     if let Ok(data) = crate::commands::build_summary("all", &settings, cli.as_deref()).await {
+        let snapshot = RefreshSnapshot {
+            refreshed_at_ms: chrono::Utc::now().timestamp_millis(),
+            report: data.clone(),
+        };
+        if let Ok(mut latest) = state.latest_refresh.write() {
+            *latest = Some(snapshot);
+        }
         // Émission de l'événement vers l'UI
         let _ = app.emit("quotas_updated", &data);
 
