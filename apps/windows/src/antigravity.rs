@@ -5,6 +5,7 @@ use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
 };
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -426,7 +427,119 @@ fn load_step_dates(
     (step_dates, last_date)
 }
 
+#[derive(Debug)]
+struct AgyUsage {
+    weekly_remaining: Option<f64>,
+    weekly_reset_time: Option<String>,
+    session_remaining: Option<f64>,
+    session_reset_time: Option<String>,
+}
+
+fn parse_agy_usage(output: &str) -> Option<AgyUsage> {
+    let mut usage = AgyUsage {
+        weekly_remaining: None,
+        weekly_reset_time: None,
+        session_remaining: None,
+        session_reset_time: None,
+    };
+
+    for line in output.lines() {
+        let columns = line.split('\t').collect::<Vec<_>>();
+        if columns.len() < 4 || !columns[0].eq_ignore_ascii_case("Gemini Models") {
+            continue;
+        }
+        let remaining = columns[2].trim().trim_end_matches('%').parse::<f64>().ok();
+        let reset_time = Some(columns[3].trim().to_string()).filter(|value| !value.is_empty());
+        if columns[1].eq_ignore_ascii_case("Weekly Limit Remaining") {
+            usage.weekly_remaining = remaining;
+            usage.weekly_reset_time = reset_time;
+        } else if columns[1].eq_ignore_ascii_case("Five Hour Limit Remaining") {
+            usage.session_remaining = remaining;
+            usage.session_reset_time = reset_time;
+        }
+    }
+
+    usage.weekly_remaining.map(|_| usage)
+}
+
+fn agy_executable() -> PathBuf {
+    let installed = std::env::var("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .map(|path| path.join("agy").join("bin").join("agy.exe"))
+        .ok()
+        .filter(|path| path.is_file());
+    installed.unwrap_or_else(|| PathBuf::from("agy"))
+}
+
+fn get_agy_usage() -> Option<AgyUsage> {
+    let mut command = std::process::Command::new(agy_executable());
+    command.args([
+        "-p",
+        "/usage",
+        "--output-format",
+        "text",
+        "--print-timeout",
+        "12s",
+    ]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(powershell_creation_flags());
+    }
+    let output = command_output_with_timeout(command, std::time::Duration::from_secs(15))?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout))
+        .and_then(|stdout| parse_agy_usage(&stdout))
+}
+
 fn get_live_antigravity_plan() -> Option<AntigravityPlan> {
+    static CACHE: OnceLock<Mutex<Option<(std::time::Instant, Option<AntigravityPlan>)>>> =
+        OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(None));
+    if let Ok(guard) = cache.lock() {
+        if let Some((created_at, plan)) = guard.as_ref() {
+            if created_at.elapsed() < std::time::Duration::from_secs(30) {
+                return plan.clone();
+            }
+        }
+    }
+
+    let usage = get_agy_usage();
+    let mut plan = get_language_server_plan().or_else(load_cached_antigravity_plan);
+    if plan.is_none() && usage.is_some() {
+        plan = Some(AntigravityPlan {
+            plan: "Unknown".to_string(),
+            price_per_month: 0.0,
+            email: None,
+            name: None,
+            quotas: Vec::new(),
+            weekly_remaining: None,
+            weekly_reset_time: None,
+            session_remaining: None,
+            session_reset_time: None,
+        });
+    }
+    if let (Some(plan), Some(usage)) = (plan.as_mut(), usage) {
+        plan.weekly_remaining = usage.weekly_remaining;
+        plan.weekly_reset_time = usage.weekly_reset_time;
+        plan.session_remaining = usage.session_remaining;
+        plan.session_reset_time = usage.session_reset_time;
+    }
+    if let Some(plan) = plan
+        .as_ref()
+        .filter(|plan| !plan.plan.eq_ignore_ascii_case("unknown"))
+    {
+        save_cached_antigravity_plan(plan);
+    }
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some((std::time::Instant::now(), plan.clone()));
+    }
+    plan
+}
+
+fn get_language_server_plan() -> Option<AntigravityPlan> {
     let script = r#"$OutputEncoding=[Console]::OutputEncoding=[Text.UTF8Encoding]::new();$p=Get-CimInstance Win32_Process -Filter "Name = 'language_server.exe'"|Select-Object -First 1;if(-not $p){exit 1};$m=[regex]::Match($p.CommandLine,'--csrf_token\s+([^\s]+)');if(-not $m.Success){exit 1};$token=$m.Groups[1].Value;$ports=Get-NetTCPConnection -State Listen|Where-Object{$_.OwningProcess -eq $p.ProcessId -and $_.LocalAddress -eq '127.0.0.1'}|Select-Object -ExpandProperty LocalPort -Unique;[System.Net.ServicePointManager]::ServerCertificateValidationCallback={$true};$fallback=$null;foreach($port in $ports){foreach($scheme in @('http','https')){try{$headers=@{'x-codeium-csrf-token'=$token;'Connect-Protocol-Version'='1'};$s=Invoke-RestMethod -Uri "${scheme}://127.0.0.1:${port}/exa.language_server_pb.LanguageServerService/GetUserStatus" -Method Post -Headers $headers -ContentType 'application/json' -Body '{}' -TimeoutSec 2 -ErrorAction Stop;if(-not $fallback){$fallback=$s.userStatus};try{$q=Invoke-RestMethod -Uri "${scheme}://127.0.0.1:${port}/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary" -Method Post -Headers $headers -ContentType 'application/json' -Body '{}' -TimeoutSec 2 -ErrorAction Stop;@{userStatus=$s.userStatus;quotaSummary=$q.response}|ConvertTo-Json -Depth 30 -Compress;exit 0}catch{}}catch{}}};if($fallback){@{userStatus=$fallback;quotaSummary=$null}|ConvertTo-Json -Depth 30 -Compress;exit 0};exit 1"#;
     let mut command = std::process::Command::new("powershell.exe");
     command.args(["-NoProfile", "-NonInteractive", "-Command", script]);
@@ -441,6 +554,100 @@ fn get_live_antigravity_plan() -> Option<AntigravityPlan> {
     }
     let status = serde_json::from_slice::<serde_json::Value>(&output.stdout).ok()?;
     parse_live_status(&status)
+}
+
+fn cached_plan_path() -> PathBuf {
+    crate::archive::get_data_dir().join("antigravity-plan.json")
+}
+
+fn save_cached_antigravity_plan(plan: &AntigravityPlan) {
+    if let Ok(bytes) = serde_json::to_vec_pretty(plan) {
+        let _ = fs::write(cached_plan_path(), bytes);
+    }
+}
+
+fn load_cached_antigravity_plan() -> Option<AntigravityPlan> {
+    fs::read(cached_plan_path())
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .filter(|plan: &AntigravityPlan| !plan.plan.eq_ignore_ascii_case("unknown"))
+        .or_else(load_plan_from_report_cache)
+        .or_else(|| {
+            plan_name_from_quota_history(&crate::archive::load_quota_history()).map(|plan| {
+                AntigravityPlan {
+                    plan,
+                    price_per_month: 0.0,
+                    email: None,
+                    name: None,
+                    quotas: Vec::new(),
+                    weekly_remaining: None,
+                    weekly_reset_time: None,
+                    session_remaining: None,
+                    session_reset_time: None,
+                }
+            })
+        })
+}
+
+fn plan_name_from_quota_history(history: &serde_json::Value) -> Option<String> {
+    history.as_array()?.iter().rev().find_map(|sample| {
+        sample.get("agents")?.as_array()?.iter().find_map(|agent| {
+            if agent.get("agent").and_then(|value| value.as_str()) != Some("antigravity") {
+                return None;
+            }
+            agent
+                .get("plan")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|plan| !plan.is_empty() && !plan.eq_ignore_ascii_case("unknown"))
+                .map(str::to_string)
+        })
+    })
+}
+
+fn load_plan_from_report_cache() -> Option<AntigravityPlan> {
+    let cached = crate::archive::load_report_cache();
+    let agent = cached
+        .pointer("/summary/subscription/agents")?
+        .as_array()?
+        .iter()
+        .find(|agent| agent.get("agent").and_then(|value| value.as_str()) == Some("antigravity"))?;
+    let window = agent.get("window");
+    let short_window = agent.get("shortWindow");
+    let plan_name = agent.get("plan").and_then(|value| value.as_str())?;
+    if plan_name.eq_ignore_ascii_case("unknown") || plan_name.trim().is_empty() {
+        return None;
+    }
+    Some(AntigravityPlan {
+        plan: plan_name.to_string(),
+        price_per_month: agent
+            .get("pricePerMonth")
+            .and_then(|value| value.as_f64())
+            .unwrap_or(0.0),
+        email: agent
+            .get("account")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        name: None,
+        quotas: serde_json::from_value(agent.get("liveLimits").cloned().unwrap_or_default())
+            .unwrap_or_default(),
+        weekly_remaining: window
+            .and_then(|value| value.get("usedPercent"))
+            .and_then(|value| value.as_f64())
+            .map(|used| 100.0 - used),
+        weekly_reset_time: window
+            .and_then(|value| value.get("resetDate"))
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        session_remaining: short_window
+            .and_then(|value| value.get("usedPercent"))
+            .and_then(|value| value.as_f64())
+            .map(|used| 100.0 - used),
+        session_reset_time: short_window
+            .and_then(|value| value.get("resetDate"))
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+    })
 }
 
 fn command_output_with_timeout(
@@ -916,6 +1123,48 @@ mod tests {
     }
 
     #[test]
+    fn agy_usage_output_extracts_gemini_weekly_and_five_hour_limits() {
+        let output = "Gemini Models\tWeekly Limit Remaining\t88%\t2026-09-23T04:34:22Z\n\
+Gemini Models\tFive Hour Limit Remaining\t100%\t2026-09-16T20:31:31Z\n\
+Claude and GPT models\tWeekly Limit Remaining\t97%\t2026-09-23T15:31:31Z\n";
+
+        let quotas = parse_agy_usage(output).expect("valid agy quota output");
+
+        assert_eq!(quotas.weekly_remaining, Some(88.0));
+        assert_eq!(
+            quotas.weekly_reset_time.as_deref(),
+            Some("2026-09-23T04:34:22Z")
+        );
+        assert_eq!(quotas.session_remaining, Some(100.0));
+        assert_eq!(
+            quotas.session_reset_time.as_deref(),
+            Some("2026-09-16T20:31:31Z")
+        );
+    }
+
+    #[test]
+    fn agy_usage_output_rejects_missing_gemini_limits() {
+        assert!(parse_agy_usage(
+            "Claude and GPT models\tWeekly Limit Remaining\t97%\t2026-09-23T15:31:31Z"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn historical_quota_samples_restore_the_last_detected_plan() {
+        let history = serde_json::json!([
+            {"agents": [{"agent": "antigravity", "plan": "Pro"}]},
+            {"agents": [{"agent": "codex", "plan": "Plus"}]},
+            {"agents": [{"agent": "antigravity", "plan": "Unknown"}]}
+        ]);
+
+        assert_eq!(
+            plan_name_from_quota_history(&history).as_deref(),
+            Some("Pro")
+        );
+    }
+
+    #[test]
     fn pro_plan_has_known_monthly_price() {
         assert_eq!(antigravity_plan_price("Pro", None), 20.0);
     }
@@ -957,11 +1206,12 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires a running local Antigravity language server"]
-    fn running_antigravity_exposes_its_real_plan() {
+    #[ignore = "requires a local authenticated Antigravity CLI"]
+    fn authenticated_antigravity_cli_exposes_real_plan_and_quota() {
         let plan = get_live_antigravity_plan().expect("live Antigravity plan");
-        assert!(!plan.plan.is_empty());
-        assert!(!plan.quotas.is_empty());
+        assert_ne!(plan.plan, "Unknown");
+        assert!(plan.weekly_remaining.is_some());
+        assert!(plan.weekly_reset_time.is_some());
     }
 
     #[test]

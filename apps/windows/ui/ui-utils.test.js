@@ -3,7 +3,6 @@ import test from "node:test";
 
 import {
   escapeHtml,
-  shouldShowTimelineLoading,
   getRestoredPeriod,
   timelineStartDate,
   shouldShowAntigravityUltraSetting,
@@ -11,9 +10,44 @@ import {
   quotaRemainingPercent,
   mergeLiveSubscription,
   persistQuotaSource,
+  timelineSelection,
+  timelinePreloadOrder,
+  isTimelineCacheFresh,
   subscriptionPresentation,
   visibleTokenBreakdownEntries,
 } from "./ui-utils.js";
+
+test("keeps the current dashboard visible while an uncached timeline loads", () => {
+  const currentReport = { totals: { totalCost: 12 } };
+
+  assert.deepEqual(timelineSelection({}, "ytd", currentReport, null), {
+    reportData: currentReport,
+    antigravityData: null,
+    pending: true,
+  });
+});
+
+test("switches immediately when the requested timeline is cached", () => {
+  const cached = { reportData: { totals: { totalCost: 42 } }, antigravityData: null, updatedAt: 1_000 };
+
+  assert.deepEqual(timelineSelection({ ytd: cached }, "ytd", { totals: { totalCost: 12 } }, null), {
+    ...cached,
+    pending: false,
+  });
+});
+
+test("refreshes a selected timeline only after its five minute freshness window", () => {
+  assert.equal(isTimelineCacheFresh({ updatedAt: 1_000 }, 300_999), true);
+  assert.equal(isTimelineCacheFresh({ updatedAt: 1_000 }, 301_001), false);
+  assert.equal(isTimelineCacheFresh({ reportData: {} }, 2_000), false);
+});
+
+test("preloads inactive timelines in their normal display order", () => {
+  assert.deepEqual(
+    timelinePreloadOrder(["all", "today", "week", "ytd", "month"], "week"),
+    ["all", "today", "ytd", "month"],
+  );
+});
 
 test("waits for settings before persisting a quota source", async () => {
   let resolveSettings;
@@ -45,11 +79,6 @@ test("does not persist a quota source when settings failed to load", async () =>
 
 test("escapes untrusted log labels before inserting them into HTML", () => {
   assert.equal(escapeHtml('<img src=x onerror="alert(1)">'), "&lt;img src=x onerror=&quot;alert(1)&quot;&gt;");
-});
-
-test("shows a clean loading state when the selected timeline is not cached", () => {
-  assert.equal(shouldShowTimelineLoading({ today: {} }, "week"), true);
-  assert.equal(shouldShowTimelineLoading({ today: {} }, "today"), false);
 });
 
 test("omits unsupported cache-write metrics instead of displaying zero", () => {

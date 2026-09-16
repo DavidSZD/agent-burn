@@ -2,7 +2,9 @@ import { RequestGate } from "./request-gate.js";
 import {
   escapeHtml,
   getRestoredPeriod,
-  shouldShowTimelineLoading,
+  isTimelineCacheFresh,
+  timelineSelection,
+  timelinePreloadOrder,
   timelineStartDate,
   shouldShowAntigravityUltraSetting,
   quotaPresentation,
@@ -58,6 +60,7 @@ let lastUpdatedTime = Date.now();
 let appSettings = null;
 let settingsLoadPromise = Promise.resolve(null);
 const periodCache = {};
+const periodRequests = new Map();
 const harnessCache = {};
 const summaryRequestGate = new RequestGate();
 
@@ -188,8 +191,9 @@ window.addEventListener("DOMContentLoaded", async () => {
 
   // Démarrage rapide avec le cache
   await initColdStart();
-  // Chargement frais en direct
-  await loadData(false);
+  updateTimelineAvailability();
+  // On ne bloque le premier affichage que s'il n'existe encore aucune donnée.
+  if (!periodCache[currentPeriod]) await loadData(true);
   // Fill every timeline cache without changing the currently visible period.
   void preloadTimelines();
 });
@@ -198,7 +202,6 @@ function initBackendEvents() {
   const listen = getListen();
   if (!listen) return;
   listen("refresh_requested", async () => {
-    for (const key in periodCache) delete periodCache[key];
     await loadData(true);
   });
   listen("quotas_updated", async (event) => {
@@ -232,6 +235,8 @@ async function initColdStart() {
     }
     if (cached?.currentPeriod) {
       currentPeriod = getRestoredPeriod(cached.currentPeriod, Object.keys(PERIOD_LABELS));
+      const select = document.getElementById("summary-period-select");
+      if (select) select.value = currentPeriod;
     }
     if (cached && (cached.summary || cached.antigravity)) {
       if (cached.antigravity) antigravityData = cached.antigravity;
@@ -254,15 +259,13 @@ async function initColdStart() {
   }
 }
 
-async function preloadTimelines() {
-  for (const period of Object.keys(PERIOD_LABELS)) {
-    if (periodCache[period]) continue;
+async function preloadTimelines(refreshExisting = false) {
+  const periods = timelinePreloadOrder(Object.keys(PERIOD_LABELS), currentPeriod);
+  for (const period of periods) {
+    if (!refreshExisting && periodCache[period]) continue;
     try {
-      const summary = await invokeTauri("get_summary", { range: period === "all" ? null : period });
-      periodCache[period] = {
-        reportData: JSON.parse(JSON.stringify(summary)),
-        antigravityData: null,
-      };
+      await requestTimeline(period, refreshExisting);
+      updateTimelineAvailability();
       await invokeTauri("save_report_cache", {
         data: { summary: reportData, periods: periodCache, currentPeriod },
       });
@@ -421,38 +424,57 @@ async function switchPeriod(newPeriod) {
   const hSelect = document.getElementById("harness-period-select");
   if (hSelect) hSelect.value = currentPeriod;
 
-  // Si déjà en cache, affichage immédiat en 0 ms
-  if (periodCache[currentPeriod]) {
-    setTimelineLoading(false);
-    const cached = periodCache[currentPeriod];
-    reportData = mergeLiveSubscription(cached.reportData, latestLiveQuotaReport);
-    antigravityData = cached.antigravityData;
+  const selection = timelineSelection(periodCache, currentPeriod, reportData, antigravityData);
+  if (!selection.pending) {
+    setTimelineRefreshing(false);
+    reportData = mergeLiveSubscription(selection.reportData, latestLiveQuotaReport);
+    antigravityData = selection.antigravityData;
     computeDetectedAgents(reportData, antigravityData);
     renderHarnessTabs();
     if (currentTab === "summary") renderSummary();
     else if (currentTab !== "settings") renderHarnessView(currentTab);
+    if (!isTimelineCacheFresh(periodCache[currentPeriod])) {
+      setTimelineRefreshing(true);
+      void loadData(true);
+    }
     return;
   }
 
-  if (shouldShowTimelineLoading(periodCache, currentPeriod)) setTimelineLoading(true);
+  setTimelineRefreshing(true);
   await loadData(true);
 }
 
-function setTimelineLoading(loading) {
-  const viewId = currentTab === "summary" ? "view-summary" : "view-harness";
-  const view = document.getElementById(viewId);
-  if (!view) return;
-  view.classList.toggle("timeline-loading", loading);
-  view.setAttribute("aria-busy", String(loading));
-  let overlay = view.querySelector(":scope > .timeline-loading-overlay");
-  if (loading && !overlay) {
-    overlay = document.createElement("div");
-    overlay.className = "timeline-loading-overlay";
-    overlay.innerHTML = '<span class="timeline-spinner" aria-hidden="true"></span><span>Loading this timeline…</span>';
-    view.appendChild(overlay);
-  } else if (!loading) {
-    overlay?.remove();
-  }
+function setTimelineRefreshing(refreshing) {
+  document.querySelectorAll(".timeline-refresh-status").forEach((status) => {
+    status.hidden = !refreshing;
+  });
+}
+
+function updateTimelineAvailability() {
+  document.querySelectorAll(".macos-period-select").forEach((select) => {
+    for (const option of select.options) {
+      option.disabled = option.value !== currentPeriod && !periodCache[option.value];
+    }
+  });
+}
+
+function requestTimeline(period, force = false) {
+  if (!force && periodCache[period]) return Promise.resolve(periodCache[period]);
+  if (periodRequests.has(period)) return periodRequests.get(period);
+
+  const request = invokeTauri("get_summary", { range: period === "all" ? null : period })
+    .then((summary) => {
+      const entry = {
+        reportData: JSON.parse(JSON.stringify(summary)),
+        antigravityData: null,
+        updatedAt: Date.now(),
+      };
+      periodCache[period] = entry;
+      return entry;
+    })
+    .finally(() => periodRequests.delete(period));
+  periodRequests.set(period, request);
+  return request;
 }
 
 // ==========================================================================
@@ -474,27 +496,21 @@ async function loadData(force = false) {
 
   try {
     // 1. Récupération du résumé CLI et de l'historique des quotas
-    const args = currentPeriod === "all" ? [] : [currentPeriod];
-    const summary = await invokeTauri("get_summary", { range: args.length > 0 ? args[0] : null });
+    const loaded = await requestTimeline(cacheKey, force);
     try {
       quotaHistoryData = await invokeTauri("get_quota_history");
     } catch (_) {}
 
     if (!summaryRequestGate.isCurrent(requestGeneration) || currentPeriod !== cacheKey) return;
 
-    reportData = mergeLiveSubscription(summary, latestLiveQuotaReport);
-    antigravityData = null;
+    reportData = mergeLiveSubscription(loaded.reportData, latestLiveQuotaReport);
+    antigravityData = loaded.antigravityData;
     if (currentPeriod === "all" || !fullReportData) {
-      fullReportData = summary;
+      fullReportData = loaded.reportData;
     }
     lastUpdatedTime = Date.now();
 
     // Antigravity est déjà normalisé dans le rapport standard par le backend Rust.
-    periodCache[cacheKey] = {
-      reportData: JSON.parse(JSON.stringify(reportData)),
-      antigravityData: null,
-    };
-
     // 4. Calcul strict des harnais détectés
     computeDetectedAgents(reportData, antigravityData);
 
@@ -520,7 +536,7 @@ async function loadData(force = false) {
   } catch (err) {
     showStatusError(`Unable to load usage: ${err}`);
   } finally {
-    if (summaryRequestGate.isCurrent(requestGeneration)) setTimelineLoading(false);
+    if (summaryRequestGate.isCurrent(requestGeneration)) setTimelineRefreshing(false);
   }
 }
 
@@ -736,6 +752,7 @@ function renderHarnessView(agent) {
       </div>
 
       <div class="period-picker-box">
+        <span class="timeline-refresh-status" hidden><span class="timeline-spinner" aria-hidden="true"></span>Refreshing</span>
         <select class="macos-period-select" id="harness-period-select">
           ${Object.entries(PERIOD_LABELS)
             .map(([k, v]) => `<option value="${k}" ${k === currentPeriod ? "selected" : ""}>${v}</option>`)
@@ -1033,6 +1050,7 @@ function renderHarnessView(agent) {
   document.getElementById("harness-period-select")?.addEventListener("change", async (e) => {
     await switchPeriod(e.target.value);
   });
+  updateTimelineAvailability();
 
   // Granularité d'activité adaptée et rendu de l'histogramme de l'agent
   const agentDays = agentData?.daily || [];
@@ -2072,7 +2090,6 @@ function setupAutoRefresh() {
   }
   const mins = Math.max(1, appSettings?.refreshMinutes || 1);
   refreshIntervalTimer = setInterval(async () => {
-    for (const key in periodCache) delete periodCache[key];
     for (const key in harnessCache) delete harnessCache[key];
     await loadData(true);
   }, mins * 60 * 1000);
@@ -2172,9 +2189,9 @@ async function saveSettingsFromControls() {
   };
   appSettings = await invokeTauri("set_settings", { settings });
   setupAutoRefresh();
-  for (const key in periodCache) delete periodCache[key];
   for (const key in harnessCache) delete harnessCache[key];
   await loadData(true);
+  void preloadTimelines();
 }
 
 function renderSettings() {
@@ -2216,9 +2233,9 @@ function renderSettings() {
 // ==========================================================================
 function initRefresh() {
   document.getElementById("refresh-btn")?.addEventListener("click", async () => {
-    for (const k in periodCache) delete periodCache[k];
     for (const k in harnessCache) delete harnessCache[k];
     await loadData(true);
+    void preloadTimelines();
   });
 }
 

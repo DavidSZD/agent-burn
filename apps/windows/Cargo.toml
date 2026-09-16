@@ -1,6 +1,6 @@
 [package]
 name = "agent-burn-windows"
-version = "0.1.14"
+version = "0.1.15"
 description = "Agent Burn Windows Desktop Application"
 edition = "2021"
 

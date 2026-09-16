@@ -27,8 +27,22 @@ export function subscriptionPresentation(subscription) {
   };
 }
 
-export function shouldShowTimelineLoading(periodCache, period) {
-  return !Object.prototype.hasOwnProperty.call(periodCache, period);
+export function timelineSelection(periodCache, period, currentReport, currentAntigravity) {
+  const cached = periodCache[period];
+  if (cached) return { ...cached, pending: false };
+  return {
+    reportData: currentReport,
+    antigravityData: currentAntigravity,
+    pending: true,
+  };
+}
+
+export function isTimelineCacheFresh(entry, now = Date.now()) {
+  return Number.isFinite(entry?.updatedAt) && now - entry.updatedAt <= 5 * 60 * 1000;
+}
+
+export function timelinePreloadOrder(periods, activePeriod) {
+  return periods.filter((period) => period !== activePeriod);
 }
 
 export function getRestoredPeriod(storedPeriod, availablePeriods) {
