@@ -427,7 +427,7 @@ fn load_step_dates(
 }
 
 fn get_live_antigravity_plan() -> Option<AntigravityPlan> {
-    let script = r#"$OutputEncoding=[Console]::OutputEncoding=[Text.UTF8Encoding]::new();$p=Get-CimInstance Win32_Process -Filter "Name = 'language_server.exe'"|Select-Object -First 1;if(-not $p){exit 1};$m=[regex]::Match($p.CommandLine,'--csrf_token\s+([^\s]+)');if(-not $m.Success){exit 1};$token=$m.Groups[1].Value;$ports=Get-NetTCPConnection -State Listen|Where-Object{$_.OwningProcess -eq $p.ProcessId -and $_.LocalAddress -eq '127.0.0.1'}|Select-Object -ExpandProperty LocalPort -Unique;[System.Net.ServicePointManager]::ServerCertificateValidationCallback={$true};foreach($port in $ports){foreach($scheme in @('http','https')){try{$headers=@{'x-codeium-csrf-token'=$token;'Connect-Protocol-Version'='1'};$s=Invoke-RestMethod -Uri "${scheme}://127.0.0.1:${port}/exa.language_server_pb.LanguageServerService/GetUserStatus" -Method Post -Headers $headers -ContentType 'application/json' -Body '{}' -TimeoutSec 2 -ErrorAction Stop;$q=Invoke-RestMethod -Uri "${scheme}://127.0.0.1:${port}/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary" -Method Post -Headers $headers -ContentType 'application/json' -Body '{}' -TimeoutSec 2 -ErrorAction SilentlyContinue;@{userStatus=$s.userStatus;quotaSummary=$q.response}|ConvertTo-Json -Depth 30 -Compress;exit 0}catch{}}};exit 1"#;
+    let script = r#"$OutputEncoding=[Console]::OutputEncoding=[Text.UTF8Encoding]::new();$p=Get-CimInstance Win32_Process -Filter "Name = 'language_server.exe'"|Select-Object -First 1;if(-not $p){exit 1};$m=[regex]::Match($p.CommandLine,'--csrf_token\s+([^\s]+)');if(-not $m.Success){exit 1};$token=$m.Groups[1].Value;$ports=Get-NetTCPConnection -State Listen|Where-Object{$_.OwningProcess -eq $p.ProcessId -and $_.LocalAddress -eq '127.0.0.1'}|Select-Object -ExpandProperty LocalPort -Unique;[System.Net.ServicePointManager]::ServerCertificateValidationCallback={$true};$fallback=$null;foreach($port in $ports){foreach($scheme in @('http','https')){try{$headers=@{'x-codeium-csrf-token'=$token;'Connect-Protocol-Version'='1'};$s=Invoke-RestMethod -Uri "${scheme}://127.0.0.1:${port}/exa.language_server_pb.LanguageServerService/GetUserStatus" -Method Post -Headers $headers -ContentType 'application/json' -Body '{}' -TimeoutSec 2 -ErrorAction Stop;if(-not $fallback){$fallback=$s.userStatus};try{$q=Invoke-RestMethod -Uri "${scheme}://127.0.0.1:${port}/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary" -Method Post -Headers $headers -ContentType 'application/json' -Body '{}' -TimeoutSec 2 -ErrorAction Stop;@{userStatus=$s.userStatus;quotaSummary=$q.response}|ConvertTo-Json -Depth 30 -Compress;exit 0}catch{}}catch{}}};if($fallback){@{userStatus=$fallback;quotaSummary=$null}|ConvertTo-Json -Depth 30 -Compress;exit 0};exit 1"#;
     let mut command = std::process::Command::new("powershell.exe");
     command.args(["-NoProfile", "-NonInteractive", "-Command", script]);
     #[cfg(windows)]
@@ -487,18 +487,21 @@ fn parse_live_status(status: &serde_json::Value) -> Option<AntigravityPlan> {
                     for bucket in buckets {
                         let window = bucket.get("window").and_then(|w| w.as_str()).unwrap_or("");
                         let frac = bucket.get("remainingFraction").and_then(|f| f.as_f64());
-                        let reset = bucket.get("resetTime").and_then(|r| r.as_str()).map(str::to_string);
+                        let reset = bucket
+                            .get("resetTime")
+                            .and_then(|r| r.as_str())
+                            .map(str::to_string);
 
                         if window == "weekly" {
                             if let Some(rem_pct) = frac.map(|f| f * 100.0) {
-                                if weekly_remaining.map_or(true, |curr| rem_pct < curr) {
+                                if weekly_remaining.is_none_or(|curr| rem_pct < curr) {
                                     weekly_remaining = Some(rem_pct);
                                     weekly_reset_time = reset;
                                 }
                             }
                         } else if window == "5h" {
                             if let Some(rem_pct) = frac.map(|f| f * 100.0) {
-                                if session_remaining.map_or(true, |curr| rem_pct < curr) {
+                                if session_remaining.is_none_or(|curr| rem_pct < curr) {
                                     session_remaining = Some(rem_pct);
                                     session_reset_time = reset;
                                 }
@@ -876,9 +879,15 @@ mod tests {
 
         assert_eq!(plan.plan, "Pro");
         assert!((plan.weekly_remaining.unwrap() - 97.34).abs() < 0.01);
-        assert_eq!(plan.weekly_reset_time.as_deref(), Some("2026-09-23T04:34:22Z"));
+        assert_eq!(
+            plan.weekly_reset_time.as_deref(),
+            Some("2026-09-23T04:34:22Z")
+        );
         assert!((plan.session_remaining.unwrap() - 84.09).abs() < 0.01);
-        assert_eq!(plan.session_reset_time.as_deref(), Some("2026-09-16T09:34:22Z"));
+        assert_eq!(
+            plan.session_reset_time.as_deref(),
+            Some("2026-09-16T09:34:22Z")
+        );
     }
 
     #[test]
