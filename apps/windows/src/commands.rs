@@ -19,12 +19,7 @@ pub async fn get_summary(
         .clone();
     let cli = resolve_cli_path_with_override(settings.custom_cli_path.as_deref())
         .or_else(|| state.cli_path.clone());
-    let summary = build_summary(&period_val, &settings, cli.as_deref()).await?;
-    if period_val == "all" {
-        crate::archive::record_quota_sample(&summary);
-        crate::archive::record_metrics_snapshot(&summary);
-    }
-    Ok(summary)
+    build_summary(&period_val, &settings, cli.as_deref()).await
 }
 
 pub(crate) async fn build_summary(
@@ -199,16 +194,19 @@ fn merge_antigravity(
             .iter()
             .min_by(|a, b| a.remaining.total_cmp(&b.remaining));
 
-        let window_val = if let (Some(rem), Some(reset_time)) = (plan.weekly_remaining, &plan.weekly_reset_time) {
-            let elapsed_mins = chrono::DateTime::parse_from_rfc3339(reset_time)
-                .ok()
-                .map(|reset_dt| {
-                    let total_mins = 7.0 * 24.0 * 60.0;
-                    let rem_mins = (reset_dt.with_timezone(&chrono::Utc) - chrono::Utc::now())
-                        .num_seconds() as f64
-                        / 60.0;
-                    (total_mins - rem_mins).clamp(0.0, total_mins)
-                });
+        let window_val = if let (Some(rem), Some(reset_time)) =
+            (plan.weekly_remaining, &plan.weekly_reset_time)
+        {
+            let elapsed_mins =
+                chrono::DateTime::parse_from_rfc3339(reset_time)
+                    .ok()
+                    .map(|reset_dt| {
+                        let total_mins = 7.0 * 24.0 * 60.0;
+                        let rem_mins = (reset_dt.with_timezone(&chrono::Utc) - chrono::Utc::now())
+                            .num_seconds() as f64
+                            / 60.0;
+                        (total_mins - rem_mins).clamp(0.0, total_mins)
+                    });
 
             Some(serde_json::json!({
                 "usedPercent": (100.0 - rem).clamp(0.0, 100.0),
@@ -236,16 +234,19 @@ fn merge_antigravity(
             })
         };
 
-        let short_window_val = if let (Some(rem), Some(reset_time)) = (plan.session_remaining, &plan.session_reset_time) {
-            let elapsed_mins = chrono::DateTime::parse_from_rfc3339(reset_time)
-                .ok()
-                .map(|reset_dt| {
-                    let total_mins = 5.0 * 60.0;
-                    let rem_mins = (reset_dt.with_timezone(&chrono::Utc) - chrono::Utc::now())
-                        .num_seconds() as f64
-                        / 60.0;
-                    (total_mins - rem_mins).clamp(0.0, total_mins)
-                });
+        let short_window_val = if let (Some(rem), Some(reset_time)) =
+            (plan.session_remaining, &plan.session_reset_time)
+        {
+            let elapsed_mins =
+                chrono::DateTime::parse_from_rfc3339(reset_time)
+                    .ok()
+                    .map(|reset_dt| {
+                        let total_mins = 5.0 * 60.0;
+                        let rem_mins = (reset_dt.with_timezone(&chrono::Utc) - chrono::Utc::now())
+                            .num_seconds() as f64
+                            / 60.0;
+                        (total_mins - rem_mins).clamp(0.0, total_mins)
+                    });
             Some(serde_json::json!({
                 "usedPercent": (100.0 - rem).clamp(0.0, 100.0),
                 "resetDate": reset_time,
@@ -483,8 +484,13 @@ mod tests {
 
         merge_antigravity(&mut summary, &antigravity).expect("merge summary");
 
-        let agents = summary["subscription"]["agents"].as_array().expect("agents array");
-        let ag = agents.iter().find(|a| a["agent"] == "antigravity").expect("antigravity in subscription");
+        let agents = summary["subscription"]["agents"]
+            .as_array()
+            .expect("agents array");
+        let ag = agents
+            .iter()
+            .find(|a| a["agent"] == "antigravity")
+            .expect("antigravity in subscription");
         assert_eq!(ag["plan"], "Pro");
         let win = &ag["window"];
         assert!((win["usedPercent"].as_f64().unwrap() - 4.5).abs() < 0.01);
