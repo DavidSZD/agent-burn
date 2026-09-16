@@ -393,6 +393,25 @@ body {
 }
 
 /* Sélecteur de période macOS (Top Right) */
+.period-picker-box {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.timeline-refresh-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-muted);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.timeline-refresh-status[hidden] {
+  display: none !important;
+}
+
 .macos-period-select, .macos-select {
   appearance: none;
   -webkit-appearance: none;
@@ -1223,29 +1242,9 @@ details[open] .disclosure-arrow {
   margin-top: 20px;
   padding-bottom: 24px;
 }
-.timeline-loading {
-  position: relative;
-  min-height: 360px;
-}
-
-.timeline-loading > :not(.timeline-loading-overlay) {
-  visibility: hidden;
-}
-
-.timeline-loading-overlay {
-  position: absolute;
-  inset: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 10px;
-  color: var(--text-muted);
-  font-size: 13px;
-}
-
 .timeline-spinner {
-  width: 16px;
-  height: 16px;
+  width: 11px;
+  height: 11px;
   border: 2px solid rgba(255, 255, 255, 0.18);
   border-top-color: var(--accent, #f97316);
   border-radius: 50%;

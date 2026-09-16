@@ -10,6 +10,15 @@ use tokio::process::Command;
 pub struct AppState {
     pub cli_path: Option<PathBuf>,
     pub settings: RwLock<AppSettings>,
+    pub latest_refresh: RwLock<Option<RefreshSnapshot>>,
+    pub summary_scan: tokio::sync::Mutex<()>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RefreshSnapshot {
+    pub refreshed_at_ms: i64,
+    pub report: serde_json::Value,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -59,6 +68,8 @@ impl AppState {
         Self {
             cli_path,
             settings: RwLock::new(settings),
+            latest_refresh: RwLock::new(None),
+            summary_scan: tokio::sync::Mutex::new(()),
         }
     }
 }

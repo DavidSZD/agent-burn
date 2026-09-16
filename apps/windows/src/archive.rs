@@ -8,7 +8,8 @@ use std::{
 };
 
 const MAX_QUOTA_SAMPLES: usize = 50_000;
-const MAX_REPORT_JOURNAL_ENTRIES: usize = 500;
+const MAX_REPORT_JOURNAL_ENTRIES: usize = 10;
+const MAX_LEGACY_REPORT_JOURNAL_BYTES: u64 = 8 * 1024 * 1024;
 
 pub fn get_data_dir() -> PathBuf {
     let base = env::var("LOCALAPPDATA")
@@ -161,8 +162,8 @@ pub fn open_data_folder() -> Result<(), String> {
     Ok(())
 }
 
-pub fn save_report_cache(data: &Value) {
-    let _ = save_report_cache_in(&get_data_dir(), data);
+pub fn save_report_cache(data: &Value) -> Result<(), String> {
+    save_report_cache_in(&get_data_dir(), data)
 }
 
 pub fn load_report_cache() -> Value {
@@ -176,6 +177,7 @@ fn save_report_cache_in(directory: &std::path::Path, data: &Value) -> Result<(),
     let tmp_path = directory.join("report-cache.json.tmp");
     let journal_path = directory.join("usage-journal.json");
     save_atomic_with_backup(&cache_path, &bak_path, &tmp_path, data);
+    migrate_oversized_journal(directory, &journal_path, MAX_LEGACY_REPORT_JOURNAL_BYTES)?;
 
     let mut journal = read_json(&journal_path)
         .and_then(|value| value.as_array().cloned())
@@ -190,6 +192,30 @@ fn save_report_cache_in(directory: &std::path::Path, data: &Value) -> Result<(),
         .map_err(|error| error.to_string())?;
     }
     Ok(())
+}
+
+fn migrate_oversized_journal(
+    directory: &std::path::Path,
+    journal_path: &std::path::Path,
+    maximum_bytes: u64,
+) -> Result<(), String> {
+    let Ok(metadata) = fs::metadata(journal_path) else {
+        return Ok(());
+    };
+    if metadata.len() <= maximum_bytes {
+        return Ok(());
+    }
+
+    let backup_directory = directory.join("update-backups");
+    fs::create_dir_all(&backup_directory).map_err(|error| error.to_string())?;
+    let timestamp = Utc::now().format("%Y%m%d-%H%M%S%.f");
+    let backup_path = backup_directory.join(format!("pre-0.1.18-usage-journal-{timestamp}.json"));
+    fs::rename(journal_path, &backup_path).map_err(|error| {
+        format!(
+            "Impossible d'archiver l'ancien journal {}: {error}",
+            journal_path.display()
+        )
+    })
 }
 
 fn load_report_cache_in(directory: &std::path::Path) -> Value {
@@ -288,6 +314,54 @@ mod tests {
         let loaded = load_report_cache_in(&directory);
         assert_eq!(loaded["testKey"], "testVal");
         assert_eq!(loaded["number"], 42);
+        fs::remove_dir_all(directory).expect("remove fixture directory");
+    }
+
+    #[test]
+    fn report_journal_keeps_only_the_latest_ten_snapshots() {
+        let directory = std::env::temp_dir().join(format!(
+            "agent-burn-cache-retention-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+
+        for value in 0..12 {
+            save_report_cache_in(&directory, &json!({ "revision": value }))
+                .expect("save cache revision");
+        }
+
+        let journal = read_json(&directory.join("usage-journal.json"))
+            .and_then(|value| value.as_array().cloned())
+            .expect("journal array");
+        assert_eq!(journal.len(), 10);
+        assert_eq!(journal.first().unwrap()["revision"], 2);
+        assert_eq!(journal.last().unwrap()["revision"], 11);
+        fs::remove_dir_all(directory).expect("remove fixture directory");
+    }
+
+    #[test]
+    fn oversized_report_journal_is_moved_to_update_backups_without_parsing() {
+        let directory = std::env::temp_dir().join(format!(
+            "agent-burn-cache-migration-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).expect("create fixture directory");
+        let journal_path = directory.join("usage-journal.json");
+        fs::write(&journal_path, b"legacy journal payload").expect("write legacy journal");
+
+        migrate_oversized_journal(&directory, &journal_path, 8).expect("migrate journal");
+
+        assert!(!journal_path.exists());
+        let backups = fs::read_dir(directory.join("update-backups"))
+            .expect("read update backups")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect update backups");
+        assert_eq!(backups.len(), 1);
+        assert_eq!(
+            fs::read(backups[0].path()).unwrap(),
+            b"legacy journal payload"
+        );
         fs::remove_dir_all(directory).expect("remove fixture directory");
     }
 }

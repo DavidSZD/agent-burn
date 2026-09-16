@@ -2,8 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  createCoalescedSaver,
+  createSingleFlight,
   escapeHtml,
-  shouldShowTimelineLoading,
   getRestoredPeriod,
   timelineStartDate,
   shouldShowAntigravityUltraSetting,
@@ -11,9 +12,152 @@ import {
   quotaRemainingPercent,
   mergeLiveSubscription,
   persistQuotaSource,
+  timelineSelection,
+  timelinePreloadOrder,
+  isTimelineCacheFresh,
+  loadQuotaHistory,
+  resetWindowStartDate,
+  timelinePeriodEntries,
+  updateCachedReportsFromToday,
   subscriptionPresentation,
   visibleTokenBreakdownEntries,
 } from "./ui-utils.js";
+
+test("coalesced saves keep the in-flight write and only the newest pending state", async () => {
+  let releaseFirst;
+  const writes = [];
+  const save = createCoalescedSaver(async (data) => {
+    writes.push(data.revision);
+    if (data.revision === 1) await new Promise((resolve) => { releaseFirst = resolve; });
+  });
+
+  const first = save({ revision: 1 });
+  save({ revision: 2 });
+  const latest = save({ revision: 3 });
+  releaseFirst();
+  await Promise.all([first, latest]);
+
+  assert.deepEqual(writes, [1, 3]);
+});
+
+test("single-flight refreshes share one active operation", async () => {
+  let release;
+  let calls = 0;
+  const run = createSingleFlight(async () => {
+    calls += 1;
+    await new Promise((resolve) => { release = resolve; });
+    return "done";
+  });
+
+  const first = run();
+  const second = run();
+  release();
+
+  assert.equal(await first, "done");
+  assert.equal(await second, "done");
+  assert.equal(calls, 1);
+});
+
+test("general timeline choices omit reset to date", () => {
+  assert.deepEqual(
+    timelinePeriodEntries({ all: "All time", rtd: "Reset to date", ytd: "Year to date" }, false),
+    [["all", "All time"], ["ytd", "Year to date"]],
+  );
+});
+
+test("quota history is loaded independently from a timeline refresh", async () => {
+  const calls = [];
+  const history = [{ timestamp: "2026-09-16T10:00:00Z", agents: [] }];
+
+  const result = await loadQuotaHistory(async (command) => {
+    calls.push(command);
+    return history;
+  });
+
+  assert.deepEqual(calls, ["get_quota_history"]);
+  assert.deepEqual(result, history);
+});
+
+test("keeps the current dashboard visible while an uncached timeline loads", () => {
+  const currentReport = { totals: { totalCost: 12 } };
+
+  assert.deepEqual(timelineSelection({}, "ytd", currentReport, null), {
+    reportData: currentReport,
+    antigravityData: null,
+    pending: true,
+  });
+});
+
+test("switches immediately when the requested timeline is cached", () => {
+  const cached = { reportData: { totals: { totalCost: 42 } }, antigravityData: null, updatedAt: 1_000 };
+
+  assert.deepEqual(timelineSelection({ ytd: cached }, "ytd", { totals: { totalCost: 12 } }, null), {
+    ...cached,
+    pending: false,
+  });
+});
+
+test("refreshes a selected timeline only after its five minute freshness window", () => {
+  assert.equal(isTimelineCacheFresh({ updatedAt: 1_000 }, 300_999), true);
+  assert.equal(isTimelineCacheFresh({ updatedAt: 1_000 }, 301_001), false);
+  assert.equal(isTimelineCacheFresh({ reportData: {} }, 2_000), false);
+});
+
+test("derives reset-to-date start from a weekly provider reset", () => {
+  assert.equal(resetWindowStartDate("2026-09-23T04:34:22Z"), "2026-09-16");
+  assert.equal(resetWindowStartDate(null, 48 * 60, new Date("2026-09-16T12:00:00Z")), "2026-09-14");
+  assert.equal(resetWindowStartDate(null), null);
+});
+
+test("a fresh today report advances every timeline that contains today", () => {
+  const cache = {
+    today: { reportData: { totals: { totalCost: 2, totalTokens: 20 }, daily: [{ date: "2026-09-16", cost: 2, tokens: 20 }], agents: [], models: [] }, updatedAt: 1 },
+    ytd: { reportData: { totals: { totalCost: 12, totalTokens: 120 }, daily: [{ date: "2026-09-16", cost: 2, tokens: 20 }], agents: [], models: [] }, updatedAt: 1 },
+    yesterday: { reportData: { totals: { totalCost: 5, totalTokens: 50 }, daily: [], agents: [], models: [] }, updatedAt: 1 },
+  };
+  const freshToday = { totals: { totalCost: 3, totalTokens: 30 }, daily: [{ date: "2026-09-16", cost: 3, tokens: 30 }], agents: [], models: [], subscription: { agents: [] } };
+
+  updateCachedReportsFromToday(cache, freshToday, 500);
+
+  assert.deepEqual(cache.ytd.reportData.totals, { totalCost: 13, totalTokens: 130 });
+  assert.deepEqual(cache.ytd.reportData.daily, [{ date: "2026-09-16", cost: 3, tokens: 30 }]);
+  assert.equal(cache.ytd.updatedAt, 500);
+  assert.deepEqual(cache.yesterday.reportData.totals, { totalCost: 5, totalTokens: 50 });
+  assert.equal(cache.yesterday.updatedAt, 1);
+});
+
+test("a newly detected agent is copied once into older timeline caches", () => {
+  const cache = {
+    today: { reportData: { totals: {}, daily: [], agents: [], models: [] }, updatedAt: 1 },
+    ytd: { reportData: { totals: {}, daily: [], agents: [], models: [] }, updatedAt: 1 },
+  };
+  const freshToday = {
+    totals: { totalCost: 2, totalTokens: 20 },
+    daily: [{ date: "2026-09-16", cost: 2, tokens: 20 }],
+    models: [{ model: "new-model", totalCost: 2, totalTokens: 20, percentage: 100 }],
+    agents: [{
+      agent: "new-agent",
+      totalCost: 2,
+      totalTokens: 20,
+      models: [{ model: "new-model", totalCost: 2, totalTokens: 20, percentage: 100 }],
+      daily: [{ date: "2026-09-16", cost: 2, tokens: 20 }],
+      tokenBreakdown: { input: 20 },
+    }],
+  };
+
+  updateCachedReportsFromToday(cache, freshToday, 500);
+
+  assert.equal(cache.ytd.reportData.agents[0].totalTokens, 20);
+  assert.equal(cache.ytd.reportData.agents[0].models[0].totalTokens, 20);
+  assert.equal(cache.ytd.reportData.agents[0].tokenBreakdown.input, 20);
+});
+
+test("preloads inactive timelines in their normal display order", () => {
+  assert.deepEqual(
+    timelinePreloadOrder(["all", "today", "week", "ytd", "month"], "week"),
+    ["all", "today", "ytd", "month"],
+  );
+});
 
 test("waits for settings before persisting a quota source", async () => {
   let resolveSettings;
@@ -45,11 +189,6 @@ test("does not persist a quota source when settings failed to load", async () =>
 
 test("escapes untrusted log labels before inserting them into HTML", () => {
   assert.equal(escapeHtml('<img src=x onerror="alert(1)">'), "&lt;img src=x onerror=&quot;alert(1)&quot;&gt;");
-});
-
-test("shows a clean loading state when the selected timeline is not cached", () => {
-  assert.equal(shouldShowTimelineLoading({ today: {} }, "week"), true);
-  assert.equal(shouldShowTimelineLoading({ today: {} }, "today"), false);
 });
 
 test("omits unsupported cache-write metrics instead of displaying zero", () => {

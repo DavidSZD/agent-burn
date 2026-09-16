@@ -27,8 +27,157 @@ export function subscriptionPresentation(subscription) {
   };
 }
 
-export function shouldShowTimelineLoading(periodCache, period) {
-  return !Object.prototype.hasOwnProperty.call(periodCache, period);
+export function timelineSelection(periodCache, period, currentReport, currentAntigravity) {
+  const cached = periodCache[period];
+  if (cached) return { ...cached, pending: false };
+  return {
+    reportData: currentReport,
+    antigravityData: currentAntigravity,
+    pending: true,
+  };
+}
+
+export function isTimelineCacheFresh(entry, now = Date.now()) {
+  return Number.isFinite(entry?.updatedAt) && now - entry.updatedAt <= 5 * 60 * 1000;
+}
+
+export function timelinePeriodEntries(periodLabels, includeResetToDate = true) {
+  return Object.entries(periodLabels).filter(([period]) => includeResetToDate || period !== "rtd");
+}
+
+export function loadQuotaHistory(invoke) {
+  return invoke("get_quota_history");
+}
+
+export function createCoalescedSaver(write) {
+  let pending;
+  let active = null;
+
+  return (data) => {
+    pending = data;
+    if (!active) {
+      active = (async () => {
+        while (pending !== undefined) {
+          const next = pending;
+          pending = undefined;
+          await write(next);
+        }
+      })().finally(() => {
+        active = null;
+      });
+    }
+    return active;
+  };
+}
+
+export function createSingleFlight(operation) {
+  let active = null;
+  return (...args) => {
+    if (!active) {
+      active = Promise.resolve(operation(...args)).finally(() => {
+        active = null;
+      });
+    }
+    return active;
+  };
+}
+
+export function resetWindowStartDate(resetDate, elapsedMinutes, now = new Date()) {
+  const reset = resetDate ? new Date(resetDate) : null;
+  if (reset && Number.isFinite(reset.getTime())) {
+    return new Date(reset.getTime() - 7 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  }
+  const elapsed = Number(elapsedMinutes);
+  if (!Number.isFinite(elapsed) || elapsed < 0) return null;
+  return new Date(now.getTime() - elapsed * 60 * 1000).toISOString().slice(0, 10);
+}
+
+function applyNumberDelta(target, fresh, previous, key) {
+  const current = Number(target?.[key]) || 0;
+  const delta = (Number(fresh?.[key]) || 0) - (Number(previous?.[key]) || 0);
+  target[key] = Math.max(0, current + delta);
+}
+
+function applyRowsDelta(targetRows, freshRows, previousRows, key) {
+  for (const fresh of freshRows || []) {
+    const id = fresh?.[key];
+    if (id == null) continue;
+    let target = targetRows.find((row) => row?.[key] === id);
+    if (!target) {
+      target = structuredClone(fresh);
+      targetRows.push(target);
+      continue;
+    }
+    const previous = (previousRows || []).find((row) => row?.[key] === id) || {};
+    applyNumberDelta(target, fresh, previous, "totalCost");
+    applyNumberDelta(target, fresh, previous, "totalTokens");
+  }
+}
+
+export function updateCachedReportsFromToday(periodCache, freshToday, updatedAt = Date.now()) {
+  const previousToday = periodCache.today?.reportData;
+  periodCache.today = { reportData: structuredClone(freshToday), antigravityData: null, updatedAt };
+  if (!previousToday) return;
+
+  for (const [period, entry] of Object.entries(periodCache)) {
+    if (period === "today" || period === "yesterday" || !entry?.reportData) continue;
+    const report = entry.reportData;
+    report.totals ||= {};
+    applyNumberDelta(report.totals, freshToday.totals, previousToday.totals, "totalCost");
+    applyNumberDelta(report.totals, freshToday.totals, previousToday.totals, "totalTokens");
+
+    const todayDate = freshToday.daily?.[0]?.date;
+    if (todayDate) {
+      report.daily = (report.daily || []).filter((day) => day.date !== todayDate);
+      report.daily.push(...structuredClone(freshToday.daily || []));
+      report.daily.sort((left, right) => String(left.date).localeCompare(String(right.date)));
+    }
+    report.models ||= [];
+    applyRowsDelta(report.models, freshToday.models, previousToday.models, "model");
+    report.agents ||= [];
+    const existingAgents = new Set(report.agents.map((agent) => agent.agent));
+    applyRowsDelta(report.agents, freshToday.agents, previousToday.agents, "agent");
+    for (const freshAgent of freshToday.agents || []) {
+      const targetAgent = report.agents.find((agent) => agent.agent === freshAgent.agent);
+      const previousAgent = (previousToday.agents || []).find((agent) => agent.agent === freshAgent.agent) || {};
+      if (!targetAgent) continue;
+      if (!existingAgents.has(freshAgent.agent)) continue;
+      targetAgent.models ||= [];
+      applyRowsDelta(targetAgent.models, freshAgent.models, previousAgent.models, "model");
+      if (todayDate) {
+        targetAgent.daily = (targetAgent.daily || []).filter((day) => day.date !== todayDate);
+        targetAgent.daily.push(...structuredClone(freshAgent.daily || []));
+        targetAgent.daily.sort((left, right) => String(left.date).localeCompare(String(right.date)));
+      }
+      targetAgent.tokenBreakdown ||= {};
+      for (const key of ["input", "output", "cacheWrite", "cacheRead"]) {
+        if (freshAgent.tokenBreakdown?.[key] != null || previousAgent.tokenBreakdown?.[key] != null) {
+          applyNumberDelta(targetAgent.tokenBreakdown, freshAgent.tokenBreakdown, previousAgent.tokenBreakdown, key);
+        }
+      }
+    }
+    const modelTokens = report.models.reduce((sum, model) => sum + (Number(model.totalTokens) || 0), 0);
+    for (const model of report.models) {
+      model.percentage = modelTokens > 0 ? ((Number(model.totalTokens) || 0) / modelTokens) * 100 : 0;
+    }
+    for (const agent of report.agents) {
+      const agentModelTokens = (agent.models || []).reduce(
+        (sum, model) => sum + (Number(model.totalTokens) || 0),
+        0,
+      );
+      for (const model of agent.models || []) {
+        model.percentage = agentModelTokens > 0
+          ? ((Number(model.totalTokens) || 0) / agentModelTokens) * 100
+          : 0;
+      }
+    }
+    report.subscription = structuredClone(freshToday.subscription || report.subscription);
+    entry.updatedAt = updatedAt;
+  }
+}
+
+export function timelinePreloadOrder(periods, activePeriod) {
+  return periods.filter((period) => period !== activePeriod);
 }
 
 export function getRestoredPeriod(storedPeriod, availablePeriods) {

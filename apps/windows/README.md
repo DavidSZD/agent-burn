@@ -14,6 +14,8 @@ The system-tray tooltip provides live quota remaining for detected providers. Po
 - **Native Windows shell**: Powered by Microsoft Edge WebView2, included with supported Windows versions.
 - **Local-First & Offline**: Reads local logs directly. No source code or prompts ever leave your machine.
 - **Recoverable history**: Atomic cache and backup files plus an append-only journal recover the latest report after cache corruption.
+- **Instant timeline switching**: Persisted period caches open immediately; stale selections refresh unobtrusively while startup preloads the remaining periods in the background.
+- **Antigravity without the desktop app**: Live weekly and five-hour quotas are collected through the authenticated `agy` CLI, with the local language server and persisted account tier used for plan detection.
 
 ## Architecture
 
@@ -60,7 +62,7 @@ The release bundle contains `agent-burn.exe`; the desktop application never down
 Build or download an installer with a version newer than the installed copy, close Agent Burn from its tray menu, then launch it in update mode:
 
 ```powershell
-Start-Process '.\Agent Burn_0.1.14_x64-setup.exe' -ArgumentList '/UPDATE' -Wait
+Start-Process '.\Agent Burn_0.1.18_x64-setup.exe' -ArgumentList '/UPDATE' -Wait
 ```
 
 Update mode replaces the application in place without showing the uninstall/data-removal flow. Dashboard settings and history under `%LOCALAPPDATA%\Agent Burn` are preserved. Automatic network updates are not enabled, so release installers remain the explicit update channel until a signed release feed is configured.
