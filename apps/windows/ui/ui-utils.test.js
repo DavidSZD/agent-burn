@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  createCoalescedSaver,
+  createSingleFlight,
   escapeHtml,
   getRestoredPeriod,
   timelineStartDate,
@@ -20,6 +22,41 @@ import {
   subscriptionPresentation,
   visibleTokenBreakdownEntries,
 } from "./ui-utils.js";
+
+test("coalesced saves keep the in-flight write and only the newest pending state", async () => {
+  let releaseFirst;
+  const writes = [];
+  const save = createCoalescedSaver(async (data) => {
+    writes.push(data.revision);
+    if (data.revision === 1) await new Promise((resolve) => { releaseFirst = resolve; });
+  });
+
+  const first = save({ revision: 1 });
+  save({ revision: 2 });
+  const latest = save({ revision: 3 });
+  releaseFirst();
+  await Promise.all([first, latest]);
+
+  assert.deepEqual(writes, [1, 3]);
+});
+
+test("single-flight refreshes share one active operation", async () => {
+  let release;
+  let calls = 0;
+  const run = createSingleFlight(async () => {
+    calls += 1;
+    await new Promise((resolve) => { release = resolve; });
+    return "done";
+  });
+
+  const first = run();
+  const second = run();
+  release();
+
+  assert.equal(await first, "done");
+  assert.equal(await second, "done");
+  assert.equal(calls, 1);
+});
 
 test("general timeline choices omit reset to date", () => {
   assert.deepEqual(

@@ -11,6 +11,7 @@ pub struct AppState {
     pub cli_path: Option<PathBuf>,
     pub settings: RwLock<AppSettings>,
     pub latest_refresh: RwLock<Option<RefreshSnapshot>>,
+    pub summary_scan: tokio::sync::Mutex<()>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -68,6 +69,7 @@ impl AppState {
             cli_path,
             settings: RwLock::new(settings),
             latest_refresh: RwLock::new(None),
+            summary_scan: tokio::sync::Mutex::new(()),
         }
     }
 }

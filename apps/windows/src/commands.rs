@@ -11,6 +11,7 @@ pub async fn get_summary(
     range: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<serde_json::Value, String> {
+    let _scan = state.summary_scan.lock().await;
     let period_val = period.or(range).unwrap_or_else(|| "all".to_string());
     let settings = state
         .settings
@@ -27,6 +28,7 @@ pub async fn get_summary_since(
     since: String,
     state: State<'_, AppState>,
 ) -> Result<serde_json::Value, String> {
+    let _scan = state.summary_scan.lock().await;
     chrono::NaiveDate::parse_from_str(&since, "%Y-%m-%d")
         .map_err(|_| "La date de début doit utiliser le format YYYY-MM-DD.".to_string())?;
     let settings = state
@@ -321,6 +323,7 @@ pub async fn get_harness(
     agent: String,
     state: State<'_, AppState>,
 ) -> Result<serde_json::Value, String> {
+    let _scan = state.summary_scan.lock().await;
     let args = vec!["harness", &agent, "--value"];
     let settings = state
         .settings
@@ -380,8 +383,10 @@ pub fn set_autostart(enabled: bool) -> Result<bool, String> {
 }
 
 #[tauri::command]
-pub fn get_quota_history() -> Result<serde_json::Value, String> {
-    Ok(crate::archive::load_quota_history())
+pub async fn get_quota_history() -> Result<serde_json::Value, String> {
+    tokio::task::spawn_blocking(crate::archive::load_quota_history)
+        .await
+        .map_err(|error| format!("Erreur lecture historique quotas: {error}"))
 }
 
 #[tauri::command]
@@ -392,6 +397,15 @@ pub fn get_refresh_snapshot(
         .latest_refresh
         .read()
         .map(|snapshot| snapshot.clone())
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn get_refresh_revision(state: State<'_, AppState>) -> Result<Option<i64>, String> {
+    state
+        .latest_refresh
+        .read()
+        .map(|snapshot| snapshot.as_ref().map(|value| value.refreshed_at_ms))
         .map_err(|error| error.to_string())
 }
 
@@ -413,14 +427,17 @@ pub fn open_project_folder(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn get_report_cache() -> Result<serde_json::Value, String> {
-    Ok(crate::archive::load_report_cache())
+pub async fn get_report_cache() -> Result<serde_json::Value, String> {
+    tokio::task::spawn_blocking(crate::archive::load_report_cache)
+        .await
+        .map_err(|error| format!("Erreur lecture cache rapports: {error}"))
 }
 
 #[tauri::command]
-pub fn save_report_cache(data: serde_json::Value) -> Result<(), String> {
-    crate::archive::save_report_cache(&data);
-    Ok(())
+pub async fn save_report_cache(data: serde_json::Value) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || crate::archive::save_report_cache(&data))
+        .await
+        .map_err(|error| format!("Erreur écriture cache rapports: {error}"))?
 }
 
 #[tauri::command]

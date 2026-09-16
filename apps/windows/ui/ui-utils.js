@@ -49,6 +49,39 @@ export function loadQuotaHistory(invoke) {
   return invoke("get_quota_history");
 }
 
+export function createCoalescedSaver(write) {
+  let pending;
+  let active = null;
+
+  return (data) => {
+    pending = data;
+    if (!active) {
+      active = (async () => {
+        while (pending !== undefined) {
+          const next = pending;
+          pending = undefined;
+          await write(next);
+        }
+      })().finally(() => {
+        active = null;
+      });
+    }
+    return active;
+  };
+}
+
+export function createSingleFlight(operation) {
+  let active = null;
+  return (...args) => {
+    if (!active) {
+      active = Promise.resolve(operation(...args)).finally(() => {
+        active = null;
+      });
+    }
+    return active;
+  };
+}
+
 export function resetWindowStartDate(resetDate, elapsedMinutes, now = new Date()) {
   const reset = resetDate ? new Date(resetDate) : null;
   if (reset && Number.isFinite(reset.getTime())) {

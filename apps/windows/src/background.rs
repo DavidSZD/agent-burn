@@ -31,7 +31,11 @@ async fn collect_and_archive(app: &AppHandle) {
     };
     let cli = resolve_cli_path_with_override(settings.custom_cli_path.as_deref())
         .or_else(|| state.cli_path.clone());
-    if let Ok(data) = crate::commands::build_summary("all", &settings, cli.as_deref()).await {
+    let summary = {
+        let _scan = state.summary_scan.lock().await;
+        crate::commands::build_summary("all", &settings, cli.as_deref()).await
+    };
+    if let Ok(data) = summary {
         let snapshot = RefreshSnapshot {
             refreshed_at_ms: chrono::Utc::now().timestamp_millis(),
             report: data.clone(),

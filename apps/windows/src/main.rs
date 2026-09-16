@@ -58,6 +58,7 @@ fn main() {
             commands::set_autostart,
             commands::get_quota_history,
             commands::get_refresh_snapshot,
+            commands::get_refresh_revision,
             commands::open_data_folder,
             commands::get_projects_usage,
             commands::open_project_folder,

@@ -1,5 +1,7 @@
 import { RequestGate } from "./request-gate.js";
 import {
+  createCoalescedSaver,
+  createSingleFlight,
   escapeHtml,
   getRestoredPeriod,
   isTimelineCacheFresh,
@@ -62,10 +64,13 @@ let detectedAgents = [];
 const allKnownAgents = new Set();
 let lastUpdatedTime = Date.now();
 let lastBackendRefreshMs = 0;
+let lastBackendRevisionMs = 0;
 let appSettings = null;
 let settingsLoadPromise = Promise.resolve(null);
 const periodCache = {};
 const periodRequests = new Map();
+const saveReportCache = createCoalescedSaver((data) => invokeTauri("save_report_cache", { data }));
+const refreshAllTimelineCaches = createSingleFlight(performAllTimelineRefresh);
 const harnessCache = {};
 const summaryRequestGate = new RequestGate();
 
@@ -234,9 +239,6 @@ function applyBackendRefresh(data, refreshedAtMs) {
     reportData = mergeLiveSubscription(reportData, data);
   }
   computeDetectedAgents(reportData, antigravityData);
-  renderHarnessTabs();
-  if (currentTab === "summary") renderSummary();
-  else if (currentTab !== "settings") renderHarnessView(currentTab);
   return true;
 }
 
@@ -245,6 +247,7 @@ async function syncBackendRefresh(data, refreshedAtMs) {
   try {
     quotaHistoryData = await invokeTauri("get_quota_history");
   } catch (_) {}
+  renderHarnessTabs();
   if (currentTab === "summary") renderSummary();
   else if (currentTab !== "settings") renderHarnessView(currentTab);
 }
@@ -252,8 +255,13 @@ async function syncBackendRefresh(data, refreshedAtMs) {
 function initBackendRefreshPolling() {
   const poll = async () => {
     try {
+      const revision = Number(await invokeTauri("get_refresh_revision"));
+      if (!Number.isFinite(revision) || revision <= lastBackendRevisionMs) return;
       const snapshot = await invokeTauri("get_refresh_snapshot");
-      if (snapshot?.report) await syncBackendRefresh(snapshot.report, Number(snapshot.refreshedAtMs));
+      if (snapshot?.report) {
+        lastBackendRevisionMs = revision;
+        await syncBackendRefresh(snapshot.report, Number(snapshot.refreshedAtMs));
+      }
     } catch (_) {}
   };
   setTimeout(poll, 3000);
@@ -306,9 +314,7 @@ async function preloadTimelines(refreshExisting = false) {
     try {
       await requestTimeline(period, refreshExisting);
       updateTimelineAvailability();
-      await invokeTauri("save_report_cache", {
-        data: { summary: reportData, periods: periodCache, currentPeriod },
-      });
+      await saveReportCache({ summary: reportData, periods: periodCache, currentPeriod });
     } catch (error) {
       // A missing source for one period must not prevent the other periods loading.
       console.debug(`Unable to preload ${period}`, error);
@@ -609,9 +615,8 @@ async function loadData(force = false) {
     }
 
     // Sauvegarde en cache disque
-    invokeTauri("save_report_cache", {
-      data: { summary: reportData, periods: periodCache, currentPeriod },
-    }).catch((error) => showStatusError(`Unable to save report cache: ${error}`));
+    saveReportCache({ summary: reportData, periods: periodCache, currentPeriod })
+      .catch((error) => showStatusError(`Unable to save report cache: ${error}`));
 
   } catch (err) {
     showStatusError(`Unable to load usage: ${err}`);
@@ -620,7 +625,7 @@ async function loadData(force = false) {
   }
 }
 
-async function refreshAllTimelineCaches(showIndicator = false) {
+async function performAllTimelineRefresh(showIndicator = false) {
   if (showIndicator) setTimelineRefreshing(true);
   try {
     const previousToday = periodCache.today;
@@ -640,9 +645,7 @@ async function refreshAllTimelineCaches(showIndicator = false) {
       if (currentTab === "summary") renderSummary();
       else if (currentTab !== "settings") renderHarnessView(currentTab);
     }
-    await invokeTauri("save_report_cache", {
-      data: { summary: reportData, periods: periodCache, currentPeriod },
-    });
+    await saveReportCache({ summary: reportData, periods: periodCache, currentPeriod });
     void preloadTimelines();
   } catch (error) {
     showStatusError(`Unable to refresh timelines: ${error}`);
