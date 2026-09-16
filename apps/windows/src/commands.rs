@@ -32,7 +32,13 @@ pub(crate) async fn build_summary(
         args.push(period);
     }
     let mut summary = execute_cli_json_with_settings(cli, &args, settings).await?;
-    if let Ok(mut antigravity) = crate::antigravity::get_antigravity_data(Some(period)) {
+    let antigravity_period = period.to_string();
+    let antigravity_result = tokio::task::spawn_blocking(move || {
+        crate::antigravity::get_antigravity_data(Some(&antigravity_period))
+    })
+    .await
+    .map_err(|error| format!("Erreur tâche d'analyse Antigravity: {error}"))?;
+    if let Ok(mut antigravity) = antigravity_result {
         if let Some(plan) = antigravity.plan.as_mut() {
             plan.price_per_month = crate::antigravity::antigravity_plan_price(
                 &plan.plan,
