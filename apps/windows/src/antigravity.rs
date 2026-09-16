@@ -55,6 +55,14 @@ pub struct AntigravityPlan {
     pub email: Option<String>,
     pub name: Option<String>,
     pub quotas: Vec<AntigravityQuotaInfo>,
+    #[serde(default)]
+    pub weekly_remaining: Option<f64>,
+    #[serde(default)]
+    pub weekly_reset_time: Option<String>,
+    #[serde(default)]
+    pub session_remaining: Option<f64>,
+    #[serde(default)]
+    pub session_reset_time: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -419,7 +427,7 @@ fn load_step_dates(
 }
 
 fn get_live_antigravity_plan() -> Option<AntigravityPlan> {
-    let script = r#"$OutputEncoding=[Console]::OutputEncoding=[Text.UTF8Encoding]::new();$p=Get-CimInstance Win32_Process -Filter "Name = 'language_server.exe'"|Select-Object -First 1;if(-not $p){exit 1};$m=[regex]::Match($p.CommandLine,'--csrf_token\s+([^\s]+)');if(-not $m.Success){exit 1};$token=$m.Groups[1].Value;$ports=Get-NetTCPConnection -State Listen|Where-Object{$_.OwningProcess -eq $p.ProcessId -and $_.LocalAddress -eq '127.0.0.1'}|Select-Object -ExpandProperty LocalPort -Unique;[System.Net.ServicePointManager]::ServerCertificateValidationCallback={$true};foreach($port in $ports){foreach($scheme in @('http','https')){try{$r=Invoke-RestMethod -Uri "${scheme}://127.0.0.1:${port}/exa.language_server_pb.LanguageServerService/GetUserStatus" -Method Post -Headers @{'x-codeium-csrf-token'=$token;'Connect-Protocol-Version'='1'} -ContentType 'application/json' -Body '{}' -TimeoutSec 2 -ErrorAction Stop;$r|ConvertTo-Json -Depth 30 -Compress;exit 0}catch{}}};exit 1"#;
+    let script = r#"$OutputEncoding=[Console]::OutputEncoding=[Text.UTF8Encoding]::new();$p=Get-CimInstance Win32_Process -Filter "Name = 'language_server.exe'"|Select-Object -First 1;if(-not $p){exit 1};$m=[regex]::Match($p.CommandLine,'--csrf_token\s+([^\s]+)');if(-not $m.Success){exit 1};$token=$m.Groups[1].Value;$ports=Get-NetTCPConnection -State Listen|Where-Object{$_.OwningProcess -eq $p.ProcessId -and $_.LocalAddress -eq '127.0.0.1'}|Select-Object -ExpandProperty LocalPort -Unique;[System.Net.ServicePointManager]::ServerCertificateValidationCallback={$true};foreach($port in $ports){foreach($scheme in @('http','https')){try{$headers=@{'x-codeium-csrf-token'=$token;'Connect-Protocol-Version'='1'};$s=Invoke-RestMethod -Uri "${scheme}://127.0.0.1:${port}/exa.language_server_pb.LanguageServerService/GetUserStatus" -Method Post -Headers $headers -ContentType 'application/json' -Body '{}' -TimeoutSec 2 -ErrorAction Stop;$q=Invoke-RestMethod -Uri "${scheme}://127.0.0.1:${port}/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary" -Method Post -Headers $headers -ContentType 'application/json' -Body '{}' -TimeoutSec 2 -ErrorAction SilentlyContinue;@{userStatus=$s.userStatus;quotaSummary=$q.response}|ConvertTo-Json -Depth 30 -Compress;exit 0}catch{}}};exit 1"#;
     let mut command = std::process::Command::new("powershell.exe");
     command.args(["-NoProfile", "-NonInteractive", "-Command", script]);
     #[cfg(windows)]
@@ -441,7 +449,7 @@ fn powershell_creation_flags() -> u32 {
 }
 
 fn parse_live_status(status: &serde_json::Value) -> Option<AntigravityPlan> {
-    let user = status.get("userStatus")?;
+    let user = status.get("userStatus").unwrap_or(status);
     let plan = user
         .pointer("/planStatus/planInfo/planName")
         .and_then(|v| v.as_str())?
@@ -466,6 +474,42 @@ fn parse_live_status(status: &serde_json::Value) -> Option<AntigravityPlan> {
             })
         })
         .collect();
+
+    let mut weekly_remaining: Option<f64> = None;
+    let mut weekly_reset_time: Option<String> = None;
+    let mut session_remaining: Option<f64> = None;
+    let mut session_reset_time: Option<String> = None;
+
+    if let Some(quota_summary) = status.get("quotaSummary") {
+        if let Some(groups) = quota_summary.get("groups").and_then(|g| g.as_array()) {
+            for group in groups {
+                if let Some(buckets) = group.get("buckets").and_then(|b| b.as_array()) {
+                    for bucket in buckets {
+                        let window = bucket.get("window").and_then(|w| w.as_str()).unwrap_or("");
+                        let frac = bucket.get("remainingFraction").and_then(|f| f.as_f64());
+                        let reset = bucket.get("resetTime").and_then(|r| r.as_str()).map(str::to_string);
+
+                        if window == "weekly" {
+                            if let Some(rem_pct) = frac.map(|f| f * 100.0) {
+                                if weekly_remaining.map_or(true, |curr| rem_pct < curr) {
+                                    weekly_remaining = Some(rem_pct);
+                                    weekly_reset_time = reset;
+                                }
+                            }
+                        } else if window == "5h" {
+                            if let Some(rem_pct) = frac.map(|f| f * 100.0) {
+                                if session_remaining.map_or(true, |curr| rem_pct < curr) {
+                                    session_remaining = Some(rem_pct);
+                                    session_reset_time = reset;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     Some(AntigravityPlan {
         plan,
         price_per_month: 0.0,
@@ -478,6 +522,10 @@ fn parse_live_status(status: &serde_json::Value) -> Option<AntigravityPlan> {
             .and_then(|value| value.as_str())
             .map(str::to_string),
         quotas,
+        weekly_remaining,
+        weekly_reset_time,
+        session_remaining,
+        session_reset_time,
     })
 }
 
@@ -793,6 +841,44 @@ mod tests {
         assert_eq!(plan.name.as_deref(), Some("Real User"));
         assert_eq!(plan.quotas[0].remaining, 54.0);
         assert_eq!(plan.quotas[0].model_id.as_deref(), Some("gemini-pro-agent"));
+    }
+
+    #[test]
+    fn live_status_extracts_weekly_and_session_quota_from_quota_summary() {
+        let status = serde_json::json!({
+            "userStatus": {
+                "name": "Real User",
+                "planStatus": {"planInfo": {"planName": "Pro"}},
+                "cascadeModelConfigData": {"clientModelConfigs": []}
+            },
+            "quotaSummary": {
+                "groups": [{
+                    "displayName": "Gemini Models",
+                    "buckets": [
+                        {
+                            "bucketId": "gemini-weekly",
+                            "window": "weekly",
+                            "remainingFraction": 0.9734,
+                            "resetTime": "2026-09-23T04:34:22Z"
+                        },
+                        {
+                            "bucketId": "gemini-5h",
+                            "window": "5h",
+                            "remainingFraction": 0.8409,
+                            "resetTime": "2026-09-16T09:34:22Z"
+                        }
+                    ]
+                }]
+            }
+        });
+
+        let plan = parse_live_status(&status).expect("real plan with quota summary");
+
+        assert_eq!(plan.plan, "Pro");
+        assert!((plan.weekly_remaining.unwrap() - 97.34).abs() < 0.01);
+        assert_eq!(plan.weekly_reset_time.as_deref(), Some("2026-09-23T04:34:22Z"));
+        assert!((plan.session_remaining.unwrap() - 84.09).abs() < 0.01);
+        assert_eq!(plan.session_reset_time.as_deref(), Some("2026-09-16T09:34:22Z"));
     }
 
     #[test]

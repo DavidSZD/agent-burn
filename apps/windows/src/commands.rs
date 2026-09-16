@@ -19,7 +19,12 @@ pub async fn get_summary(
         .clone();
     let cli = resolve_cli_path_with_override(settings.custom_cli_path.as_deref())
         .or_else(|| state.cli_path.clone());
-    build_summary(&period_val, &settings, cli.as_deref()).await
+    let summary = build_summary(&period_val, &settings, cli.as_deref()).await?;
+    if period_val == "all" {
+        crate::archive::record_quota_sample(&summary);
+        crate::archive::record_metrics_snapshot(&summary);
+    }
+    Ok(summary)
 }
 
 pub(crate) async fn build_summary(
@@ -193,16 +198,71 @@ fn merge_antigravity(
             .quotas
             .iter()
             .min_by(|a, b| a.remaining.total_cmp(&b.remaining));
+
+        let window_val = if let (Some(rem), Some(reset_time)) = (plan.weekly_remaining, &plan.weekly_reset_time) {
+            let elapsed_mins = chrono::DateTime::parse_from_rfc3339(reset_time)
+                .ok()
+                .map(|reset_dt| {
+                    let total_mins = 7.0 * 24.0 * 60.0;
+                    let rem_mins = (reset_dt.with_timezone(&chrono::Utc) - chrono::Utc::now())
+                        .num_seconds() as f64
+                        / 60.0;
+                    (total_mins - rem_mins).clamp(0.0, total_mins)
+                });
+
+            Some(serde_json::json!({
+                "usedPercent": (100.0 - rem).clamp(0.0, 100.0),
+                "resetDate": reset_time,
+                "elapsedMinutes": elapsed_mins,
+            }))
+        } else {
+            limiting.map(|quota| {
+                let elapsed_mins = quota
+                    .reset_time
+                    .as_deref()
+                    .and_then(|rt| chrono::DateTime::parse_from_rfc3339(rt).ok())
+                    .map(|reset_dt| {
+                        let total_mins = 7.0 * 24.0 * 60.0;
+                        let rem_mins = (reset_dt.with_timezone(&chrono::Utc) - chrono::Utc::now())
+                            .num_seconds() as f64
+                            / 60.0;
+                        (total_mins - rem_mins).clamp(0.0, total_mins)
+                    });
+                serde_json::json!({
+                    "usedPercent": (100.0 - quota.remaining).clamp(0.0, 100.0),
+                    "resetDate": quota.reset_time,
+                    "elapsedMinutes": elapsed_mins,
+                })
+            })
+        };
+
+        let short_window_val = if let (Some(rem), Some(reset_time)) = (plan.session_remaining, &plan.session_reset_time) {
+            let elapsed_mins = chrono::DateTime::parse_from_rfc3339(reset_time)
+                .ok()
+                .map(|reset_dt| {
+                    let total_mins = 5.0 * 60.0;
+                    let rem_mins = (reset_dt.with_timezone(&chrono::Utc) - chrono::Utc::now())
+                        .num_seconds() as f64
+                        / 60.0;
+                    (total_mins - rem_mins).clamp(0.0, total_mins)
+                });
+            Some(serde_json::json!({
+                "usedPercent": (100.0 - rem).clamp(0.0, 100.0),
+                "resetDate": reset_time,
+                "elapsedMinutes": elapsed_mins,
+            }))
+        } else {
+            None
+        };
+
         let subscription = serde_json::json!({
             "agent": "antigravity",
             "plan": plan.plan,
             "pricePerMonth": if plan.price_per_month > 0.0 { Some(plan.price_per_month) } else { None },
             "account": plan.email.as_ref().or(plan.name.as_ref()),
             "liveLimits": plan.quotas,
-            "window": limiting.map(|quota| serde_json::json!({
-                "usedPercent": (100.0 - quota.remaining).clamp(0.0, 100.0),
-                "resetDate": quota.reset_time,
-            })),
+            "window": window_val,
+            "shortWindow": short_window_val,
         });
         let subscriptions = root
             .entry("subscription")
@@ -388,5 +448,49 @@ mod tests {
         };
 
         assert!(merge_antigravity(&mut summary, &antigravity).is_err());
+    }
+
+    #[test]
+    fn antigravity_merge_includes_weekly_and_session_window_with_elapsed_minutes() {
+        let mut summary = serde_json::json!({
+            "totals": {"totalCost": 0.0, "totalTokens": 0},
+            "agents": [], "models": [], "daily": []
+        });
+        let future_reset = (chrono::Utc::now() + chrono::Duration::hours(24)).to_rfc3339();
+        let antigravity = crate::antigravity::AntigravitySummary {
+            period: "all".into(),
+            session_count: 1,
+            total_tokens: 10,
+            input_tokens: 5,
+            output_tokens: 5,
+            cache_read_tokens: 0,
+            total_cost: 0.1,
+            top_models: vec![],
+            sessions: vec![],
+            daily: vec![],
+            plan: Some(crate::antigravity::AntigravityPlan {
+                plan: "Pro".into(),
+                price_per_month: 20.0,
+                email: Some("test@example.com".into()),
+                name: Some("Test User".into()),
+                quotas: vec![],
+                weekly_remaining: Some(95.5),
+                weekly_reset_time: Some(future_reset.clone()),
+                session_remaining: Some(80.0),
+                session_reset_time: Some(future_reset.clone()),
+            }),
+        };
+
+        merge_antigravity(&mut summary, &antigravity).expect("merge summary");
+
+        let agents = summary["subscription"]["agents"].as_array().expect("agents array");
+        let ag = agents.iter().find(|a| a["agent"] == "antigravity").expect("antigravity in subscription");
+        assert_eq!(ag["plan"], "Pro");
+        let win = &ag["window"];
+        assert!((win["usedPercent"].as_f64().unwrap() - 4.5).abs() < 0.01);
+        assert!(win["elapsedMinutes"].as_f64().is_some());
+        let swin = &ag["shortWindow"];
+        assert!((swin["usedPercent"].as_f64().unwrap() - 20.0).abs() < 0.01);
+        assert!(swin["elapsedMinutes"].as_f64().is_some());
     }
 }

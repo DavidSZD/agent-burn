@@ -196,10 +196,21 @@ function initBackendEvents() {
     for (const key in periodCache) delete periodCache[key];
     await loadData(true);
   });
-  listen("quotas_updated", (event) => {
+  listen("quotas_updated", async (event) => {
     // The collector already performed a full CLI scan. Reuse its payload for
     // the lightweight quota indicator instead of immediately scanning again.
-    if (event?.payload) updateTopBarQuotaPill(event.payload);
+    if (event?.payload) {
+      updateTopBarQuotaPill(event.payload);
+      try {
+        quotaHistoryData = await invokeTauri("get_quota_history");
+        if (currentTab !== "summary" && currentTab !== "settings") {
+          const subAgent = (event.payload?.subscription?.agents || []).find((a) => a.agent === currentTab);
+          if (subAgent?.window) {
+            renderBurndownSVG("burndown-svg-wrapper", subAgent);
+          }
+        }
+      } catch (_) {}
+    }
   });
 }
 
@@ -449,9 +460,12 @@ async function loadData(force = false) {
   }
 
   try {
-    // 1. Récupération du résumé CLI
+    // 1. Récupération du résumé CLI et de l'historique des quotas
     const args = currentPeriod === "all" ? [] : [currentPeriod];
     const summary = await invokeTauri("get_summary", { range: args.length > 0 ? args[0] : null });
+    try {
+      quotaHistoryData = await invokeTauri("get_quota_history");
+    } catch (_) {}
 
     if (!summaryRequestGate.isCurrent(requestGeneration) || currentPeriod !== cacheKey) return;
 
@@ -738,6 +752,20 @@ function renderHarnessView(agent) {
                 <span class="quota-fact-sub">banked</span>
               </div>
             </div>
+            ${subscriptionAgent.shortWindow ? (() => {
+              const sw = quotaPresentation(subscriptionAgent.shortWindow);
+              const swMins = sw.resetInMinutes;
+              const swTimeText = swMins != null ? (swMins >= 60 ? `${Math.floor(swMins / 60)}h ${swMins % 60}m` : `${swMins}m`) : "";
+              return `
+                <div class="quota-fact-row">
+                  <span class="quota-fact-label">5-hour limit</span>
+                  <div class="quota-fact-val-group">
+                    <span class="quota-fact-primary">${sw.remainingPercent.toFixed(1)}%</span>
+                    <span class="quota-fact-sub">${swTimeText ? `resets in ${swTimeText}` : "session limit"}</span>
+                  </div>
+                </div>
+              `;
+            })() : ""}
           </div>
         </div>
 
@@ -977,6 +1005,7 @@ function renderBurndownSVG(containerId, subAgent) {
   const used = subAgent?.window?.usedPercent || 0;
   const remaining = Math.max(0, 100 - used);
   const elapsed = Math.max(1, subAgent?.window?.elapsedMinutes || 1000);
+  const agentName = subAgent?.agent || currentTab;
 
   // Règles exactes de QuotaChart.swift macOS :
   // showsForecast est true UNIQUEMENT pour 'rte' (Until reset)
@@ -985,24 +1014,33 @@ function renderBurndownSVG(containerId, subAgent) {
   const showsIdeal = currentQuotaHorizon === "rte" || currentQuotaHorizon === "rtd";
 
   // Définition de l'échelle temporelle selon l'horizon sélectionné
-  let totalWindowMins = 7 * 24 * 60; // Défaut : 7 jours (rte)
   const nowTime = new Date();
-  let cycleEndTime = subAgent?.window?.resetDate ? new Date(subAgent.window.resetDate) : new Date(nowTime.getTime() + (totalWindowMins - elapsed) * 60000);
+  let cycleEndTime = subAgent?.window?.resetDate ? new Date(subAgent.window.resetDate) : new Date(nowTime.getTime() + (7 * 24 * 60 - elapsed) * 60000);
   if (isNaN(cycleEndTime.getTime())) {
-    cycleEndTime = new Date(nowTime.getTime() + (totalWindowMins - elapsed) * 60000);
+    cycleEndTime = new Date(nowTime.getTime() + (7 * 24 * 60 - elapsed) * 60000);
   }
+
+  const cycleDurationMins = 7 * 24 * 60; // 7 jours pour le cycle complet
+  const cycleStartTime = new Date(cycleEndTime.getTime() - cycleDurationMins * 60000);
+
+  let windowStart = cycleStartTime;
+  let windowEnd = cycleEndTime;
 
   if (currentQuotaHorizon === "rtd") {
-    totalWindowMins = Math.max(elapsed, 1440);
+    windowStart = cycleStartTime;
+    windowEnd = nowTime;
   } else if (currentQuotaHorizon === "today") {
-    totalWindowMins = 24 * 60; // 1440 mins
+    windowStart = new Date(nowTime.getFullYear(), nowTime.getMonth(), nowTime.getDate());
+    windowEnd = nowTime;
   } else if (currentQuotaHorizon === "week") {
-    totalWindowMins = 7 * 24 * 60;
+    windowStart = new Date(nowTime.getTime() - 7 * 24 * 60 * 60000);
+    windowEnd = nowTime;
   } else if (currentQuotaHorizon === "month") {
-    totalWindowMins = 30 * 24 * 60;
+    windowStart = new Date(nowTime.getTime() - 30 * 24 * 60 * 60000);
+    windowEnd = nowTime;
   }
 
-  const cycleStartTime = new Date(cycleEndTime.getTime() - totalWindowMins * 60000);
+  const windowDurationMs = Math.max(1000, windowEnd.getTime() - windowStart.getTime());
 
   function formatMacChartDate(d) {
     if (!d || isNaN(d.getTime())) return "";
@@ -1016,13 +1054,16 @@ function renderBurndownSVG(containerId, subAgent) {
     return `${m} ${dayNum} at ${h}:${mins} ${ampm}`;
   }
 
-  // Noms réels des jours de la semaine abrégés pour l'axe X (façon macOS)
+  // Noms réels des repères pour l'axe X (façon macOS)
   let daysNames = [];
   const numGridX = 7;
   for (let i = 0; i < numGridX; i++) {
-    const d = new Date(cycleStartTime.getTime() + (i / (numGridX - 1)) * totalWindowMins * 60000);
+    const d = new Date(windowStart.getTime() + (i / (numGridX - 1)) * windowDurationMs);
     if (currentQuotaHorizon === "today") {
       daysNames.push(`${d.getHours().toString().padStart(2, "0")}:${d.getMinutes().toString().padStart(2, "0")}`);
+    } else if (currentQuotaHorizon === "month") {
+      const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+      daysNames.push(`${months[d.getMonth()]} ${d.getDate()}`);
     } else {
       daysNames.push(d.toLocaleDateString("en-US", { weekday: "short" }));
     }
@@ -1031,28 +1072,107 @@ function renderBurndownSVG(containerId, subAgent) {
   // Échelle Y : 0% à 100%
   const yToCoord = (pct) => padT + chartH * (1 - Math.max(0, Math.min(100, pct)) / 100);
 
-  // Échelle X selon l'horizon
-  const xToCoord = (min) => padL + (Math.max(0, Math.min(totalWindowMins, min)) / totalWindowMins) * chartW;
-
-  // Ligne de rythme idéal (Pace) : de 100% à 0%
-  const paceX1 = xToCoord(0);
-  const paceY1 = yToCoord(100);
-  const paceX2 = xToCoord(totalWindowMins);
-  const paceY2 = yToCoord(0);
+  // Conversion temps -> coordonnée X dans la fenêtre visible
+  const timeToX = (d) => {
+    const t = d instanceof Date ? d.getTime() : new Date(d).getTime();
+    const ratio = Math.max(0, Math.min(1, (t - windowStart.getTime()) / windowDurationMs));
+    return padL + ratio * chartW;
+  };
 
   // Position actuelle
-  const curElapsed = Math.min(elapsed, totalWindowMins);
-  const curX = xToCoord(curElapsed);
+  const curX = Math.max(padL, Math.min(padL + chartW, timeToX(nowTime)));
   const curY = yToCoord(remaining);
 
-  const currentIdeal = Math.max(0, 100 - (curElapsed / totalWindowMins) * 100);
+  // Rythme idéal (Pace) : de 100% au début du cycle à 0% au reset
+  const cycleTotalMs = Math.max(1000, cycleEndTime.getTime() - cycleStartTime.getTime());
+  const curCycleElapsedMs = Math.max(0, Math.min(cycleTotalMs, nowTime.getTime() - cycleStartTime.getTime()));
+  const currentIdeal = Math.max(0, 100 - (curCycleElapsedMs / cycleTotalMs) * 100);
   const paceDelta = remaining - currentIdeal;
   const isAhead = paceDelta >= -0.05;
   const lineColor = isAhead ? "var(--green-ahead)" : "var(--red-behind)";
 
+  const paceX1 = timeToX(cycleStartTime);
+  const paceY1 = yToCoord(100);
+  const paceX2 = timeToX(cycleEndTime);
+  const paceY2 = yToCoord(0);
+
   // Projection Forecast
   const projPct = subAgent?.estimate?.projectedUsePercent != null ? Math.max(0, 100 - subAgent.estimate.projectedUsePercent) : Math.max(0, remaining - (currentIdeal - 0));
   const forecastY = yToCoord(projPct);
+
+  // Extraction et filtrage des échantillons réels de l'historique des quotas
+  const rawSamples = [];
+  if (Array.isArray(quotaHistoryData)) {
+    for (const entry of quotaHistoryData) {
+      if (!entry?.timestamp || !Array.isArray(entry.agents)) continue;
+      const d = new Date(entry.timestamp);
+      if (isNaN(d.getTime())) continue;
+      const match = entry.agents.find((a) => a.agent === agentName);
+      if (match && typeof match.remainingPercent === "number") {
+        rawSamples.push({
+          date: d,
+          remaining: Math.max(0, Math.min(100, match.remainingPercent)),
+        });
+      }
+    }
+  }
+  rawSamples.sort((a, b) => a.date.getTime() - b.date.getTime());
+
+  // Filtrer les échantillons dans l'intervalle visible [windowStart, windowEnd]
+  let inWindow = rawSamples.filter((s) => s.date >= windowStart && s.date <= windowEnd);
+
+  if (showsIdeal) {
+    // Si un reset survient (quota remonte de plus de 1%), on conserve depuis le dernier reset
+    let lastResetIdx = 0;
+    for (let i = 1; i < inWindow.length; i++) {
+      if (inWindow[i].remaining > inWindow[i - 1].remaining + 1.0) {
+        lastResetIdx = i;
+      }
+    }
+    if (lastResetIdx > 0) {
+      inWindow = inWindow.slice(lastResetIdx);
+    }
+    // Ancrer à 100% au début du cycle si aucun relevé précoce
+    if (inWindow.length === 0 || inWindow[0].date.getTime() > windowStart.getTime() + 90000) {
+      inWindow.unshift({ date: windowStart, remaining: 100 });
+    }
+  } else {
+    if (inWindow.length === 0) {
+      inWindow.push({ date: windowStart, remaining });
+    }
+  }
+
+  // Ancrer le relevé en direct à nowTime
+  const lastSample = inWindow[inWindow.length - 1];
+  if (!lastSample || Math.abs(lastSample.date.getTime() - nowTime.getTime()) > 30000) {
+    inWindow.push({ date: nowTime, remaining });
+  } else {
+    inWindow[inWindow.length - 1] = { date: nowTime, remaining };
+  }
+
+  // Marches d'escalier fidèles à macOS (holds plateau then steps)
+  const drawnSamples = [];
+  if (inWindow.length > 0) {
+    let prev = inWindow[0];
+    drawnSamples.push(prev);
+    const stepGapMs = 2 * 3600 * 1000;
+    for (let i = 1; i < inWindow.length; i++) {
+      const s = inWindow[i];
+      const dt = s.date.getTime() - prev.date.getTime();
+      if (dt > 0 && dt <= stepGapMs && Math.abs(s.remaining - prev.remaining) >= 0.05) {
+        drawnSamples.push({ date: s.date, remaining: prev.remaining });
+      }
+      drawnSamples.push(s);
+      prev = s;
+    }
+  }
+
+  const drawnPoints = drawnSamples.map((s) => ({
+    x: timeToX(s.date),
+    y: yToCoord(s.remaining),
+    remaining: s.remaining,
+    date: s.date,
+  }));
 
   // Initialisation du texte temporel en haut à droite
   const projectedText = container.closest(".burndown-chart-col")?.querySelector(".projected-time-text");
@@ -1119,10 +1239,20 @@ function renderBurndownSVG(containerId, subAgent) {
     <line x1="${paceX1}" y1="${paceY1}" x2="${paceX2}" y2="${paceY2}" stroke="#8e8e93" stroke-dasharray="4,4" stroke-width="1.5" />
   ` : "";
 
-  // 5. Tracé Recorded réel (avec aire subtile si !showsIdeal, comme macOS)
-  const pathD = `M ${padL} ${yToCoord(100)} L ${curX} ${curY}`;
+  // 5. Tracé Recorded réel (avec historique)
+  let pathD = "";
+  if (drawnPoints.length > 0) {
+    pathD = `M ${drawnPoints[0].x.toFixed(1)} ${drawnPoints[0].y.toFixed(1)}`;
+    for (let i = 1; i < drawnPoints.length; i++) {
+      pathD += ` L ${drawnPoints[i].x.toFixed(1)} ${drawnPoints[i].y.toFixed(1)}`;
+    }
+  } else {
+    pathD = `M ${padL} ${yToCoord(100)} L ${curX} ${curY}`;
+  }
+
+  const firstX = drawnPoints.length > 0 ? drawnPoints[0].x.toFixed(1) : padL;
   const recordedAreaSvg = !showsIdeal ? `
-    <path d="M ${padL} ${yToCoord(100)} L ${curX} ${curY} L ${curX} ${padT + chartH} L ${padL} ${padT + chartH} Z" fill="${lineColor}" opacity="0.08" />
+    <path d="${pathD} L ${curX.toFixed(1)} ${padT + chartH} L ${firstX} ${padT + chartH} Z" fill="${lineColor}" opacity="0.08" />
   ` : "";
 
   // 6. Projection Forecast (si applicable pour l'horizon : rte uniquement)
@@ -1174,24 +1304,41 @@ function renderBurndownSVG(containerId, subAgent) {
     svgEl.addEventListener("mousemove", (e) => {
       const rect = svgEl.getBoundingClientRect();
       const rawMouseX = ((e.clientX - rect.left) / rect.width) * width;
-      // Si pas de forecast, le curseur ne va pas au-delà de curX
       const mouseX = Math.max(padL, Math.min(showsForecast ? padL + chartW : curX, rawMouseX));
       const ratio = (mouseX - padL) / chartW;
 
-      const idealVal = Math.max(0, 100 - ratio * 100);
       let curVal;
-
-      if (mouseX <= curX) {
-        const curProgress = (mouseX - padL) / (curX - padL || 1);
-        curVal = Math.max(0, 100 - curProgress * used);
+      if (mouseX <= curX && drawnPoints.length >= 2) {
+        let pA = drawnPoints[0];
+        let pB = drawnPoints[drawnPoints.length - 1];
+        for (let i = 0; i < drawnPoints.length - 1; i++) {
+          if (mouseX >= drawnPoints[i].x && mouseX <= drawnPoints[i + 1].x) {
+            pA = drawnPoints[i];
+            pB = drawnPoints[i + 1];
+            break;
+          }
+        }
+        const segW = pB.x - pA.x;
+        if (segW > 0.001) {
+          const t = (mouseX - pA.x) / segW;
+          curVal = pA.remaining + t * (pB.remaining - pA.remaining);
+        } else {
+          curVal = pB.remaining;
+        }
+      } else if (mouseX <= curX) {
+        curVal = remaining;
       } else {
         const forecastProgress = (mouseX - curX) / (paceX2 - curX || 1);
         curVal = Math.max(0, remaining - forecastProgress * (remaining - projPct));
       }
 
       const curYPos = yToCoord(curVal);
-      const delta = curVal - idealVal;
-      const ahead = delta >= -0.05;
+      const hoverTime = new Date(windowStart.getTime() + ratio * windowDurationMs);
+      const idealVal = showsIdeal
+        ? Math.max(0, 100 - ((hoverTime.getTime() - cycleStartTime.getTime()) / cycleTotalMs) * 100)
+        : null;
+      const delta = idealVal != null ? curVal - idealVal : null;
+      const ahead = delta != null ? delta >= -0.05 : true;
       const tone = ahead ? "var(--green-ahead)" : "var(--red-behind)";
 
       if (hoverLine) {
@@ -1210,13 +1357,12 @@ function renderBurndownSVG(containerId, subAgent) {
         hoverBadge.setAttribute("transform", `translate(${bx}, ${by})`);
       }
       if (badgePct) badgePct.textContent = `${curVal.toFixed(1)}%`;
-      if (badgeDelta && showsIdeal) {
+      if (badgeDelta && showsIdeal && delta != null) {
         badgeDelta.textContent = `${delta >= 0 ? '+' : ''}${delta.toFixed(1)}%`;
         badgeDelta.setAttribute("fill", tone);
       }
 
       // Date dynamique en haut à droite façon macOS
-      const hoverTime = new Date(cycleStartTime.getTime() + ratio * totalWindowMins * 60000);
       const isObserved = mouseX <= curX;
       if (projectedText) {
         projectedText.textContent = isObserved
@@ -1230,7 +1376,7 @@ function renderBurndownSVG(containerId, subAgent) {
       const paceLabel = document.querySelector("#burndown-legend-pace .legend-label-text");
       if (recLabel && isObserved) recLabel.textContent = `Recorded ${curVal.toFixed(1)}%`;
       if (fcastLabel && !isObserved) fcastLabel.textContent = `Forecast ${curVal.toFixed(1)}%`;
-      if (paceLabel) paceLabel.textContent = `Pace ${idealVal.toFixed(1)}%`;
+      if (paceLabel && idealVal != null) paceLabel.textContent = `Pace ${idealVal.toFixed(1)}%`;
     });
 
     svgEl.addEventListener("mouseleave", () => {

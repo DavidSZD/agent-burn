@@ -1,6 +1,6 @@
 [package]
 name = "agent-burn-windows"
-version = "0.1.13"
+version = "0.1.14"
 description = "Agent Burn Windows Desktop Application"
 edition = "2021"
 
@@ -16,3 +16,6 @@ sqlite = { version = "0.37.0", default-features = false, features = ["bundled", 
 
 [build-dependencies]
 tauri-build = { version = "2", default-features = false , features = [] }
+
+[profile.release]
+opt-level = 1
