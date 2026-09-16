@@ -19,9 +19,7 @@ pub async fn get_summary(
         .clone();
     let cli = resolve_cli_path_with_override(settings.custom_cli_path.as_deref())
         .or_else(|| state.cli_path.clone());
-    let mut timeline_settings = settings;
-    timeline_settings.offline = true;
-    build_summary(&period_val, &timeline_settings, cli.as_deref()).await
+    build_summary(&period_val, &settings, cli.as_deref()).await
 }
 
 #[tauri::command]
@@ -39,10 +37,7 @@ pub async fn get_summary_since(
     let cli = resolve_cli_path_with_override(settings.custom_cli_path.as_deref())
         .or_else(|| state.cli_path.clone());
     let args = ["summary", "--value", "--since", since.as_str()];
-    let mut timeline_settings = settings.clone();
-    timeline_settings.offline = true;
-    let mut summary =
-        execute_cli_json_with_settings(cli.as_deref(), &args, &timeline_settings).await?;
+    let mut summary = execute_cli_json_with_settings(cli.as_deref(), &args, &settings).await?;
     let min_date = chrono::NaiveDate::parse_from_str(&since, "%Y-%m-%d")
         .ok()
         .and_then(|date| date.and_hms_opt(0, 0, 0))
