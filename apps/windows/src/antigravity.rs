@@ -435,12 +435,37 @@ fn get_live_antigravity_plan() -> Option<AntigravityPlan> {
         use std::os::windows::process::CommandExt;
         command.creation_flags(powershell_creation_flags());
     }
-    let output = command.output().ok()?;
+    let output = command_output_with_timeout(command, std::time::Duration::from_secs(15))?;
     if !output.status.success() {
         return unavailable_live_plan();
     }
     let status = serde_json::from_slice::<serde_json::Value>(&output.stdout).ok()?;
     parse_live_status(&status)
+}
+
+fn command_output_with_timeout(
+    mut command: std::process::Command,
+    timeout: std::time::Duration,
+) -> Option<std::process::Output> {
+    use std::process::Stdio;
+
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn().ok()?;
+    let deadline = std::time::Instant::now() + timeout;
+
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait_with_output();
+                return None;
+            }
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -911,6 +936,24 @@ mod tests {
     #[test]
     fn live_status_process_is_hidden_on_windows() {
         assert_eq!(powershell_creation_flags(), 0x08000000);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn live_status_process_is_killed_after_its_deadline() {
+        let mut command = std::process::Command::new("powershell.exe");
+        command.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Start-Sleep -Seconds 5",
+        ]);
+
+        let started = std::time::Instant::now();
+        let output = command_output_with_timeout(command, std::time::Duration::from_millis(50));
+
+        assert!(output.is_none());
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 
     #[test]

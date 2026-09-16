@@ -78,3 +78,9 @@ export function mergeLiveSubscription(currentReport, liveReport) {
   if (!currentReport || !liveReport?.subscription) return currentReport;
   return { ...currentReport, subscription: liveReport.subscription };
 }
+
+export async function persistQuotaSource(settingsPromise, quotaSource, persist) {
+  const settings = await settingsPromise;
+  if (!settings) return null;
+  return await persist({ ...settings, quotaSource });
+}

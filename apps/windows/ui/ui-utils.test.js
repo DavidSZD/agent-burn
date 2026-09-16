@@ -10,9 +10,38 @@ import {
   quotaPresentation,
   quotaRemainingPercent,
   mergeLiveSubscription,
+  persistQuotaSource,
   subscriptionPresentation,
   visibleTokenBreakdownEntries,
 } from "./ui-utils.js";
+
+test("waits for settings before persisting a quota source", async () => {
+  let resolveSettings;
+  const settingsPromise = new Promise((resolve) => {
+    resolveSettings = resolve;
+  });
+  const persisted = [];
+  const pending = persistQuotaSource(settingsPromise, "codex", async (settings) => {
+    persisted.push(settings);
+    return settings;
+  });
+
+  assert.deepEqual(persisted, []);
+  resolveSettings({ offline: true, refreshMinutes: 5, quotaSource: "antigravity" });
+
+  assert.deepEqual(await pending, { offline: true, refreshMinutes: 5, quotaSource: "codex" });
+  assert.deepEqual(persisted, [{ offline: true, refreshMinutes: 5, quotaSource: "codex" }]);
+});
+
+test("does not persist a quota source when settings failed to load", async () => {
+  let called = false;
+  const result = await persistQuotaSource(Promise.resolve(null), "codex", async () => {
+    called = true;
+  });
+
+  assert.equal(result, null);
+  assert.equal(called, false);
+});
 
 test("escapes untrusted log labels before inserting them into HTML", () => {
   assert.equal(escapeHtml('<img src=x onerror="alert(1)">'), "&lt;img src=x onerror=&quot;alert(1)&quot;&gt;");

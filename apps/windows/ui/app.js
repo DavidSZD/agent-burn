@@ -8,6 +8,7 @@ import {
   quotaPresentation,
   quotaRemainingPercent,
   mergeLiveSubscription,
+  persistQuotaSource,
   subscriptionPresentation,
   visibleTokenBreakdownEntries,
 } from "./ui-utils.js";
@@ -55,6 +56,7 @@ let detectedAgents = [];
 const allKnownAgents = new Set();
 let lastUpdatedTime = Date.now();
 let appSettings = null;
+let settingsLoadPromise = Promise.resolve(null);
 const periodCache = {};
 const harnessCache = {};
 const summaryRequestGate = new RequestGate();
@@ -578,10 +580,18 @@ function updateTopBarQuotaPill(data) {
         item.addEventListener("click", async (e) => {
           e.stopPropagation();
           menu.classList.remove("open");
-          if (!appSettings) appSettings = {};
-          appSettings.quotaSource = a.agent;
-          await invokeTauri("set_settings", { settings: appSettings }).catch(() => {});
-          updateTopBarQuotaPill(data);
+          try {
+            const savedSettings = await persistQuotaSource(
+              settingsLoadPromise,
+              a.agent,
+              (settings) => invokeTauri("set_settings", { settings }),
+            );
+            if (!savedSettings) return;
+            appSettings = savedSettings;
+            updateTopBarQuotaPill(data);
+          } catch (error) {
+            showStatusError(`Settings unavailable: ${error}`);
+          }
         });
         menu.appendChild(item);
       });
@@ -2109,13 +2119,17 @@ function initSettings() {
     })
     .catch((error) => showStatusError(`CLI status unavailable: ${error}`));
 
-  invokeTauri("get_settings")
+  settingsLoadPromise = invokeTauri("get_settings")
     .then((settings) => {
       appSettings = settings;
       applySettingsToControls();
       setupAutoRefresh();
+      return settings;
     })
-    .catch((error) => showStatusError(`Settings unavailable: ${error}`));
+    .catch((error) => {
+      showStatusError(`Settings unavailable: ${error}`);
+      return null;
+    });
 
   for (const id of [
     "settings-cli-input",
