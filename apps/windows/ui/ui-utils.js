@@ -60,3 +60,22 @@ export function quotaPresentation(windowData, now = new Date()) {
     : null;
   return { usedPercent, remainingPercent, resetDate: validResetDate, resetInMinutes };
 }
+
+export function quotaRemainingPercent(agent) {
+  const usedPercent = agent?.window?.usedPercent;
+  if (typeof usedPercent === "number" && Number.isFinite(usedPercent)) {
+    return Math.min(100, Math.max(0, 100 - usedPercent));
+  }
+
+  const liveRemaining = (Array.isArray(agent?.liveLimits) ? agent.liveLimits : [])
+    .map((limit) => limit?.remaining)
+    .filter((remaining) => typeof remaining === "number" && Number.isFinite(remaining))
+    .map((remaining) => Math.min(100, Math.max(0, remaining)));
+  return liveRemaining.length > 0 ? Math.min(...liveRemaining) : null;
+}
+
+export function mergeLiveSubscription(currentReport, liveReport) {
+  if (!liveReport?.subscription) return currentReport;
+  if (!currentReport) return liveReport;
+  return { ...currentReport, subscription: liveReport.subscription };
+}

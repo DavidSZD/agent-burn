@@ -6,6 +6,8 @@ import {
   timelineStartDate,
   shouldShowAntigravityUltraSetting,
   quotaPresentation,
+  quotaRemainingPercent,
+  mergeLiveSubscription,
   subscriptionPresentation,
   visibleTokenBreakdownEntries,
 } from "./ui-utils.js";
@@ -204,17 +206,15 @@ function initBackendEvents() {
       updateTopBarQuotaPill(event.payload);
       try {
         quotaHistoryData = await invokeTauri("get_quota_history");
-        if (currentTab === "summary") {
-          reportData = event.payload;
-          computeDetectedAgents(reportData, antigravityData);
-          renderSummary();
-        } else if (currentTab !== "settings") {
-          const subAgent = (event.payload?.subscription?.agents || []).find((a) => a.agent === currentTab);
-          if (subAgent?.window) {
-            renderBurndownSVG("burndown-svg-wrapper", subAgent);
-          }
-        }
       } catch (_) {}
+
+      reportData = mergeLiveSubscription(reportData, event.payload);
+      computeDetectedAgents(reportData, antigravityData);
+      if (currentTab === "summary") {
+        renderSummary();
+      } else if (currentTab !== "settings") {
+        renderHarnessView(currentTab);
+      }
     }
   });
 }
@@ -529,9 +529,7 @@ function updateTopBarQuotaPill(data) {
 
   const agents = data?.subscription?.agents || [];
   // Filtrer uniquement les agents avec quota détecté
-  const agentsWithQuota = agents.filter(
-    (a) => (a.window && typeof a.window.usedPercent === "number") || (a.liveLimits && a.liveLimits.length > 0)
-  );
+  const agentsWithQuota = agents.filter((agent) => quotaRemainingPercent(agent) !== null);
 
   // Si aucun quota n'est détecté, masquer totalement le tag
   if (agentsWithQuota.length === 0) {
@@ -549,8 +547,7 @@ function updateTopBarQuotaPill(data) {
 
   const agentName = selectedAgent.agent;
   const displayName = getAgentDisplayName(agentName);
-  const used = selectedAgent.window?.usedPercent ?? 0;
-  const remaining = Math.max(0, 100 - used);
+  const remaining = quotaRemainingPercent(selectedAgent);
 
   // Affichage : nom du harnais + pourcentage (ex: "Antigravity 93%")
   pillText.textContent = `${displayName} ${remaining.toFixed(0)}%`;
@@ -564,11 +561,15 @@ function updateTopBarQuotaPill(data) {
       agentsWithQuota.forEach((a) => {
         const item = document.createElement("button");
         const aDisp = getAgentDisplayName(a.agent);
-        const aUsed = a.window?.usedPercent ?? 0;
-        const aRem = Math.max(0, 100 - aUsed);
+        const aRem = quotaRemainingPercent(a);
         const isSelected = a.agent === selectedAgent.agent;
         item.className = `quota-menu-item${isSelected ? " selected" : ""}`;
-        item.innerHTML = `<span>${isSelected ? "✓ " : ""}${aDisp}</span><span style="color:var(--text-muted);">${aRem.toFixed(0)}%</span>`;
+        const label = document.createElement("span");
+        label.textContent = `${isSelected ? "✓ " : ""}${aDisp}`;
+        const value = document.createElement("span");
+        value.className = "quota-menu-value";
+        value.textContent = `${aRem.toFixed(0)}%`;
+        item.append(label, value);
         item.addEventListener("click", async (e) => {
           e.stopPropagation();
           menu.classList.remove("open");

@@ -8,6 +8,8 @@ import {
   timelineStartDate,
   shouldShowAntigravityUltraSetting,
   quotaPresentation,
+  quotaRemainingPercent,
+  mergeLiveSubscription,
   subscriptionPresentation,
   visibleTokenBreakdownEntries,
 } from "./ui-utils.js";
@@ -69,4 +71,45 @@ test("uses the provider reset timestamp for live quota presentation", () => {
   assert.equal(result.remainingPercent, 75);
   assert.equal(result.resetInMinutes, 150);
   assert.equal(result.resetDate.toISOString(), "2026-09-15T14:30:00.000Z");
+});
+
+test("derives a real remaining percentage from live limits when no window exists", () => {
+  assert.equal(
+    quotaRemainingPercent({
+      liveLimits: [
+        { label: "Fast", remaining: 82 },
+        { label: "Pro", remaining: 47 },
+      ],
+    }),
+    47,
+  );
+});
+
+test("does not fabricate a full quota when no usable limit exists", () => {
+  assert.equal(
+    quotaRemainingPercent({
+      window: { usedPercent: null },
+      liveLimits: [{ label: "Unknown", remaining: null }],
+    }),
+    null,
+  );
+});
+
+test("live quota refresh preserves the selected timeline usage", () => {
+  const current = {
+    totals: { totalCost: 12 },
+    daily: [{ date: "2026-09-16", cost: 12 }],
+    subscription: { agents: [{ agent: "codex", window: { usedPercent: 10 } }] },
+  };
+  const live = {
+    totals: { totalCost: 999 },
+    daily: [{ date: "2020-01-01", cost: 999 }],
+    subscription: { agents: [{ agent: "codex", window: { usedPercent: 25 } }] },
+  };
+
+  assert.deepEqual(mergeLiveSubscription(current, live), {
+    totals: { totalCost: 12 },
+    daily: [{ date: "2026-09-16", cost: 12 }],
+    subscription: { agents: [{ agent: "codex", window: { usedPercent: 25 } }] },
+  });
 });

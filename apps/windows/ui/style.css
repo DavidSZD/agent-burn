@@ -170,6 +170,10 @@ body {
   color: #fff;
 }
 
+.quota-menu-value {
+  color: var(--text-muted);
+}
+
 .quota-dot {
   width: 7px;
   height: 7px;
