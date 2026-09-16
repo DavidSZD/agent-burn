@@ -15,6 +15,7 @@ mod agent-burn 'apps/agent-burn'
 mod docs
 mod rust
 mod macos 'apps/macos'
+mod windows 'apps/windows'
 
 [private]
 default:

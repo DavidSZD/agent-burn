@@ -1,6 +1,6 @@
 # Agent Burn
 
-Native macOS app and local CLI for coding-agent usage, limits, and subscription value.
+Native desktop apps (macOS & Windows) and local CLI for coding-agent usage, limits, and subscription value.
 
 Site: [agent-burn.melvynx.dev](https://agent-burn.melvynx.dev)
 
@@ -9,6 +9,8 @@ Site: [agent-burn.melvynx.dev](https://agent-burn.melvynx.dev)
 ## Install
 
 **Mac app:** [Download](https://agent-burn.melvynx.dev/download), unzip, move to Applications. macOS 14+, Apple Silicon and Intel. The app bundles the CLI.
+
+**Windows app:** Download the installer (`Agent Burn_<version>_x64-setup.exe`) from [Releases](https://github.com/DavidSZD/agent-burn/releases). Windows 10/11 (x64). Integrates into the system tray and bundles the CLI. Build locally with `just windows::build`. Details: [apps/windows](https://github.com/DavidSZD/agent-burn/tree/main/apps/windows).
 
 **CLI:**
 
@@ -31,6 +33,8 @@ agent-burn summary --json
 ```
 
 macOS app: menu-bar quota for Codex, Claude, and Cursor, plus a dashboard across detected harnesses. Build locally with `just macos::run`. Details: [apps/macos](https://github.com/Melvynx/agent-burn/tree/main/apps/macos).
+
+Windows app: system-tray quota tooltip, live background polling, and responsive dashboard for Claude, Codex, Cursor, Antigravity, and Gemini. Build locally with `just windows::build` or run it with `just windows::run`. Antigravity support is provided by the Windows desktop layer and reads local data under `%USERPROFILE%\.gemini\antigravity`. Details: [apps/windows](https://github.com/DavidSZD/agent-burn/tree/main/apps/windows).
 
 ## Subscription Value
 

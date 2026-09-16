@@ -1,0 +1,39 @@
+{
+	"$schema": "https://schema.tauri.app/config/2",
+	"productName": "Agent Burn",
+	"version": "0.1.14",
+	"identifier": "dev.melvynx.agent-burn-windows",
+	"build": {
+		"frontendDist": "./ui"
+	},
+	"app": {
+		"withGlobalTauri": true,
+		"windows": [
+			{
+				"label": "main",
+				"title": "Agent Burn",
+				"width": 1060,
+				"height": 780,
+				"resizable": true,
+				"fullscreen": false,
+				"visible": true,
+				"center": true,
+				"decorations": true
+			}
+		],
+		"security": {
+			"csp": "default-src 'self'; img-src 'self' asset: http://asset.localhost; style-src 'self' 'unsafe-inline'; script-src 'self'"
+		}
+	},
+	"bundle": {
+		"active": true,
+		"targets": "all",
+		"resources": [
+			"resources/*"
+		],
+		"icon": [
+			"icons/icon.ico",
+			"icons/icon.png"
+		]
+	}
+}

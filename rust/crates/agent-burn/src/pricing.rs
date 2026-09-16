@@ -2073,7 +2073,7 @@ mod tests {
     fn embedded_build_time_pricing_is_compact() {
         assert!(BUILD_TIME_PRICING_JSON.len() < 200_000);
         assert!(!BUILD_TIME_PRICING_JSON.contains("\"source\""));
-        assert!(!BUILD_TIME_PRICING_JSON.contains("vertex_ai/"));
+        assert!(BUILD_TIME_PRICING_JSON.contains("vertex_ai/gemini"));
         assert!(BUILD_TIME_PRICING_JSON.contains("claude-opus-4-6"));
     }
 

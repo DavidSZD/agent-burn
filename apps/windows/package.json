@@ -1,0 +1,14 @@
+{
+	"name": "@agent-burn/windows",
+	"version": "0.1.14",
+	"private": true,
+	"description": "Agent Burn Windows system tray and dashboard application",
+	"type": "module",
+	"scripts": {
+		"dev": "powershell -ExecutionPolicy Bypass -File ./build.ps1",
+		"build": "powershell -ExecutionPolicy Bypass -File ./build.ps1 -Release"
+	},
+	"devDependencies": {
+		"@tauri-apps/cli": "^2.0.0"
+	}
+}

@@ -1,0 +1,13 @@
+# Windows desktop application recipes
+
+# Run development mode
+run:
+    powershell -ExecutionPolicy Bypass -File ./build.ps1
+
+# Build production executable
+build:
+    powershell -ExecutionPolicy Bypass -File ./build.ps1 -Release
+
+# Clean artifacts
+clean:
+    cargo clean

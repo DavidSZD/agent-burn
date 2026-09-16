@@ -51,3 +51,8 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 
 # Vercel CLI / Nitro output at the repo root
 .vercel
+
+# Binaires Windows
+*.exe
+!apps/windows/resources/
+!apps/windows/resources/.gitkeep
