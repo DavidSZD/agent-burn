@@ -28,14 +28,12 @@ if (-not $wv2) {
     Write-Host "Microsoft Edge WebView2 est requis." -ForegroundColor Yellow
 }
 
-# 3. Compilation du binaire CLI si manquant
+# 3. Compilation du binaire CLI depuis les sources courantes
 $rootDir = (Resolve-Path "$PSScriptRoot\..\..").Path
 $cliBin = Join-Path $rootDir "rust\target\release\agent-burn.exe"
-if (-not (Test-Path $cliBin)) {
-    Write-Host "==> Compilation du binaire natif agent-burn..." -ForegroundColor Cyan
-    cargo build --manifest-path (Join-Path $rootDir "rust\Cargo.toml") --release --bin agent-burn
-    if ($LASTEXITCODE -ne 0) { throw "La compilation du CLI Agent Burn a échoué (code $LASTEXITCODE)." }
-}
+Write-Host "==> Compilation du binaire natif agent-burn..." -ForegroundColor Cyan
+cargo build --manifest-path (Join-Path $rootDir "rust\Cargo.toml") --release --bin agent-burn
+if ($LASTEXITCODE -ne 0) { throw "La compilation du CLI Agent Burn a échoué (code $LASTEXITCODE)." }
 
 # 4. Préparation du sidecar CLI inclus dans chaque bundle Tauri
 $resourcesDir = Join-Path $PSScriptRoot "resources"
