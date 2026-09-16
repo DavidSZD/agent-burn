@@ -519,6 +519,34 @@ mod tests {
     }
 
     #[test]
+    fn streaming_aggregation_applies_date_bounds_before_grouping() {
+        let fixture = fs_fixture!({
+            "sessions/old.jsonl": json!({
+                "timestamp": "2025-12-31T23:00:00.000Z",
+                "type": "event_msg",
+                "payload": {"type": "token_count", "info": {"model": "gpt-5", "last_token_usage": {"input_tokens": 10, "output_tokens": 2, "total_tokens": 12}}}
+            }).to_string(),
+            "sessions/new.jsonl": json!({
+                "timestamp": "2026-01-01T01:00:00.000Z",
+                "type": "event_msg",
+                "payload": {"type": "token_count", "info": {"model": "gpt-5", "last_token_usage": {"input_tokens": 20, "output_tokens": 4, "total_tokens": 24}}}
+            }).to_string(),
+        });
+        let shared = SharedArgs {
+            since: Some("20260101".to_string()),
+            timezone: Some("UTC".to_string()),
+            ..SharedArgs::default()
+        };
+
+        let groups =
+            load_groups_from_directory(&fixture.path("sessions"), &shared, AgentReportKind::Daily)
+                .unwrap();
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups["2026-01-01"].total_tokens, 24);
+    }
+
+    #[test]
     fn keeps_matching_token_usage_in_distinct_session_groups() {
         let usage_line = json!({
             "timestamp": "2026-05-29T08:01:00.000Z",
