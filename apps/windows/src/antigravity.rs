@@ -526,7 +526,7 @@ fn extract_workspace_from_blob(blob: &[u8]) -> Option<String> {
 }
 
 fn urlencoding_decode(s: &str) -> String {
-    let mut result = String::new();
+    let mut result = Vec::with_capacity(s.len());
     let bytes = s.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -534,15 +534,15 @@ fn urlencoding_decode(s: &str) -> String {
             if let Ok(hex_val) =
                 u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""), 16)
             {
-                result.push(hex_val as char);
+                result.push(hex_val);
                 i += 3;
                 continue;
             }
         }
-        result.push(bytes[i] as char);
+        result.push(bytes[i]);
         i += 1;
     }
-    result
+    String::from_utf8_lossy(&result).into_owned()
 }
 
 /// Décodeur Protobuf optimisé pour extraire le modèle et les tokens réels de `gen_metadata`
@@ -655,6 +655,20 @@ fn decode_proto(b: &[u8]) -> Vec<(u32, ProtoValue)> {
                     break;
                 }
             }
+            1 => {
+                if pos + 8 <= b.len() {
+                    pos += 8;
+                } else {
+                    break;
+                }
+            }
+            5 => {
+                if pos + 4 <= b.len() {
+                    pos += 4;
+                } else {
+                    break;
+                }
+            }
             _ => {
                 // Autres types non utilisés pour nos champs (skip)
                 break;
@@ -712,6 +726,36 @@ mod tests {
         bytes.extend(varint(value.len() as u64));
         bytes.extend(value);
         bytes
+    }
+
+    #[test]
+    fn percent_decoding_preserves_utf8_characters() {
+        assert_eq!(urlencoding_decode("Caf%C3%A9%20M%C3%A9nage"), "Café Ménage");
+    }
+
+    #[test]
+    fn protobuf_decoder_continues_after_fixed64_fields() {
+        let mut blob = varint((2_u64 << 3) | 1);
+        blob.extend([0; 8]);
+        blob.extend(varint_field(3, 42));
+
+        let fields = decode_proto(&blob);
+
+        assert!(matches!(fields.as_slice(), [(3, ProtoValue::Varint(42))]));
+    }
+
+    #[test]
+    fn protobuf_decoder_continues_after_fixed32_fields() {
+        let mut blob = varint((2_u64 << 3) | 5);
+        blob.extend([0; 4]);
+        blob.extend(bytes_field(3, b"gemini-test"));
+
+        let fields = decode_proto(&blob);
+
+        assert!(matches!(
+            fields.as_slice(),
+            [(3, ProtoValue::Bytes(value))] if value == b"gemini-test"
+        ));
     }
 
     #[test]
