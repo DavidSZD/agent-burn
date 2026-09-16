@@ -13,11 +13,33 @@ import {
   timelineSelection,
   timelinePreloadOrder,
   isTimelineCacheFresh,
+  loadQuotaHistory,
   resetWindowStartDate,
+  timelinePeriodEntries,
   updateCachedReportsFromToday,
   subscriptionPresentation,
   visibleTokenBreakdownEntries,
 } from "./ui-utils.js";
+
+test("general timeline choices omit reset to date", () => {
+  assert.deepEqual(
+    timelinePeriodEntries({ all: "All time", rtd: "Reset to date", ytd: "Year to date" }, false),
+    [["all", "All time"], ["ytd", "Year to date"]],
+  );
+});
+
+test("quota history is loaded independently from a timeline refresh", async () => {
+  const calls = [];
+  const history = [{ timestamp: "2026-09-16T10:00:00Z", agents: [] }];
+
+  const result = await loadQuotaHistory(async (command) => {
+    calls.push(command);
+    return history;
+  });
+
+  assert.deepEqual(calls, ["get_quota_history"]);
+  assert.deepEqual(result, history);
+});
 
 test("keeps the current dashboard visible while an uncached timeline loads", () => {
   const currentReport = { totals: { totalCost: 12 } };

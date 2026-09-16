@@ -41,6 +41,14 @@ export function isTimelineCacheFresh(entry, now = Date.now()) {
   return Number.isFinite(entry?.updatedAt) && now - entry.updatedAt <= 5 * 60 * 1000;
 }
 
+export function timelinePeriodEntries(periodLabels, includeResetToDate = true) {
+  return Object.entries(periodLabels).filter(([period]) => includeResetToDate || period !== "rtd");
+}
+
+export function loadQuotaHistory(invoke) {
+  return invoke("get_quota_history");
+}
+
 export function resetWindowStartDate(resetDate, elapsedMinutes, now = new Date()) {
   const reset = resetDate ? new Date(resetDate) : null;
   if (reset && Number.isFinite(reset.getTime())) {

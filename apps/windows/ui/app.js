@@ -3,9 +3,11 @@ import {
   escapeHtml,
   getRestoredPeriod,
   isTimelineCacheFresh,
+  loadQuotaHistory,
   resetWindowStartDate,
   timelineSelection,
   timelinePreloadOrder,
+  timelinePeriodEntries,
   timelineStartDate,
   shouldShowAntigravityUltraSetting,
   quotaPresentation,
@@ -261,6 +263,7 @@ function initBackendRefreshPolling() {
 // Cache au démarrage (0 ms)
 async function initColdStart() {
   try {
+    quotaHistoryData = await loadQuotaHistory(invokeTauri);
     const cached = await invokeTauri("get_report_cache");
     if (cached?.periods && typeof cached.periods === "object") {
       Object.assign(periodCache, cached.periods);
@@ -450,6 +453,9 @@ function switchTab(tabId) {
 function initPeriods() {
   const summarySelect = document.getElementById("summary-period-select");
   if (summarySelect) {
+    summarySelect.innerHTML = timelinePeriodEntries(PERIOD_LABELS, false)
+      .map(([period, label]) => `<option value="${period}">${label}</option>`)
+      .join("");
     summarySelect.value = currentPeriod;
     summarySelect.addEventListener("change", async (e) => {
       await switchPeriod(e.target.value);
@@ -859,7 +865,7 @@ function renderHarnessView(agent) {
       <div class="period-picker-box">
         <span class="timeline-refresh-status" hidden><span class="timeline-spinner" aria-hidden="true"></span>Refreshing</span>
         <select class="macos-period-select" id="harness-period-select">
-          ${Object.entries(PERIOD_LABELS)
+          ${timelinePeriodEntries(PERIOD_LABELS)
             .map(([k, v]) => `<option value="${k}" ${k === currentPeriod ? "selected" : ""}>${v}</option>`)
             .join("")}
         </select>
