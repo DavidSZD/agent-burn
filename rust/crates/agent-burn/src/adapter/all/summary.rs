@@ -10,8 +10,8 @@ use crate::{
     cli::{AgentReportKind, SharedArgs, SummaryArgs, SummaryRange, WeekDay},
     cost::tiered_cost,
     fast::FxHashMap,
-    format_currency, format_date_tz, format_utc_date, json_float, parse_iso_date, parse_tz,
-    print_json_or_jq, utc_now, wants_json, week_start,
+    format_currency, format_date_tz, format_naive_date, format_utc_date, json_float,
+    parse_iso_date, parse_tz, print_json_or_jq, utc_now, wants_json, week_start,
 };
 
 use super::{
@@ -98,6 +98,13 @@ pub(super) fn run(args: SummaryArgs) -> Result<()> {
 
     if wants_json(&shared) {
         let mut output = detail::to_json(&summary, &result.rows);
+        if range.is_none() && std::env::var("AGENT_BURN_TIMELINE_CACHE").as_deref() == Ok("1") {
+            let timezone = parse_tz(shared.timezone.as_deref());
+            let today = format_date_tz(utc_now(), timezone.as_ref());
+            if let Some(today) = parse_iso_date(&today) {
+                output["timelineReports"] = timeline_json_reports(&result.rows, today);
+            }
+        }
         if value
             && (shared.agents.is_empty() || shared.agents.iter().any(|agent| agent == "cursor"))
             && let Some(account) = cursor::load_account(shared.offline)
@@ -200,6 +207,35 @@ fn range_bounds(today: IsoDate, range: SummaryRange) -> (Option<IsoDate>, Option
         .then(|| today.checked_add_days(-1))
         .flatten();
     (since, until)
+}
+
+fn timeline_json_reports(rows: &[AllRow], today: IsoDate) -> Value {
+    let ranges = [
+        ("today", SummaryRange::Today),
+        ("yesterday", SummaryRange::Yesterday),
+        ("wtd", SummaryRange::Wtd),
+        ("mtd", SummaryRange::Mtd),
+        ("ytd", SummaryRange::Ytd),
+        ("week", SummaryRange::Week),
+        ("month", SummaryRange::Month),
+    ];
+    let mut reports = serde_json::Map::new();
+    for (name, range) in ranges {
+        let (since, until) = range_bounds(today, range);
+        let since = since.map(format_naive_date);
+        let until = until.map(format_naive_date);
+        let filtered = rows
+            .iter()
+            .filter(|row| {
+                since.as_ref().is_none_or(|start| &row.period >= start)
+                    && until.as_ref().is_none_or(|end| &row.period <= end)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let summary = Summary::from_rows(&filtered);
+        reports.insert(name.to_string(), detail::to_json(&summary, &filtered));
+    }
+    Value::Object(reports)
 }
 
 fn compact_date(date: IsoDate) -> String {
@@ -1309,6 +1345,34 @@ mod tests {
         assert_eq!(output["models"][0]["outputTokens"], 20);
         assert_eq!(output["models"][0]["cacheWriteTokens"], 30);
         assert_eq!(output["models"][0]["cacheReadTokens"], 40);
+    }
+
+    #[test]
+    fn one_loaded_report_builds_every_timeline_cache() {
+        let mut yesterday = day_row(
+            2.0,
+            20,
+            Vec::new(),
+            vec![model_token_breakdown("old", 20, 0, 0, 0, 2.0)],
+        );
+        yesterday.period = "2026-09-16".into();
+        let mut today = day_row(
+            3.0,
+            30,
+            Vec::new(),
+            vec![model_token_breakdown("new", 30, 0, 0, 0, 3.0)],
+        );
+        today.period = "2026-09-17".into();
+
+        let reports = timeline_json_reports(
+            &[yesterday, today],
+            IsoDate::from_ymd(2026, 9, 17).expect("valid date"),
+        );
+
+        assert_eq!(reports["today"]["totals"]["totalTokens"], 30);
+        assert_eq!(reports["yesterday"]["totals"]["totalTokens"], 20);
+        assert_eq!(reports["ytd"]["totals"]["totalTokens"], 50);
+        assert_eq!(reports["today"]["models"][0]["inputTokens"], 30);
     }
 
     #[test]

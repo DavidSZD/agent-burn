@@ -683,6 +683,7 @@ body {
   padding: 8px 10px;
   border-bottom: 1px solid var(--border);
   font-size: 11.5px;
+  white-space: nowrap;
 }
 
 .macos-table th.sortable {

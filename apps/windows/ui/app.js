@@ -25,7 +25,7 @@ import {
   visibleTokenBreakdownEntries,
   visibleAgents,
   updateCachedReportsFromToday,
-  updateCacheFromAllSnapshot,
+  updateCacheFromTimelineSnapshot,
   waitForInitialRefresh,
 } from "./ui-utils.js";
 
@@ -250,7 +250,7 @@ function applyBackendRefresh(data, refreshedAtMs) {
   latestLiveQuotaReport = data;
   updateTopBarQuotaPill(data);
 
-  const entry = updateCacheFromAllSnapshot(periodCache, data, refreshedAtMs);
+  const entry = updateCacheFromTimelineSnapshot(periodCache, data, refreshedAtMs);
   if (currentPeriod === "all") {
     reportData = entry.reportData;
     fullReportData = entry.reportData;
@@ -1107,7 +1107,7 @@ function renderHarnessView(agent) {
         <table class="macos-table" id="harness-models-table">
           <thead>
             <tr>
-              <th class="col-model sortable" data-sort="model">Model <span class="sort-indicator"></span></th>
+              <th class="col-model">Model</th>
               <th class="col-token-part text-right sortable" data-sort="input">Input <span class="sort-indicator"></span></th>
               <th class="col-token-part text-right sortable" data-sort="cacheRead">Cached input <span class="sort-indicator"></span></th>
               <th class="col-token-part text-right sortable" data-sort="cacheWrite">Cache write <span class="sort-indicator"></span></th>
@@ -2180,7 +2180,7 @@ function renderModelsTable(models, totalCost, tbodyId, countId, searchInputId) {
       const pricingTitle = modelPricingTooltip(m.pricing);
       const tr = document.createElement("tr");
       tr.innerHTML = `
-        <td class="col-model"><span title="${escapeHtml(m.model)}">${escapeHtml(m.model)}</span><span class="model-price-info" title="${escapeHtml(pricingTitle)}" aria-label="${escapeHtml(pricingTitle)}">ⓘ</span></td>
+        <td class="col-model"><span>${escapeHtml(m.model)}</span><span class="model-price-info" title="${escapeHtml(pricingTitle)}" aria-label="${escapeHtml(pricingTitle)}">ⓘ</span></td>
         <td class="col-token-part text-right">${formatCompactTokens(m.inputTokens || 0)}</td>
         <td class="col-token-part text-right">${formatCompactTokens(m.cacheReadTokens || 0)}</td>
         <td class="col-token-part text-right">${formatCompactTokens(m.cacheWriteTokens || 0)}</td>

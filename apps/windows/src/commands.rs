@@ -124,6 +124,14 @@ fn attach_model_pricing(summary: &mut serde_json::Value) {
             );
         }
     }
+    if let Some(reports) = summary
+        .get_mut("timelineReports")
+        .and_then(|value| value.as_object_mut())
+    {
+        for report in reports.values_mut() {
+            attach_model_pricing(report);
+        }
+    }
 }
 
 fn merge_antigravity(
@@ -504,7 +512,8 @@ mod tests {
     fn model_pricing_is_attached_to_general_and_harness_rows() {
         let mut summary = serde_json::json!({
             "models": [{"model": "gpt-5.5"}],
-            "agents": [{"agent": "codex", "models": [{"model": "gpt-5.5"}]}]
+            "agents": [{"agent": "codex", "models": [{"model": "gpt-5.5"}]}],
+            "timelineReports": {"today": {"models": [{"model": "gpt-5.5"}], "agents": []}}
         });
 
         attach_model_pricing(&mut summary);
@@ -514,6 +523,10 @@ mod tests {
         assert_eq!(
             summary["agents"][0]["models"][0]["pricing"]["cacheReadPerM"],
             0.5
+        );
+        assert_eq!(
+            summary["timelineReports"]["today"]["models"][0]["pricing"]["inputPerM"],
+            5.0
         );
     }
 

@@ -50,10 +50,11 @@ export function modelPricingTooltip(pricing) {
 export function subscriptionPresentation(subscription) {
   const rawPlan = String(subscription?.plan || "").trim();
   const unknownPlan = !rawPlan || /^(unknown|plan not detected)$/i.test(rawPlan);
+  const explicitlyFree = /^free$/i.test(rawPlan);
   const price = Number(subscription?.pricePerMonth);
   return {
     plan: unknownPlan ? "Free" : rawPlan,
-    monthlyPrice: Number.isFinite(price) && price > 0 ? price : null,
+    monthlyPrice: explicitlyFree ? 0 : (Number.isFinite(price) && price > 0 ? price : null),
   };
 }
 
@@ -267,6 +268,20 @@ export function updateCacheFromAllSnapshot(periodCache, freshAll, updatedAt = Da
   };
   periodCache.all = entry;
   return entry;
+}
+
+export function updateCacheFromTimelineSnapshot(periodCache, snapshot, updatedAt = Date.now()) {
+  const allReport = structuredClone(snapshot);
+  delete allReport.timelineReports;
+  const allEntry = updateCacheFromAllSnapshot(periodCache, allReport, updatedAt);
+  for (const [period, report] of Object.entries(snapshot?.timelineReports || {})) {
+    periodCache[period] = {
+      reportData: mergeLiveSubscription(structuredClone(report), allReport),
+      antigravityData: null,
+      updatedAt,
+    };
+  }
+  return allEntry;
 }
 
 export function timelinePreloadOrder(periods, activePeriod) {

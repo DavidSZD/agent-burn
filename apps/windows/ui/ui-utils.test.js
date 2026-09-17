@@ -26,6 +26,7 @@ import {
   timelinePeriodEntries,
   updateCachedReportsFromToday,
   updateCacheFromAllSnapshot,
+  updateCacheFromTimelineSnapshot,
   waitForInitialRefresh,
   subscriptionPresentation,
   visibleTokenBreakdownEntries,
@@ -207,6 +208,26 @@ test("a backend all-time snapshot refreshes the all-time cache without replacing
   assert.equal(cache.today, today);
 });
 
+test("one backend snapshot refreshes every included timeline", () => {
+  const cache = { today: { reportData: { totals: { totalTokens: 1 } }, updatedAt: 1 } };
+  const snapshot = {
+    totals: { totalTokens: 100 },
+    subscription: { agents: [{ agent: "codex", plan: "Free" }] },
+    timelineReports: {
+      today: { totals: { totalTokens: 10 }, agents: [], models: [] },
+      ytd: { totals: { totalTokens: 50 }, agents: [], models: [] },
+    },
+  };
+
+  updateCacheFromTimelineSnapshot(cache, snapshot, 500);
+
+  assert.equal(cache.all.reportData.timelineReports, undefined);
+  assert.equal(cache.today.reportData.totals.totalTokens, 10);
+  assert.equal(cache.today.reportData.subscription.agents[0].agent, "codex");
+  assert.equal(cache.today.updatedAt, 500);
+  assert.equal(cache.ytd.updatedAt, 500);
+});
+
 test("keeps yesterday fresh without rescanning during the same local day", () => {
   const cache = {
     yesterday: {
@@ -339,6 +360,13 @@ test("does not invent a paid subscription price when none was detected", () => {
   assert.deepEqual(subscriptionPresentation({ plan: "unknown", pricePerMonth: null }), {
     plan: "Free",
     monthlyPrice: null,
+  });
+});
+
+test("an explicitly detected free plan has a zero monthly price", () => {
+  assert.deepEqual(subscriptionPresentation({ plan: "Free", pricePerMonth: 0 }), {
+    plan: "Free",
+    monthlyPrice: 0,
   });
 });
 

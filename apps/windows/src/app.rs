@@ -212,6 +212,7 @@ async fn execute_cli_json_inner(
     if !settings.codex_homes.trim().is_empty() {
         cmd.env("CODEX_HOME", settings.codex_homes.trim());
     }
+    cmd.env("AGENT_BURN_TIMELINE_CACHE", "1");
     cmd.arg("--json");
     cmd.arg("--no-color");
     cmd.stdout(Stdio::piped());
