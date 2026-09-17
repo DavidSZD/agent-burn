@@ -38,13 +38,32 @@ export function restoredTab(storedTab, detectedAgents) {
 
 export function modelPricingTooltip(pricing) {
   if (!pricing) return "Pricing unavailable";
-  const rate = (value) => `$${Number(value).toString()} / 1M`;
+  return modelPricingRows(pricing)
+    .map(([label, value]) => `${label} ${value} / 1M`)
+    .join(" · ");
+}
+
+export function modelPricingRows(pricing) {
+  if (!pricing) return [];
+  const rate = (value) => `$${Number(value).toString()}`;
   return [
-    `Input ${rate(pricing.inputPerM)}`,
-    `Cached input ${rate(pricing.cacheReadPerM)}`,
-    `Cache write ${rate(pricing.cacheWritePerM)}`,
-    `Output ${rate(pricing.outputPerM)}`,
-  ].join(" · ");
+    ["Input", rate(pricing.inputPerM)],
+    ["Cached input", rate(pricing.cacheReadPerM)],
+    ["Cache write", rate(pricing.cacheWritePerM)],
+    ["Output", rate(pricing.outputPerM)],
+  ];
+}
+
+export function createReplaceableCallback(callback) {
+  let current = callback;
+  return {
+    replace(next) {
+      current = next;
+    },
+    run(...args) {
+      return current(...args);
+    },
+  };
 }
 
 export function subscriptionPresentation(subscription) {

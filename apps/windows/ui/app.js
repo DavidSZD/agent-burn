@@ -2,12 +2,14 @@ import { RequestGate } from "./request-gate.js";
 import {
   aggregateTokenBreakdown,
   createCoalescedSaver,
+  createReplaceableCallback,
   createSingleFlight,
   escapeHtml,
   getRestoredPeriod,
   isTimelineCacheFresh,
   latestTimelineUpdatedAt,
   modelPricingTooltip,
+  modelPricingRows,
   loadQuotaHistory,
   resetWindowStartDate,
   restoredTab,
@@ -2178,9 +2180,18 @@ function renderModelsTable(models, totalCost, tbodyId, countId, searchInputId) {
     filtered.forEach((m) => {
       const share = totalCost > 0 ? ((m.totalCost || 0) / totalCost) * 100 : m.percentage || 0;
       const pricingTitle = modelPricingTooltip(m.pricing);
+      const pricingRows = modelPricingRows(m.pricing);
+      const pricingContent = pricingRows.length > 0
+        ? pricingRows.map(([label, value]) => `
+            <div class="model-price-row">
+              <span>${escapeHtml(label)}</span>
+              <strong>${escapeHtml(value)}<small>/1M</small></strong>
+            </div>
+          `).join("")
+        : `<div class="model-price-unavailable">Pricing unavailable</div>`;
       const tr = document.createElement("tr");
       tr.innerHTML = `
-        <td class="col-model"><span>${escapeHtml(m.model)}</span><span class="model-price-info" title="${escapeHtml(pricingTitle)}" aria-label="${escapeHtml(pricingTitle)}">ⓘ</span></td>
+        <td class="col-model"><span>${escapeHtml(m.model)}</span><span class="model-price-wrap"><button class="model-price-info" type="button" aria-label="${escapeHtml(pricingTitle)}"><svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="7.25"></circle><path d="M12.4 7.4c-.55-.42-1.33-.68-2.2-.68-1.2 0-2.05.52-2.05 1.3 0 .83.7 1.12 2.02 1.38 1.75.34 2.75.92 2.75 2.25 0 1.39-1.17 2.35-2.92 2.35-.98 0-1.94-.29-2.65-.82M10 5.55v8.9"></path></svg></button><span class="model-price-popover" role="tooltip"><span class="model-price-heading">API pricing</span><span class="model-price-unit">USD per 1M tokens</span>${pricingContent}</span></span></td>
         <td class="col-token-part text-right">${formatCompactTokens(m.inputTokens || 0)}</td>
         <td class="col-token-part text-right">${formatCompactTokens(m.cacheReadTokens || 0)}</td>
         <td class="col-token-part text-right">${formatCompactTokens(m.cacheWriteTokens || 0)}</td>
@@ -2197,6 +2208,7 @@ function renderModelsTable(models, totalCost, tbodyId, countId, searchInputId) {
   // Écouteurs de clic sur les en-têtes de colonnes
   if (table && !table.dataset.sortInitialized) {
     table.dataset.sortInitialized = "true";
+    table._modelsSortCallback = createReplaceableCallback(updateRows);
     table.querySelectorAll("th.sortable").forEach((th) => {
       th.addEventListener("click", () => {
         const col = th.dataset.sort;
@@ -2207,9 +2219,11 @@ function renderModelsTable(models, totalCost, tbodyId, countId, searchInputId) {
           modelsSortState.direction = col === "model" ? "asc" : "desc";
         }
         const currentInput = document.getElementById(searchInputId);
-        updateRows(currentInput ? currentInput.value : "");
+        table._modelsSortCallback.run(currentInput ? currentInput.value : "");
       });
     });
+  } else if (table) {
+    table._modelsSortCallback.replace(updateRows);
   }
 
   updateRows();

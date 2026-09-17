@@ -18,6 +18,8 @@ import {
   isTimelineCacheFresh,
   latestTimelineUpdatedAt,
   modelPricingTooltip,
+  modelPricingRows,
+  createReplaceableCallback,
   restoredTab,
   loadQuotaHistory,
   resetWindowStartDate,
@@ -141,6 +143,29 @@ test("model pricing tooltip shows every available token rate", () => {
     "Input $1.25 / 1M · Cached input $0.125 / 1M · Cache write $1.5625 / 1M · Output $10 / 1M",
   );
   assert.equal(modelPricingTooltip(null), "Pricing unavailable");
+});
+
+test("model pricing rows expose structured rates for the custom popover", () => {
+  assert.deepEqual(
+    modelPricingRows({ inputPerM: 1.25, outputPerM: 10, cacheReadPerM: 0.125, cacheWritePerM: 1.5625 }),
+    [
+      ["Input", "$1.25"],
+      ["Cached input", "$0.125"],
+      ["Cache write", "$1.5625"],
+      ["Output", "$10"],
+    ],
+  );
+  assert.deepEqual(modelPricingRows(null), []);
+});
+
+test("model table sort callbacks always use the latest rendered dataset", () => {
+  const rendered = [];
+  const callback = createReplaceableCallback((sort) => rendered.push(["old", sort]));
+  callback.replace((sort) => rendered.push(["current", sort]));
+
+  callback.run("input");
+
+  assert.deepEqual(rendered, [["current", "input"]]);
 });
 
 test("timeline preloading waits for the initial live refresh", async () => {
