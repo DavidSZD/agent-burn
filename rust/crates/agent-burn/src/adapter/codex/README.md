@@ -27,7 +27,7 @@ Token mapping:
 
 - `input_tokens` - total input tokens.
 - `cached_input_tokens` - cached prompt tokens.
-- `cache_write_input_tokens` - prompt-cache writes when Codex reports them (GPT-5.6+).
+- For GPT-5.6+ and GPT-6+ models, all non-cached input is treated as prompt-cache writes for API-equivalent cost estimation. Older Codex models keep cache writes at zero.
 - `output_tokens` - completion tokens, including reasoning cost.
 - `reasoning_output_tokens` - informational breakdown; already included in output billing.
 - `total_tokens` - provided directly or recomputed as input plus output for legacy entries.

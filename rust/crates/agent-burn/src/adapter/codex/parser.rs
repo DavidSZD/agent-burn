@@ -295,16 +295,20 @@ fn visit_codex_session_entry(
         current_model,
         current_model_is_fallback,
     );
+    let cached_input_tokens = raw_usage.cached_input_tokens.min(raw_usage.input_tokens);
+    let cache_write_input_tokens = codex_cache_write_tokens(
+        model.as_deref(),
+        raw_usage.input_tokens,
+        cached_input_tokens,
+    );
 
     visit(CodexTokenUsageEvent {
         session_id: session_id.to_string(),
         timestamp,
         model,
         input_tokens: raw_usage.input_tokens,
-        cached_input_tokens: raw_usage.cached_input_tokens.min(raw_usage.input_tokens),
-        cache_write_input_tokens: raw_usage
-            .cache_write_input_tokens
-            .min(raw_usage.input_tokens),
+        cached_input_tokens,
+        cache_write_input_tokens,
         output_tokens: raw_usage.output_tokens,
         reasoning_output_tokens: raw_usage.reasoning_output_tokens,
         total_tokens: raw_usage.total_tokens,
@@ -387,20 +391,40 @@ fn visit_codex_exec_usage_event(
         current_model,
         current_model_is_fallback,
     );
+    let cached_input_tokens = raw_usage.cached_input_tokens.min(raw_usage.input_tokens);
+    let cache_write_input_tokens = codex_cache_write_tokens(
+        model.as_deref(),
+        raw_usage.input_tokens,
+        cached_input_tokens,
+    );
     visit(CodexTokenUsageEvent {
         session_id: session_id.to_string(),
         timestamp: timestamps.event,
         model,
         input_tokens: raw_usage.input_tokens,
-        cached_input_tokens: raw_usage.cached_input_tokens.min(raw_usage.input_tokens),
-        cache_write_input_tokens: raw_usage
-            .cache_write_input_tokens
-            .min(raw_usage.input_tokens),
+        cached_input_tokens,
+        cache_write_input_tokens,
         output_tokens: raw_usage.output_tokens,
         reasoning_output_tokens: raw_usage.reasoning_output_tokens,
         total_tokens: raw_usage.total_tokens,
         is_fallback_model,
     })
+}
+
+fn codex_cache_write_tokens(
+    model: Option<&str>,
+    input_tokens: u64,
+    cached_input_tokens: u64,
+) -> u64 {
+    let Some(model) = model.map(str::trim).filter(|model| !model.is_empty()) else {
+        return 0;
+    };
+    let model = model.to_ascii_lowercase();
+    if model.starts_with("gpt-5.6") || model.starts_with("gpt-6") {
+        input_tokens.saturating_sub(cached_input_tokens)
+    } else {
+        0
+    }
 }
 
 fn codex_line_usage_kind(line: &[u8]) -> Option<CodexLineKind> {
@@ -1007,5 +1031,19 @@ mod tests {
                 .windows(2)
                 .all(|window| window[0].released_on > window[1].released_on)
         );
+    }
+
+    #[test]
+    fn treats_all_uncached_codex_input_as_cache_write_for_gpt_5_6_and_newer() {
+        assert_eq!(codex_cache_write_tokens(Some("gpt-5.6-sol"), 100, 40), 60);
+        assert_eq!(codex_cache_write_tokens(Some("gpt-5.6-terra"), 100, 40), 60);
+        assert_eq!(codex_cache_write_tokens(Some("gpt-5.6-luna"), 100, 40), 60);
+        assert_eq!(codex_cache_write_tokens(Some("gpt-6-astra"), 100, 40), 60);
+    }
+
+    #[test]
+    fn leaves_pre_gpt_5_6_codex_input_without_cache_write_cost() {
+        assert_eq!(codex_cache_write_tokens(Some("gpt-5.5"), 100, 40), 0);
+        assert_eq!(codex_cache_write_tokens(Some("gpt-5.4"), 100, 40), 0);
     }
 }
