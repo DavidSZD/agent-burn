@@ -186,12 +186,21 @@ impl FastMultiplierOverrides {
         if let Some(multiplier) = self.exact.get(model) {
             return Some(*multiplier);
         }
-        let normalized = model.replace(['.', '@'], "-");
-        normalized.split(['/', ':']).find_map(|part| {
-            self.normalized_prefix
-                .iter()
-                .find_map(|(base, multiplier)| {
-                    matches_model_suffix(part, base).then_some(*multiplier)
+        if let Some(multiplier) = pricing_alias(model).and_then(|alias| self.exact.get(alias)) {
+            return Some(*multiplier);
+        }
+        model.split(['/', ':']).find_map(|part| {
+            self.exact
+                .get(part)
+                .copied()
+                .or_else(|| pricing_alias(part).and_then(|alias| self.exact.get(alias).copied()))
+                .or_else(|| {
+                    let normalized = part.replace(['.', '@'], "-");
+                    self.normalized_prefix
+                        .iter()
+                        .find_map(|(base, multiplier)| {
+                            matches_model_suffix(&normalized, base).then_some(*multiplier)
+                        })
                 })
         })
     }
@@ -303,16 +312,25 @@ impl PricingMap {
 
     fn load_models_dev_json_missing(&mut self, json: &str) -> Option<usize> {
         let raw = parse_models_dev_json(json)?;
+        let fast_multiplier_overrides = FastMultiplierOverrides::load();
         Some(match raw {
             ModelsDevJson::Providers(providers) => providers
                 .into_values()
-                .map(|provider| self.load_models_dev_models(provider.models))
+                .map(|provider| {
+                    self.load_models_dev_models(provider.models, &fast_multiplier_overrides)
+                })
                 .sum(),
-            ModelsDevJson::Models(models) => self.load_models_dev_models(models),
+            ModelsDevJson::Models(models) => {
+                self.load_models_dev_models(models, &fast_multiplier_overrides)
+            }
         })
     }
 
-    fn load_models_dev_models(&mut self, models: FxHashMap<String, ModelsDevModel>) -> usize {
+    fn load_models_dev_models(
+        &mut self,
+        models: FxHashMap<String, ModelsDevModel>,
+        fast_multiplier_overrides: &FastMultiplierOverrides,
+    ) -> usize {
         let mut loaded_count = 0;
         for (model_key, model) in models {
             let model_id = model.id.unwrap_or(model_key);
@@ -349,7 +367,9 @@ impl PricingMap {
                     output_above_200k: None,
                     cache_create_above_200k: None,
                     cache_read_above_200k: None,
-                    fast_multiplier: 1.0,
+                    fast_multiplier: fast_multiplier_overrides
+                        .multiplier_for(&model_id)
+                        .unwrap_or(1.0),
                 },
             );
             if let Some(context_limit) = model.limit.and_then(|limit| limit.context) {
@@ -544,6 +564,29 @@ impl PricingMap {
     }
 
     fn put_builtin_pricing(&mut self, fast_multiplier_overrides: &FastMultiplierOverrides) {
+        for (model, input, output, cache_create, cache_read) in [
+            ("gpt-5.6-luna", 0.2e-6, 1.2e-6, 0.25e-6, 0.02e-6),
+            ("gpt-6-astra", 10e-6, 50e-6, 12.5e-6, 1e-6),
+        ] {
+            self.entries.insert(
+                model.to_string(),
+                Pricing {
+                    input,
+                    output,
+                    cache_create,
+                    cache_read,
+                    cache_read_explicit: true,
+                    input_above_200k: None,
+                    output_above_200k: None,
+                    cache_create_above_200k: None,
+                    cache_read_above_200k: None,
+                    fast_multiplier: fast_multiplier_overrides
+                        .multiplier_for(model)
+                        .unwrap_or(1.0),
+                },
+            );
+            self.context_limits.insert(model.to_string(), 1_050_000);
+        }
         self.entries.insert(
             "claude-opus-4-5".to_string(),
             Pricing {
@@ -1134,6 +1177,8 @@ fn normalized_pricing_key(value: &str) -> Cow<'_, str> {
 /// canonical pricing keys.
 fn pricing_alias(model: &str) -> Option<&'static str> {
     match model {
+        "gpt-reserve" => Some("gpt-5.6-luna"),
+        "gpt-5.6" => Some("gpt-5.6-sol"),
         "gpt-5.3-spark" => Some("gpt-5.3-codex-spark"),
         _ => None,
     }
@@ -1794,6 +1839,19 @@ mod tests {
         assert_eq!(pricing.find("gpt-5.5").unwrap().fast_multiplier, 2.5);
         assert_eq!(pricing.find("gpt-5.4").unwrap().fast_multiplier, 2.0);
         assert_eq!(pricing.find("gpt-5.3-codex").unwrap().fast_multiplier, 2.0);
+        assert_eq!(pricing.find("gpt-6-astra").unwrap().fast_multiplier, 2.0);
+    }
+
+    #[test]
+    fn embedded_pricing_resolves_codex_gpt_reserve_to_gpt_5_6_luna() {
+        let pricing = PricingMap::load_embedded();
+        let reserve = pricing.find("gpt-reserve").expect("reserve alias pricing");
+        let luna = pricing.find("gpt-5.6-luna").expect("luna pricing");
+
+        assert_eq!(reserve.input, luna.input);
+        assert_eq!(reserve.output, luna.output);
+        assert_eq!(reserve.cache_read, luna.cache_read);
+        assert_eq!(reserve.fast_multiplier, luna.fast_multiplier);
     }
 
     #[test]
