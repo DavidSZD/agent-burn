@@ -455,7 +455,7 @@ mod tests {
         let fixture = fs_fixture!({
             "sessions/codex-session.jsonl": [
                 r#"{"timestamp":"2026-01-02T00:00:00.000Z","type":"turn_context","payload":{"model":"gpt-5"}}"#,
-                r#"{"timestamp":"2026-01-02T00:00:01.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":10,"output_tokens":50,"reasoning_output_tokens":0,"total_tokens":150},"model":"gpt-5"}}}"#,
+                r#"{"timestamp":"2026-01-02T00:00:01.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":10,"cache_write_input_tokens":15,"output_tokens":50,"reasoning_output_tokens":0,"total_tokens":150},"model":"gpt-5"}}}"#,
             ]
             .join("\n"),
         });
@@ -469,6 +469,7 @@ mod tests {
         assert_eq!(events[0].model.as_deref(), Some("gpt-5"));
         assert_eq!(events[0].input_tokens, 100);
         assert_eq!(events[0].cached_input_tokens, 10);
+        assert_eq!(events[0].cache_write_input_tokens, 15);
         assert_eq!(events[0].output_tokens, 50);
         assert_eq!(events[0].reasoning_output_tokens, 0);
         assert_eq!(events[0].total_tokens, 150);
@@ -511,6 +512,7 @@ mod tests {
             model: Some("gpt-5".to_string()),
             input_tokens: 100,
             cached_input_tokens: 10,
+            cache_write_input_tokens: 0,
             output_tokens: 50,
             reasoning_output_tokens: 0,
             total_tokens: 150,
@@ -552,6 +554,7 @@ mod tests {
             model: Some("gpt-5.3-codex".to_string()),
             input_tokens: 120,
             cached_input_tokens: 30,
+            cache_write_input_tokens: 0,
             output_tokens: 11,
             reasoning_output_tokens: 3,
             total_tokens: 131,
@@ -589,6 +592,7 @@ mod tests {
             model: Some("gpt-test".to_string()),
             input_tokens: 10,
             cached_input_tokens: 2,
+            cache_write_input_tokens: 0,
             output_tokens: 5,
             reasoning_output_tokens: 0,
             total_tokens: 15,
@@ -625,6 +629,7 @@ mod tests {
             model: Some("gpt-5.4".to_string()),
             input_tokens: 100,
             cached_input_tokens: 40,
+            cache_write_input_tokens: 0,
             output_tokens: 10,
             reasoning_output_tokens: 0,
             total_tokens: 110,

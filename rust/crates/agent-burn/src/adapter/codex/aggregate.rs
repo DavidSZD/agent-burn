@@ -29,6 +29,7 @@ type CodexEventKey = (
     u64,
     u64,
     u64,
+    u64,
 );
 type CodexDedupeShards = [Mutex<FxHashSet<CodexEventKey>>];
 
@@ -308,6 +309,7 @@ fn accumulate_codex_event_into_group(
 ) {
     group.input_tokens += event.input_tokens;
     group.cached_input_tokens += event.cached_input_tokens;
+    group.cache_write_input_tokens += event.cache_write_input_tokens;
     group.output_tokens += event.output_tokens;
     group.reasoning_output_tokens += event.reasoning_output_tokens;
     group.total_tokens += event.total_tokens;
@@ -322,6 +324,7 @@ fn accumulate_codex_event_into_group(
     let model_usage = group.models.entry(model.to_string()).or_default();
     model_usage.input_tokens += event.input_tokens;
     model_usage.cached_input_tokens += event.cached_input_tokens;
+    model_usage.cache_write_input_tokens += event.cache_write_input_tokens;
     model_usage.output_tokens += event.output_tokens;
     model_usage.reasoning_output_tokens += event.reasoning_output_tokens;
     model_usage.total_tokens += event.total_tokens;
@@ -370,6 +373,7 @@ fn codex_event_key(
         model.len(),
         event.input_tokens,
         event.cached_input_tokens,
+        event.cache_write_input_tokens,
         event.output_tokens,
         event.reasoning_output_tokens,
         event.total_tokens,
@@ -387,6 +391,7 @@ fn merge_groups(target: &mut BTreeMap<String, CodexGroup>, source: BTreeMap<Stri
         let target_group = target.entry(period).or_default();
         target_group.input_tokens += group.input_tokens;
         target_group.cached_input_tokens += group.cached_input_tokens;
+        target_group.cache_write_input_tokens += group.cache_write_input_tokens;
         target_group.output_tokens += group.output_tokens;
         target_group.reasoning_output_tokens += group.reasoning_output_tokens;
         target_group.total_tokens += group.total_tokens;
@@ -402,6 +407,7 @@ fn merge_groups(target: &mut BTreeMap<String, CodexGroup>, source: BTreeMap<Stri
             let target_usage = target_group.models.entry(model).or_default();
             target_usage.input_tokens += usage.input_tokens;
             target_usage.cached_input_tokens += usage.cached_input_tokens;
+            target_usage.cache_write_input_tokens += usage.cache_write_input_tokens;
             target_usage.output_tokens += usage.output_tokens;
             target_usage.reasoning_output_tokens += usage.reasoning_output_tokens;
             target_usage.total_tokens += usage.total_tokens;

@@ -53,7 +53,11 @@ fn group_json(
     speed: CodexSpeed,
 ) -> Value {
     let cost = calculate_group_cost(group, pricing, speed);
-    let input_tokens = non_cached_input_tokens(group.input_tokens, group.cached_input_tokens);
+    let input_tokens = billable_input_tokens(
+        group.input_tokens,
+        group.cached_input_tokens,
+        group.cache_write_input_tokens,
+    );
     let models = group
         .models
         .iter()
@@ -62,7 +66,7 @@ fn group_json(
     let mut row = json!({
         period_key(kind): period,
         "inputTokens": input_tokens,
-        "cacheCreationTokens": 0,
+        "cacheCreationTokens": group.cache_write_input_tokens,
         "cacheReadTokens": group.cached_input_tokens,
         "outputTokens": group.output_tokens,
         "reasoningOutputTokens": group.reasoning_output_tokens,
@@ -83,10 +87,24 @@ pub(crate) fn non_cached_input_tokens(input_tokens: u64, cached_input_tokens: u6
     input_tokens.saturating_sub(cached_input_tokens)
 }
 
+fn billable_input_tokens(
+    input_tokens: u64,
+    cached_input_tokens: u64,
+    cache_write_input_tokens: u64,
+) -> u64 {
+    input_tokens
+        .saturating_sub(cached_input_tokens)
+        .saturating_sub(cache_write_input_tokens)
+}
+
 fn model_usage_json(usage: &CodexModelUsage) -> Value {
     json!({
-        "inputTokens": non_cached_input_tokens(usage.input_tokens, usage.cached_input_tokens),
-        "cacheCreationTokens": 0,
+        "inputTokens": billable_input_tokens(
+            usage.input_tokens,
+            usage.cached_input_tokens,
+            usage.cache_write_input_tokens,
+        ),
+        "cacheCreationTokens": usage.cache_write_input_tokens,
         "cacheReadTokens": usage.cached_input_tokens,
         "outputTokens": usage.output_tokens,
         "reasoningOutputTokens": usage.reasoning_output_tokens,
@@ -102,13 +120,19 @@ fn totals_json<'a>(
 ) -> Value {
     let mut input = 0;
     let mut cached = 0;
+    let mut cache_write = 0;
     let mut output = 0;
     let mut reasoning = 0;
     let mut total = 0;
     let mut cost = 0.0;
     for group in groups {
-        input += non_cached_input_tokens(group.input_tokens, group.cached_input_tokens);
+        input += billable_input_tokens(
+            group.input_tokens,
+            group.cached_input_tokens,
+            group.cache_write_input_tokens,
+        );
         cached += group.cached_input_tokens;
+        cache_write += group.cache_write_input_tokens;
         output += group.output_tokens;
         reasoning += group.reasoning_output_tokens;
         total += group.total_tokens;
@@ -116,7 +140,7 @@ fn totals_json<'a>(
     }
     json!({
         "inputTokens": input,
-        "cacheCreationTokens": 0,
+        "cacheCreationTokens": cache_write,
         "cacheReadTokens": cached,
         "outputTokens": output,
         "reasoningOutputTokens": reasoning,
@@ -134,7 +158,11 @@ pub(crate) fn calculate_codex_model_cost(
     let Some(pricing) = pricing.find(model) else {
         return 0.0;
     };
-    let non_cached_input = usage.input_tokens.saturating_sub(usage.cached_input_tokens);
+    let non_cached_input = billable_input_tokens(
+        usage.input_tokens,
+        usage.cached_input_tokens,
+        usage.cache_write_input_tokens,
+    );
     let multiplier = if matches!(speed, CodexSpeed::Fast) {
         if pricing.fast_multiplier == 1.0 {
             2.0
@@ -151,6 +179,7 @@ pub(crate) fn calculate_codex_model_cost(
     };
     (non_cached_input as f64 * pricing.input
         + usage.cached_input_tokens as f64 * cache_read
+        + usage.cache_write_input_tokens as f64 * pricing.cache_create
         + usage.output_tokens as f64 * pricing.output)
         * multiplier
 }

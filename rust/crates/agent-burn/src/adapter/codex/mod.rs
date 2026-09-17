@@ -110,7 +110,7 @@ mod tests {
     }
 
     #[test]
-    fn reports_non_cached_codex_input_separately_from_cached_input() {
+    fn reports_codex_input_cache_reads_and_cache_writes_separately() {
         let pricing = PricingMap::default();
         let report = report_json(
             &[CodexTokenUsageEvent {
@@ -119,6 +119,7 @@ mod tests {
                 model: Some("gpt-5".to_string()),
                 input_tokens: 100,
                 cached_input_tokens: 90,
+                cache_write_input_tokens: 5,
                 output_tokens: 5,
                 reasoning_output_tokens: 0,
                 total_tokens: 105,
@@ -131,20 +132,53 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(report["daily"][0]["inputTokens"], 10);
-        assert_eq!(report["daily"][0]["cacheCreationTokens"], 0);
+        assert_eq!(report["daily"][0]["inputTokens"], 5);
+        assert_eq!(report["daily"][0]["cacheCreationTokens"], 5);
         assert_eq!(report["daily"][0]["cacheReadTokens"], 90);
         assert_eq!(report["daily"][0]["totalTokens"], 105);
-        assert_eq!(report["totals"]["inputTokens"], 10);
-        assert_eq!(report["totals"]["cacheCreationTokens"], 0);
+        assert_eq!(report["totals"]["inputTokens"], 5);
+        assert_eq!(report["totals"]["cacheCreationTokens"], 5);
         assert_eq!(report["totals"]["cacheReadTokens"], 90);
         assert_eq!(report["totals"]["totalTokens"], 105);
-        assert_eq!(report["daily"][0]["models"]["gpt-5"]["inputTokens"], 10);
+        assert_eq!(report["daily"][0]["models"]["gpt-5"]["inputTokens"], 5);
         assert_eq!(
             report["daily"][0]["models"]["gpt-5"]["cacheCreationTokens"],
-            0
+            5
         );
         assert_eq!(report["daily"][0]["models"]["gpt-5"]["cacheReadTokens"], 90);
+    }
+
+    #[test]
+    fn charges_reported_codex_cache_writes_at_the_model_cache_creation_rate() {
+        let mut pricing = PricingMap::default();
+        pricing.load_json(
+            r#"{
+                "gpt-5.6-test": {
+                    "input_cost_per_token": 0.000002,
+                    "output_cost_per_token": 0.000012,
+                    "cache_creation_input_token_cost": 0.0000025,
+                    "cache_read_input_token_cost": 0.0000002
+                }
+            }"#,
+        );
+        let usage = CodexModelUsage {
+            input_tokens: 100,
+            cached_input_tokens: 40,
+            cache_write_input_tokens: 20,
+            output_tokens: 5,
+            reasoning_output_tokens: 0,
+            total_tokens: 105,
+            is_fallback: false,
+        };
+
+        let cost = calculate_codex_model_cost(
+            "gpt-5.6-test",
+            &usage,
+            &pricing,
+            CodexSpeed::Standard,
+        );
+
+        assert!((cost - 0.000198).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -161,6 +195,7 @@ mod tests {
         let usage = CodexModelUsage {
             input_tokens: 100,
             cached_input_tokens: 40,
+            cache_write_input_tokens: 0,
             output_tokens: 5,
             reasoning_output_tokens: 0,
             total_tokens: 105,
@@ -187,6 +222,7 @@ mod tests {
         let usage = CodexModelUsage {
             input_tokens: 100,
             cached_input_tokens: 40,
+            cache_write_input_tokens: 0,
             output_tokens: 5,
             reasoning_output_tokens: 0,
             total_tokens: 105,
@@ -261,6 +297,7 @@ mod tests {
                 model: Some("gpt-5.3-codex".to_string()),
                 input_tokens: 140,
                 cached_input_tokens: 40,
+                cache_write_input_tokens: 0,
                 output_tokens: 5,
                 reasoning_output_tokens: 2,
                 total_tokens: 147,
@@ -272,6 +309,7 @@ mod tests {
                 model: Some("gpt-5.3-codex".to_string()),
                 input_tokens: 70,
                 cached_input_tokens: 70,
+                cache_write_input_tokens: 0,
                 output_tokens: 10,
                 reasoning_output_tokens: 0,
                 total_tokens: 80,
@@ -283,6 +321,7 @@ mod tests {
                 model: Some("gpt-5-mini".to_string()),
                 input_tokens: 10,
                 cached_input_tokens: 0,
+                cache_write_input_tokens: 0,
                 output_tokens: 2,
                 reasoning_output_tokens: 0,
                 total_tokens: 12,
@@ -294,6 +333,7 @@ mod tests {
                 model: None,
                 input_tokens: 999,
                 cached_input_tokens: 0,
+                cache_write_input_tokens: 0,
                 output_tokens: 999,
                 reasoning_output_tokens: 0,
                 total_tokens: 1_998,
