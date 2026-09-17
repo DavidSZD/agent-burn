@@ -1,6 +1,10 @@
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
-use tokio::time::{sleep, Instant};
+use tokio::time::sleep;
+
+fn refresh_delay(minutes: u64) -> Duration {
+    Duration::from_secs(minutes.max(1) * 60)
+}
 
 use crate::app::{resolve_cli_path_with_override, AppState, RefreshSnapshot};
 
@@ -9,7 +13,6 @@ pub fn spawn_quota_collector(app: AppHandle) {
         // Relevé initial rapide après 2 secondes pour archiver et mettre à jour le tray
         sleep(Duration::from_secs(2)).await;
         loop {
-            let cycle_started = Instant::now();
             collect_and_archive(&app).await;
             let minutes = app
                 .state::<AppState>()
@@ -17,10 +20,19 @@ pub fn spawn_quota_collector(app: AppHandle) {
                 .read()
                 .map(|settings| settings.refresh_minutes)
                 .unwrap_or(1);
-            let cadence = Duration::from_secs(minutes.max(1) * 60);
-            sleep(cadence.saturating_sub(cycle_started.elapsed())).await;
+            sleep(refresh_delay(minutes)).await;
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn next_refresh_waits_for_the_full_interval_after_collection() {
+        assert_eq!(refresh_delay(5), Duration::from_secs(300));
+    }
 }
 
 async fn collect_and_archive(app: &AppHandle) {

@@ -733,6 +733,24 @@ body {
   color: var(--text-muted);
 }
 
+.col-token-part {
+  width: 96px;
+  color: var(--text-muted);
+}
+
+.model-price-info {
+  display: inline-block;
+  margin-left: 7px;
+  color: var(--text-muted);
+  cursor: help;
+  font-family: var(--font-sans);
+  font-size: 11px;
+}
+
+.model-price-info:hover {
+  color: var(--macos-blue);
+}
+
 .col-spend {
   width: 95px;
   text-align: right;

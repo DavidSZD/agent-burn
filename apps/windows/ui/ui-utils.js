@@ -17,6 +17,36 @@ export function visibleTokenBreakdownEntries(breakdown) {
   return entries;
 }
 
+export function aggregateTokenBreakdown(agents) {
+  const total = { input: 0, output: 0, cacheWrite: 0, cacheRead: 0 };
+  for (const agent of agents || []) {
+    const breakdown = agent?.tokenBreakdown || {};
+    for (const key of Object.keys(total)) total[key] += Number(breakdown[key]) || 0;
+  }
+  return total;
+}
+
+export function visibleAgents(detectedAgents, hiddenAgents) {
+  const hidden = new Set(hiddenAgents || []);
+  return (detectedAgents || []).filter((agent) => !hidden.has(agent));
+}
+
+export function restoredTab(storedTab, detectedAgents) {
+  if (storedTab === "summary" || storedTab === "settings") return storedTab;
+  return (detectedAgents || []).includes(storedTab) ? storedTab : "summary";
+}
+
+export function modelPricingTooltip(pricing) {
+  if (!pricing) return "Pricing unavailable";
+  const rate = (value) => `$${Number(value).toString()} / 1M`;
+  return [
+    `Input ${rate(pricing.inputPerM)}`,
+    `Cached input ${rate(pricing.cacheReadPerM)}`,
+    `Cache write ${rate(pricing.cacheWritePerM)}`,
+    `Output ${rate(pricing.outputPerM)}`,
+  ].join(" · ");
+}
+
 export function subscriptionPresentation(subscription) {
   const rawPlan = String(subscription?.plan || "").trim();
   const unknownPlan = !rawPlan || /^(unknown|plan not detected)$/i.test(rawPlan);
@@ -151,8 +181,18 @@ function applyRowsDelta(targetRows, freshRows, previousRows, key) {
       continue;
     }
     const previous = (previousRows || []).find((row) => row?.[key] === id) || {};
-    applyNumberDelta(target, fresh, previous, "totalCost");
-    applyNumberDelta(target, fresh, previous, "totalTokens");
+    for (const field of [
+      "totalCost",
+      "totalTokens",
+      "inputTokens",
+      "outputTokens",
+      "cacheReadTokens",
+      "cacheWriteTokens",
+    ]) {
+      if (fresh?.[field] != null || previous?.[field] != null || target?.[field] != null) {
+        applyNumberDelta(target, fresh, previous, field);
+      }
+    }
   }
 }
 

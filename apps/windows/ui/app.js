@@ -1,13 +1,16 @@
 import { RequestGate } from "./request-gate.js";
 import {
+  aggregateTokenBreakdown,
   createCoalescedSaver,
   createSingleFlight,
   escapeHtml,
   getRestoredPeriod,
   isTimelineCacheFresh,
   latestTimelineUpdatedAt,
+  modelPricingTooltip,
   loadQuotaHistory,
   resetWindowStartDate,
+  restoredTab,
   shouldRefreshTimelineInBackground,
   timelineSelection,
   timelinePreloadOrder,
@@ -20,6 +23,7 @@ import {
   persistQuotaSource,
   subscriptionPresentation,
   visibleTokenBreakdownEntries,
+  visibleAgents,
   updateCachedReportsFromToday,
   updateCacheFromAllSnapshot,
   waitForInitialRefresh,
@@ -206,15 +210,22 @@ window.addEventListener("DOMContentLoaded", async () => {
   initPeriods();
   initRefresh();
   initSettings();
+  setTimelineRefreshing(true, "startup");
   initFooterTimer();
   initBackendEvents();
   initBackendRefreshPolling();
 
   // Démarrage rapide avec le cache
+  await settingsLoadPromise;
   await initColdStart();
   updateTimelineAvailability();
   // On ne bloque le premier affichage que s'il n'existe encore aucune donnée.
   if (!periodCache[currentPeriod]) await loadData(true);
+  currentTab = restoredTab(
+    localStorage.getItem("agent-burn-tab"),
+    visibleAgents(detectedAgents, appSettings?.hiddenAgents),
+  );
+  switchTab(currentTab);
   // Let live quotas update first, then refresh every stale timeline in the background.
   void refreshStaleTimelinesAfterInitialBackend();
 });
@@ -246,7 +257,7 @@ function applyBackendRefresh(data, refreshedAtMs) {
   } else {
     reportData = mergeLiveSubscription(reportData, data);
   }
-  computeDetectedAgents(reportData, antigravityData);
+  computeDetectedAgents(data, antigravityData);
   return true;
 }
 
@@ -293,6 +304,7 @@ async function initColdStart() {
       const select = document.getElementById("summary-period-select");
       if (select) select.value = currentPeriod;
     }
+    computeDetectedAgents(periodCache.all?.reportData || cached?.summary, cached?.antigravity);
     if (cached && (cached.summary || cached.antigravity)) {
       if (cached.antigravity) antigravityData = cached.antigravity;
       const selectedCache = periodCache[currentPeriod];
@@ -380,9 +392,10 @@ function renderHarnessTabs() {
   container.appendChild(generalBtn);
 
   // 2. Les agents détectés sous forme d'onglets directs (jusqu'à 8 pour inclure tous les agents actifs)
+  const shownAgents = visibleAgents(detectedAgents, appSettings?.hiddenAgents);
   const maxDirectTabs = 8;
-  const directAgents = detectedAgents.slice(0, maxDirectTabs);
-  const overflowAgents = detectedAgents.slice(maxDirectTabs);
+  const directAgents = shownAgents.slice(0, maxDirectTabs);
+  const overflowAgents = shownAgents.slice(maxDirectTabs);
 
   directAgents.forEach((agent) => {
     const btn = document.createElement("button");
@@ -442,6 +455,7 @@ function switchTab(tabId) {
     if (cached) reportData = mergeLiveSubscription(cached.reportData, latestLiveQuotaReport);
   }
   currentTab = tabId;
+  localStorage.setItem("agent-burn-tab", currentTab);
 
   // Mise à jour de la classe active sur les onglets
   renderHarnessTabs();
@@ -497,10 +511,6 @@ async function switchPeriod(newPeriod) {
     renderHarnessTabs();
     if (currentTab === "summary") renderSummary();
     else if (currentTab !== "settings") renderHarnessView(currentTab);
-    if (!isTimelineCacheFresh(periodCache[cacheKey])) {
-      setTimelineRefreshing(true, "timeline");
-      void loadData(true);
-    }
     return;
   }
 
@@ -670,6 +680,7 @@ async function performAllTimelineRefresh(showIndicator = false) {
 
 async function refreshStaleTimelinesAfterInitialBackend() {
   await waitForInitialRefresh(initialBackendRefresh);
+  setTimelineRefreshing(false, "startup");
   const cacheKey = timelineCacheKey(currentPeriod);
   if (!isTimelineCacheFresh(periodCache[cacheKey])) {
     setTimelineRefreshing(true, "timeline");
@@ -813,6 +824,17 @@ function renderSummary() {
 
   // 5. Tableau des modèles
   renderModelsTable(models, cost, "summary-models-tbody", "summary-models-count", "summary-filter-input");
+
+  const breakdownGrid = document.getElementById("summary-token-breakdown-grid");
+  if (breakdownGrid) {
+    const breakdown = aggregateTokenBreakdown(reportData.agents);
+    breakdownGrid.innerHTML = visibleTokenBreakdownEntries(breakdown).map(([label, value]) => `
+      <div class="token-metric-item">
+        <span class="token-metric-label">${escapeHtml(label)}</span>
+        <span class="token-metric-val">${formatCompactTokens(value || 0)}</span>
+      </div>
+    `).join("");
+  }
 
   // 6. Abonnements
   renderSubscriptions();
@@ -1086,7 +1108,10 @@ function renderHarnessView(agent) {
           <thead>
             <tr>
               <th class="col-model sortable" data-sort="model">Model <span class="sort-indicator"></span></th>
-              <th class="col-tokens text-right sortable" data-sort="tokens">Tokens <span class="sort-indicator"></span></th>
+              <th class="col-token-part text-right sortable" data-sort="input">Input <span class="sort-indicator"></span></th>
+              <th class="col-token-part text-right sortable" data-sort="cacheRead">Cached input <span class="sort-indicator"></span></th>
+              <th class="col-token-part text-right sortable" data-sort="cacheWrite">Cache write <span class="sort-indicator"></span></th>
+              <th class="col-token-part text-right sortable" data-sort="output">Output <span class="sort-indicator"></span></th>
               <th class="col-spend text-right sortable" data-sort="spend">Spend <span class="sort-indicator">↓</span></th>
               <th class="col-share text-right sortable" data-sort="share">Share <span class="sort-indicator"></span></th>
             </tr>
@@ -2130,8 +2155,15 @@ function renderModelsTable(models, totalCost, tbodyId, countId, searchInputId) {
       let res = 0;
       if (modelsSortState.column === "spend" || modelsSortState.column === "share") {
         res = (a.totalCost || 0) - (b.totalCost || 0);
-      } else if (modelsSortState.column === "tokens") {
-        res = (a.totalTokens || 0) - (b.totalTokens || 0);
+      } else if (["input", "output", "cacheRead", "cacheWrite"].includes(modelsSortState.column)) {
+        const fields = {
+          input: "inputTokens",
+          output: "outputTokens",
+          cacheRead: "cacheReadTokens",
+          cacheWrite: "cacheWriteTokens",
+        };
+        const field = fields[modelsSortState.column];
+        res = (a[field] || 0) - (b[field] || 0);
       } else if (modelsSortState.column === "model") {
         res = (a.model || "").localeCompare(b.model || "");
       }
@@ -2139,16 +2171,20 @@ function renderModelsTable(models, totalCost, tbodyId, countId, searchInputId) {
     });
 
     if (filtered.length === 0) {
-      tbody.innerHTML = `<tr><td colspan="4" style="text-align:center;color:var(--text-muted);padding:18px;">No models match your filter.</td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="7" style="text-align:center;color:var(--text-muted);padding:18px;">No models match your filter.</td></tr>`;
       return;
     }
 
     filtered.forEach((m) => {
       const share = totalCost > 0 ? ((m.totalCost || 0) / totalCost) * 100 : m.percentage || 0;
+      const pricingTitle = modelPricingTooltip(m.pricing);
       const tr = document.createElement("tr");
       tr.innerHTML = `
-        <td class="col-model" title="${escapeHtml(m.model)}">${escapeHtml(m.model)}</td>
-        <td class="col-tokens text-right">${formatCompactTokens(m.totalTokens)}</td>
+        <td class="col-model"><span title="${escapeHtml(m.model)}">${escapeHtml(m.model)}</span><span class="model-price-info" title="${escapeHtml(pricingTitle)}" aria-label="${escapeHtml(pricingTitle)}">ⓘ</span></td>
+        <td class="col-token-part text-right">${formatCompactTokens(m.inputTokens || 0)}</td>
+        <td class="col-token-part text-right">${formatCompactTokens(m.cacheReadTokens || 0)}</td>
+        <td class="col-token-part text-right">${formatCompactTokens(m.cacheWriteTokens || 0)}</td>
+        <td class="col-token-part text-right">${formatCompactTokens(m.outputTokens || 0)}</td>
         <td class="col-spend text-right">${formatCurrency(m.totalCost)}</td>
         <td class="col-share text-right">${share.toFixed(1)}%</td>
       `;
@@ -2307,6 +2343,7 @@ async function saveSettingsFromControls() {
     refreshMinutes: Number(document.getElementById("settings-refresh-select")?.value || 1),
     quotaSource: appSettings?.quotaSource || "antigravity",
     antigravityUltraPrice: Number(document.getElementById("settings-antigravity-ultra-price")?.value) || null,
+    hiddenAgents: appSettings?.hiddenAgents || [],
   };
   appSettings = await invokeTauri("set_settings", { settings });
   for (const key in harnessCache) delete harnessCache[key];
@@ -2340,9 +2377,25 @@ function renderSettings() {
             <img src="${getAgentBrandIcon(agent)}" width="22" height="22" style="border-radius:4px;" />
             <strong>${escapeHtml(getAgentDisplayName(agent))}</strong>
           </div>
-          <span class="status-badge-ok">Active & detected</span>
+          <label class="switch" title="Show ${escapeHtml(getAgentDisplayName(agent))} in the tab bar">
+            <input type="checkbox" data-agent-tab-toggle="${escapeHtml(agent)}" ${appSettings?.hiddenAgents?.includes(agent) ? "" : "checked"} />
+            <span class="slider"></span>
+          </label>
         `;
         list.appendChild(row);
+      });
+      list.querySelectorAll("[data-agent-tab-toggle]").forEach((toggle) => {
+        toggle.addEventListener("change", async () => {
+          const agent = toggle.dataset.agentTabToggle;
+          const hidden = new Set(appSettings?.hiddenAgents || []);
+          if (toggle.checked) hidden.delete(agent);
+          else hidden.add(agent);
+          appSettings = await invokeTauri("set_settings", {
+            settings: { ...appSettings, hiddenAgents: [...hidden] },
+          });
+          if (!toggle.checked && currentTab === agent) switchTab("summary");
+          else renderHarnessTabs();
+        });
       });
     }
   }
@@ -2366,11 +2419,12 @@ function initFooterTimer() {
   if (!el) return;
 
   setInterval(() => {
-    if (!lastUpdatedTime) {
+    const visibleUpdatedAt = periodCache[timelineCacheKey(currentPeriod)]?.updatedAt;
+    if (!Number.isFinite(visibleUpdatedAt)) {
       el.textContent = "Waiting for first update";
       return;
     }
-    const sec = Math.floor((Date.now() - lastUpdatedTime) / 1000);
+    const sec = Math.max(0, Math.floor((Date.now() - visibleUpdatedAt) / 1000));
     const staleAfter = (appSettings?.refreshMinutes || 1) * 60 + 30;
     const dot = document.querySelector("#quota-menu-pill .quota-dot");
     if (sec > staleAfter && dot) {

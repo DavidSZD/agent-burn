@@ -37,6 +37,7 @@ pub struct AppSettings {
     pub refresh_minutes: u64,
     pub quota_source: String,
     pub antigravity_ultra_price: Option<f64>,
+    pub hidden_agents: Vec<String>,
 }
 
 impl Default for AppSettings {
@@ -48,6 +49,7 @@ impl Default for AppSettings {
             refresh_minutes: 1,
             quota_source: "codex".to_string(),
             antigravity_ultra_price: None,
+            hidden_agents: Vec::new(),
         }
     }
 }
@@ -63,6 +65,14 @@ impl AppSettings {
         self.antigravity_ultra_price = self
             .antigravity_ultra_price
             .filter(|price| matches!(*price, 100.0 | 200.0));
+        self.hidden_agents = self
+            .hidden_agents
+            .drain(..)
+            .map(|agent| agent.trim().to_lowercase())
+            .filter(|agent| !agent.is_empty())
+            .collect();
+        self.hidden_agents.sort();
+        self.hidden_agents.dedup();
         self
     }
 }
@@ -306,5 +316,16 @@ mod tests {
         }
         .normalized();
         assert_eq!(settings.antigravity_ultra_price, None);
+    }
+
+    #[test]
+    fn hidden_agents_are_normalized_and_deduplicated() {
+        let settings = AppSettings {
+            hidden_agents: vec![" Codex ".into(), "codex".into(), "".into()],
+            ..AppSettings::default()
+        }
+        .normalized();
+
+        assert_eq!(settings.hidden_agents, vec!["codex"]);
     }
 }

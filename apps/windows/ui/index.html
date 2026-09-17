@@ -152,7 +152,10 @@
               <thead>
                 <tr>
                   <th class="col-model sortable" data-sort="model">Model <span class="sort-indicator"></span></th>
-                  <th class="col-tokens text-right sortable" data-sort="tokens">Tokens <span class="sort-indicator"></span></th>
+                  <th class="col-token-part text-right sortable" data-sort="input">Input <span class="sort-indicator"></span></th>
+                  <th class="col-token-part text-right sortable" data-sort="cacheRead">Cached input <span class="sort-indicator"></span></th>
+                  <th class="col-token-part text-right sortable" data-sort="cacheWrite">Cache write <span class="sort-indicator"></span></th>
+                  <th class="col-token-part text-right sortable" data-sort="output">Output <span class="sort-indicator"></span></th>
                   <th class="col-spend text-right sortable" data-sort="spend">Spend <span class="sort-indicator">↓</span></th>
                   <th class="col-share text-right sortable" data-sort="share">Share <span class="sort-indicator"></span></th>
                 </tr>
@@ -162,6 +165,11 @@
               </tbody>
             </table>
           </div>
+        </div>
+
+        <div class="groupbox token-breakdown-card" id="summary-token-breakdown-card">
+          <h2 class="card-heading">Token breakdown · available source data</h2>
+          <div class="token-breakdown-grid" id="summary-token-breakdown-grid"></div>
         </div>
 
         <!-- Section Abonnements si détectés -->
@@ -281,7 +289,7 @@
         <span id="footer-status-text">Updating...</span>
       </div>
       <div class="footer-right">
-        <span>v0.1.23 (Windows)</span>
+        <span>v0.1.24 (Windows)</span>
       </div>
     </footer>
   </div>

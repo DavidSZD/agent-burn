@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   createCoalescedSaver,
   createSingleFlight,
+  aggregateTokenBreakdown,
   escapeHtml,
   getRestoredPeriod,
   timelineStartDate,
@@ -16,6 +17,8 @@ import {
   timelinePreloadOrder,
   isTimelineCacheFresh,
   latestTimelineUpdatedAt,
+  modelPricingTooltip,
+  restoredTab,
   loadQuotaHistory,
   resetWindowStartDate,
   refreshStaticTimelineFreshness,
@@ -26,6 +29,7 @@ import {
   waitForInitialRefresh,
   subscriptionPresentation,
   visibleTokenBreakdownEntries,
+  visibleAgents,
 } from "./ui-utils.js";
 
 test("coalesced saves keep the in-flight write and only the newest pending state", async () => {
@@ -113,6 +117,31 @@ test("restoring a cache never invents a recent update time", () => {
   assert.equal(latestTimelineUpdatedAt({ all: { reportData: {} } }), null);
 });
 
+test("general token breakdown sums every detected harness", () => {
+  assert.deepEqual(aggregateTokenBreakdown([
+    { tokenBreakdown: { input: 10, output: 3, cacheRead: 5 } },
+    { tokenBreakdown: { input: 7, output: 2, cacheWrite: 4 } },
+  ]), { input: 17, output: 5, cacheWrite: 4, cacheRead: 5 });
+});
+
+test("restores only tabs that still exist", () => {
+  assert.equal(restoredTab("codex", ["codex", "antigravity"]), "codex");
+  assert.equal(restoredTab("settings", []), "settings");
+  assert.equal(restoredTab("missing", ["codex"]), "summary");
+});
+
+test("hidden harnesses are removed only from the tab bar", () => {
+  assert.deepEqual(visibleAgents(["antigravity", "codex"], ["antigravity"]), ["codex"]);
+});
+
+test("model pricing tooltip shows every available token rate", () => {
+  assert.equal(
+    modelPricingTooltip({ inputPerM: 1.25, outputPerM: 10, cacheReadPerM: 0.125, cacheWritePerM: 1.5625 }),
+    "Input $1.25 / 1M · Cached input $0.125 / 1M · Cache write $1.5625 / 1M · Output $10 / 1M",
+  );
+  assert.equal(modelPricingTooltip(null), "Pricing unavailable");
+});
+
 test("timeline preloading waits for the initial live refresh", async () => {
   let release;
   const initialRefresh = new Promise((resolve) => { release = resolve; });
@@ -147,6 +176,20 @@ test("a fresh today report advances every timeline that contains today", () => {
   assert.equal(cache.ytd.updatedAt, 500);
   assert.deepEqual(cache.yesterday.reportData.totals, { totalCost: 5, totalTokens: 50 });
   assert.equal(cache.yesterday.updatedAt, 500);
+});
+
+test("a fresh today report advances per-model token classes", () => {
+  const cache = {
+    today: { reportData: { totals: {}, daily: [], agents: [], models: [{ model: "m", totalTokens: 10, inputTokens: 4, outputTokens: 1, cacheReadTokens: 5, cacheWriteTokens: 0 }] }, updatedAt: 1 },
+    all: { reportData: { totals: {}, daily: [], agents: [], models: [{ model: "m", totalTokens: 20, inputTokens: 8, outputTokens: 2, cacheReadTokens: 10, cacheWriteTokens: 0 }] }, updatedAt: 1 },
+  };
+  const freshToday = { totals: {}, daily: [], agents: [], models: [{ model: "m", totalTokens: 15, inputTokens: 6, outputTokens: 2, cacheReadTokens: 7, cacheWriteTokens: 0 }] };
+
+  updateCachedReportsFromToday(cache, freshToday, 500);
+
+  assert.deepEqual(cache.all.reportData.models[0], {
+    model: "m", totalTokens: 25, inputTokens: 10, outputTokens: 3, cacheReadTokens: 12, cacheWriteTokens: 0, percentage: 100,
+  });
 });
 
 test("a backend all-time snapshot refreshes the all-time cache without replacing other timelines", () => {

@@ -58,6 +58,7 @@ pub async fn get_summary_since(
         );
     }
     merge_antigravity(&mut summary, &antigravity)?;
+    attach_model_pricing(&mut summary);
     Ok(summary)
 }
 
@@ -84,7 +85,45 @@ pub(crate) async fn build_summary(
         );
     }
     merge_antigravity(&mut summary, &antigravity)?;
+    attach_model_pricing(&mut summary);
     Ok(summary)
+}
+
+fn attach_model_pricing(summary: &mut serde_json::Value) {
+    fn attach(models: Option<&mut Vec<serde_json::Value>>) {
+        for model in models.into_iter().flatten() {
+            let Some(name) = model.get("model").and_then(|value| value.as_str()) else {
+                continue;
+            };
+            let Some(price) = crate::pricing::get_model_pricing(name) else {
+                continue;
+            };
+            model["pricing"] = serde_json::json!({
+                "inputPerM": price.input_per_m,
+                "outputPerM": price.output_per_m,
+                "cacheReadPerM": price.cache_read_per_m,
+                "cacheWritePerM": price.cache_write_per_m,
+            });
+        }
+    }
+
+    attach(
+        summary
+            .get_mut("models")
+            .and_then(|value| value.as_array_mut()),
+    );
+    if let Some(agents) = summary
+        .get_mut("agents")
+        .and_then(|value| value.as_array_mut())
+    {
+        for agent in agents {
+            attach(
+                agent
+                    .get_mut("models")
+                    .and_then(|value| value.as_array_mut()),
+            );
+        }
+    }
 }
 
 fn merge_antigravity(
@@ -106,131 +145,129 @@ fn merge_antigravity(
             })
         });
     if !historical_already_present {
-    let models = data
-        .top_models
-        .iter()
-        .map(|model| {
-            serde_json::json!({
-                "model": model.model,
-                "totalTokens": model.tokens,
-                "totalCost": model.cost,
-            })
-        })
-        .collect::<Vec<_>>();
-    let daily = data
-        .daily
-        .iter()
-        .map(|day| {
-            serde_json::json!({
-                "date": day.date, "tokens": day.tokens, "cost": day.cost,
-            })
-        })
-        .collect::<Vec<_>>();
-    let agent = serde_json::json!({
-        "agent": "antigravity",
-        "totalCost": data.total_cost,
-        "totalTokens": data.total_tokens,
-        "models": models,
-        "daily": daily,
-        "tokenBreakdown": {
-            "input": data.input_tokens,
-            "output": data.output_tokens,
-            "cacheRead": data.cache_read_tokens,
-        }
-    });
-    if let Some(agents) = summary
-        .get_mut("agents")
-        .and_then(|value| value.as_array_mut())
-    {
-        if let Some(index) = agents
+        let models = data
+            .top_models
             .iter()
-            .position(|value| value.get("agent").and_then(|v| v.as_str()) == Some("antigravity"))
-        {
-            agents[index] = agent;
-        } else {
-            agents.push(agent);
-        }
-    }
-    if let Some(totals) = summary.get_mut("totals") {
-        let cost = totals
-            .get("totalCost")
-            .and_then(|value| value.as_f64())
-            .unwrap_or(0.0);
-        let tokens = totals
-            .get("totalTokens")
-            .and_then(|value| value.as_i64())
-            .unwrap_or(0);
-        totals["totalCost"] = serde_json::json!(cost + data.total_cost);
-        totals["totalTokens"] = serde_json::json!(tokens + data.total_tokens);
-    }
-    if let Some(root_models) = summary
-        .get_mut("models")
-        .and_then(|value| value.as_array_mut())
-    {
-        for model in &data.top_models {
-            if let Some(existing) = root_models.iter_mut().find(|value| {
-                value.get("model").and_then(|v| v.as_str()) == Some(model.model.as_str())
-            }) {
-                let tokens = existing
-                    .get("totalTokens")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0);
-                let cost = existing
-                    .get("totalCost")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(0.0);
-                existing["totalTokens"] = serde_json::json!(tokens + model.tokens);
-                existing["totalCost"] = serde_json::json!(cost + model.cost);
-            } else {
-                root_models.push(serde_json::json!({
+            .map(|model| {
+                serde_json::json!({
                     "model": model.model,
                     "totalTokens": model.tokens,
                     "totalCost": model.cost,
-                    "percentage": 0.0,
-                }));
+                })
+            })
+            .collect::<Vec<_>>();
+        let daily = data
+            .daily
+            .iter()
+            .map(|day| {
+                serde_json::json!({
+                    "date": day.date, "tokens": day.tokens, "cost": day.cost,
+                })
+            })
+            .collect::<Vec<_>>();
+        let agent = serde_json::json!({
+            "agent": "antigravity",
+            "totalCost": data.total_cost,
+            "totalTokens": data.total_tokens,
+            "models": models,
+            "daily": daily,
+            "tokenBreakdown": {
+                "input": data.input_tokens,
+                "output": data.output_tokens,
+                "cacheRead": data.cache_read_tokens,
+            }
+        });
+        if let Some(agents) = summary
+            .get_mut("agents")
+            .and_then(|value| value.as_array_mut())
+        {
+            if let Some(index) = agents.iter().position(|value| {
+                value.get("agent").and_then(|v| v.as_str()) == Some("antigravity")
+            }) {
+                agents[index] = agent;
+            } else {
+                agents.push(agent);
             }
         }
-        let total_cost: f64 = root_models
-            .iter()
-            .filter_map(|value| value.get("totalCost")?.as_f64())
-            .sum();
-        for model in root_models {
-            let cost = model
+        if let Some(totals) = summary.get_mut("totals") {
+            let cost = totals
                 .get("totalCost")
-                .and_then(|v| v.as_f64())
+                .and_then(|value| value.as_f64())
                 .unwrap_or(0.0);
-            model["percentage"] = serde_json::json!(if total_cost > 0.0 {
-                cost / total_cost * 100.0
-            } else {
-                0.0
-            });
+            let tokens = totals
+                .get("totalTokens")
+                .and_then(|value| value.as_i64())
+                .unwrap_or(0);
+            totals["totalCost"] = serde_json::json!(cost + data.total_cost);
+            totals["totalTokens"] = serde_json::json!(tokens + data.total_tokens);
         }
-    }
-    if let Some(root_daily) = summary
-        .get_mut("daily")
-        .and_then(|value| value.as_array_mut())
-    {
-        for day in &data.daily {
-            if let Some(existing) = root_daily
-                .iter_mut()
-                .find(|value| value.get("date").and_then(|v| v.as_str()) == Some(day.date.as_str()))
-            {
-                let tokens = existing.get("tokens").and_then(|v| v.as_i64()).unwrap_or(0);
-                let cost = existing.get("cost").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                existing["tokens"] = serde_json::json!(tokens + day.tokens);
-                existing["cost"] = serde_json::json!(cost + day.cost);
-            } else {
-                root_daily.push(
+        if let Some(root_models) = summary
+            .get_mut("models")
+            .and_then(|value| value.as_array_mut())
+        {
+            for model in &data.top_models {
+                if let Some(existing) = root_models.iter_mut().find(|value| {
+                    value.get("model").and_then(|v| v.as_str()) == Some(model.model.as_str())
+                }) {
+                    let tokens = existing
+                        .get("totalTokens")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+                    let cost = existing
+                        .get("totalCost")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
+                    existing["totalTokens"] = serde_json::json!(tokens + model.tokens);
+                    existing["totalCost"] = serde_json::json!(cost + model.cost);
+                } else {
+                    root_models.push(serde_json::json!({
+                        "model": model.model,
+                        "totalTokens": model.tokens,
+                        "totalCost": model.cost,
+                        "percentage": 0.0,
+                    }));
+                }
+            }
+            let total_cost: f64 = root_models
+                .iter()
+                .filter_map(|value| value.get("totalCost")?.as_f64())
+                .sum();
+            for model in root_models {
+                let cost = model
+                    .get("totalCost")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0);
+                model["percentage"] = serde_json::json!(if total_cost > 0.0 {
+                    cost / total_cost * 100.0
+                } else {
+                    0.0
+                });
+            }
+        }
+        if let Some(root_daily) = summary
+            .get_mut("daily")
+            .and_then(|value| value.as_array_mut())
+        {
+            for day in &data.daily {
+                if let Some(existing) = root_daily.iter_mut().find(|value| {
+                    value.get("date").and_then(|v| v.as_str()) == Some(day.date.as_str())
+                }) {
+                    let tokens = existing.get("tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let cost = existing.get("cost").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    existing["tokens"] = serde_json::json!(tokens + day.tokens);
+                    existing["cost"] = serde_json::json!(cost + day.cost);
+                } else {
+                    root_daily.push(
                     serde_json::json!({"date": day.date, "tokens": day.tokens, "cost": day.cost}),
                 );
+                }
             }
+            root_daily.sort_by(|a, b| {
+                a.get("date")
+                    .and_then(|v| v.as_str())
+                    .cmp(&b.get("date").and_then(|v| v.as_str()))
+            });
         }
-        root_daily.sort_by(|a, b| {
-            a.get("date")
-                .and_then(|v| v.as_str())
-                .cmp(&b.get("date").and_then(|v| v.as_str()))
-        });
-    }
     }
     if let Some(plan) = &data.plan {
         let root = summary
@@ -462,6 +499,23 @@ pub async fn get_antigravity_summary(period: Option<String>) -> Result<serde_jso
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_pricing_is_attached_to_general_and_harness_rows() {
+        let mut summary = serde_json::json!({
+            "models": [{"model": "gpt-5.5"}],
+            "agents": [{"agent": "codex", "models": [{"model": "gpt-5.5"}]}]
+        });
+
+        attach_model_pricing(&mut summary);
+
+        assert_eq!(summary["models"][0]["pricing"]["inputPerM"], 5.0);
+        assert_eq!(summary["models"][0]["pricing"]["outputPerM"], 30.0);
+        assert_eq!(
+            summary["agents"][0]["models"][0]["pricing"]["cacheReadPerM"],
+            0.5
+        );
+    }
 
     #[test]
     fn antigravity_is_merged_into_the_standard_summary_shape() {
