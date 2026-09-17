@@ -62,7 +62,7 @@ The release bundle contains `agent-burn.exe`; the desktop application never down
 Build or download an installer with a version newer than the installed copy, close Agent Burn from its tray menu, then launch it in update mode:
 
 ```powershell
-Start-Process '.\Agent Burn_0.1.20_x64-setup.exe' -ArgumentList '/UPDATE' -Wait
+Start-Process '.\Agent Burn_0.1.21_x64-setup.exe' -ArgumentList '/UPDATE' -Wait
 ```
 
 Update mode replaces the application in place without showing the uninstall/data-removal flow. Dashboard settings and history under `%LOCALAPPDATA%\Agent Burn` are preserved. Automatic network updates are not enabled, so release installers remain the explicit update channel until a signed release feed is configured.

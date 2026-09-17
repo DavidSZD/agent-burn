@@ -87,6 +87,22 @@ pub fn get_antigravity_data(period_str: Option<&str>) -> Result<AntigravitySumma
     get_antigravity_data_with_bounds(period, min_date, max_date)
 }
 
+pub(crate) fn get_live_antigravity_data(period: &str) -> AntigravitySummary {
+    AntigravitySummary {
+        period: period.to_string(),
+        session_count: 0,
+        total_tokens: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_read_tokens: 0,
+        total_cost: 0.0,
+        top_models: Vec::new(),
+        sessions: Vec::new(),
+        daily: Vec::new(),
+        plan: get_live_antigravity_plan(),
+    }
+}
+
 pub(crate) fn get_antigravity_data_with_bounds(
     period: &str,
     min_date: Option<DateTime<Utc>>,

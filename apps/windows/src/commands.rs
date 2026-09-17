@@ -45,10 +45,11 @@ pub async fn get_summary_since(
         .and_then(|date| date.and_hms_opt(0, 0, 0))
         .map(|date| chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(date, chrono::Utc));
     let antigravity = tokio::task::spawn_blocking(move || {
-        crate::antigravity::get_antigravity_data_with_bounds("rtd", min_date, None)
+        let _ = min_date;
+        crate::antigravity::get_live_antigravity_data("rtd")
     })
     .await
-    .map_err(|error| format!("Erreur tâche d'analyse Antigravity: {error}"))??;
+    .map_err(|error| format!("Erreur tâche d'analyse Antigravity: {error}"))?;
     let mut antigravity = antigravity;
     if let Some(plan) = antigravity.plan.as_mut() {
         plan.price_per_month = crate::antigravity::antigravity_plan_price(
@@ -71,20 +72,18 @@ pub(crate) async fn build_summary(
     }
     let mut summary = execute_cli_json_with_settings(cli, &args, settings).await?;
     let antigravity_period = period.to_string();
-    let antigravity_result = tokio::task::spawn_blocking(move || {
-        crate::antigravity::get_antigravity_data(Some(&antigravity_period))
+    let mut antigravity = tokio::task::spawn_blocking(move || {
+        crate::antigravity::get_live_antigravity_data(&antigravity_period)
     })
     .await
     .map_err(|error| format!("Erreur tâche d'analyse Antigravity: {error}"))?;
-    if let Ok(mut antigravity) = antigravity_result {
-        if let Some(plan) = antigravity.plan.as_mut() {
-            plan.price_per_month = crate::antigravity::antigravity_plan_price(
-                &plan.plan,
-                settings.antigravity_ultra_price,
-            );
-        }
-        merge_antigravity(&mut summary, &antigravity)?;
+    if let Some(plan) = antigravity.plan.as_mut() {
+        plan.price_per_month = crate::antigravity::antigravity_plan_price(
+            &plan.plan,
+            settings.antigravity_ultra_price,
+        );
     }
+    merge_antigravity(&mut summary, &antigravity)?;
     Ok(summary)
 }
 
@@ -98,6 +97,15 @@ fn merge_antigravity(
     if !summary.is_object() {
         return Err("Le résumé CLI doit être un objet JSON.".to_string());
     }
+    let historical_already_present = summary
+        .get("agents")
+        .and_then(|value| value.as_array())
+        .is_some_and(|agents| {
+            agents.iter().any(|value| {
+                value.get("agent").and_then(|value| value.as_str()) == Some("antigravity")
+            })
+        });
+    if !historical_already_present {
     let models = data
         .top_models
         .iter()
@@ -222,6 +230,7 @@ fn merge_antigravity(
                 .and_then(|v| v.as_str())
                 .cmp(&b.get("date").and_then(|v| v.as_str()))
         });
+    }
     }
     if let Some(plan) = &data.plan {
         let root = summary
@@ -493,6 +502,41 @@ mod tests {
         assert_eq!(summary["totals"]["totalTokens"], 40);
         assert_eq!(summary["models"][0]["model"], "gemini-test");
         assert_eq!(summary["daily"][0]["tokens"], 30);
+    }
+
+    #[test]
+    fn live_antigravity_merge_preserves_usage_already_loaded_by_the_cli() {
+        let mut summary = serde_json::json!({
+            "totals": {"totalCost": 12.0, "totalTokens": 120},
+            "agents": [{
+                "agent": "antigravity",
+                "totalCost": 7.0,
+                "totalTokens": 70,
+                "models": [{"model": "gemini-3-pro", "totalTokens": 70}],
+                "daily": []
+            }],
+            "models": [{"model": "gemini-3-pro", "totalTokens": 70, "totalCost": 7.0}],
+            "daily": []
+        });
+        let live = crate::antigravity::AntigravitySummary {
+            period: "all".into(),
+            session_count: 0,
+            total_tokens: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            total_cost: 0.0,
+            top_models: vec![],
+            sessions: vec![],
+            daily: vec![],
+            plan: None,
+        };
+
+        merge_antigravity(&mut summary, &live).expect("merge live status");
+
+        assert_eq!(summary["totals"]["totalTokens"], 120);
+        assert_eq!(summary["agents"][0]["totalTokens"], 70);
+        assert_eq!(summary["models"][0]["totalTokens"], 70);
     }
 
     #[test]
