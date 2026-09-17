@@ -17,6 +17,8 @@ import {
   isTimelineCacheFresh,
   loadQuotaHistory,
   resetWindowStartDate,
+  refreshStaticTimelineFreshness,
+  shouldRefreshTimelineInBackground,
   timelinePeriodEntries,
   updateCachedReportsFromToday,
   subscriptionPresentation,
@@ -123,7 +125,49 @@ test("a fresh today report advances every timeline that contains today", () => {
   assert.deepEqual(cache.ytd.reportData.daily, [{ date: "2026-09-16", cost: 3, tokens: 30 }]);
   assert.equal(cache.ytd.updatedAt, 500);
   assert.deepEqual(cache.yesterday.reportData.totals, { totalCost: 5, totalTokens: 50 });
-  assert.equal(cache.yesterday.updatedAt, 1);
+  assert.equal(cache.yesterday.updatedAt, 500);
+});
+
+test("keeps yesterday fresh without rescanning during the same local day", () => {
+  const cache = {
+    yesterday: {
+      reportData: { totals: { totalCost: 5 } },
+      updatedAt: new Date(2026, 8, 16, 8, 0).getTime(),
+    },
+  };
+  const refreshedAt = new Date(2026, 8, 16, 23, 30).getTime();
+
+  refreshStaticTimelineFreshness(cache, refreshedAt);
+
+  assert.equal(cache.yesterday.updatedAt, refreshedAt);
+});
+
+test("leaves yesterday stale after local midnight so it can be rescanned", () => {
+  const originalUpdatedAt = new Date(2026, 8, 16, 23, 59).getTime();
+  const cache = {
+    yesterday: {
+      reportData: { totals: { totalCost: 5 } },
+      updatedAt: originalUpdatedAt,
+    },
+  };
+
+  refreshStaticTimelineFreshness(cache, new Date(2026, 8, 17, 0, 1).getTime());
+
+  assert.equal(cache.yesterday.updatedAt, originalUpdatedAt);
+});
+
+test("refreshes yesterday in the background only after local midnight", () => {
+  const yesterdayEntry = { updatedAt: new Date(2026, 8, 16, 23, 59).getTime() };
+
+  assert.equal(
+    shouldRefreshTimelineInBackground("yesterday", yesterdayEntry, new Date(2026, 8, 16, 23, 59, 30).getTime()),
+    false,
+  );
+  assert.equal(
+    shouldRefreshTimelineInBackground("yesterday", yesterdayEntry, new Date(2026, 8, 17, 0, 1).getTime()),
+    true,
+  );
+  assert.equal(shouldRefreshTimelineInBackground("month", yesterdayEntry), false);
 });
 
 test("a newly detected agent is copied once into older timeline caches", () => {

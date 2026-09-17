@@ -41,6 +41,29 @@ export function isTimelineCacheFresh(entry, now = Date.now()) {
   return Number.isFinite(entry?.updatedAt) && now - entry.updatedAt <= 5 * 60 * 1000;
 }
 
+function isSameLocalDay(leftTimestamp, rightTimestamp) {
+  const left = new Date(leftTimestamp);
+  const right = new Date(rightTimestamp);
+  return left.getFullYear() === right.getFullYear()
+    && left.getMonth() === right.getMonth()
+    && left.getDate() === right.getDate();
+}
+
+export function refreshStaticTimelineFreshness(periodCache, updatedAt = Date.now()) {
+  const yesterday = periodCache.yesterday;
+  if (!Number.isFinite(yesterday?.updatedAt)) return;
+  if (isSameLocalDay(yesterday.updatedAt, updatedAt)) {
+    yesterday.updatedAt = updatedAt;
+  }
+}
+
+export function shouldRefreshTimelineInBackground(period, entry, now = Date.now()) {
+  if (!entry) return true;
+  return period === "yesterday"
+    && Number.isFinite(entry.updatedAt)
+    && !isSameLocalDay(entry.updatedAt, now);
+}
+
 export function timelinePeriodEntries(periodLabels, includeResetToDate = true) {
   return Object.entries(periodLabels).filter(([period]) => includeResetToDate || period !== "rtd");
 }
@@ -117,6 +140,7 @@ function applyRowsDelta(targetRows, freshRows, previousRows, key) {
 export function updateCachedReportsFromToday(periodCache, freshToday, updatedAt = Date.now()) {
   const previousToday = periodCache.today?.reportData;
   periodCache.today = { reportData: structuredClone(freshToday), antigravityData: null, updatedAt };
+  refreshStaticTimelineFreshness(periodCache, updatedAt);
   if (!previousToday) return;
 
   for (const [period, entry] of Object.entries(periodCache)) {
