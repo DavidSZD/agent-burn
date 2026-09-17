@@ -21,6 +21,7 @@ import {
   shouldRefreshTimelineInBackground,
   timelinePeriodEntries,
   updateCachedReportsFromToday,
+  updateCacheFromAllSnapshot,
   subscriptionPresentation,
   visibleTokenBreakdownEntries,
 } from "./ui-utils.js";
@@ -126,6 +127,21 @@ test("a fresh today report advances every timeline that contains today", () => {
   assert.equal(cache.ytd.updatedAt, 500);
   assert.deepEqual(cache.yesterday.reportData.totals, { totalCost: 5, totalTokens: 50 });
   assert.equal(cache.yesterday.updatedAt, 500);
+});
+
+test("a backend all-time snapshot refreshes the all-time cache without replacing other timelines", () => {
+  const today = { reportData: { totals: { totalCost: 2 } }, updatedAt: 10 };
+  const cache = {
+    all: { reportData: { totals: { totalCost: 8 } }, updatedAt: 10 },
+    today,
+  };
+  const freshAll = { totals: { totalCost: 12 }, subscription: { agents: [] } };
+
+  const entry = updateCacheFromAllSnapshot(cache, freshAll, 500);
+
+  assert.equal(entry, cache.all);
+  assert.deepEqual(cache.all, { reportData: freshAll, antigravityData: null, updatedAt: 500 });
+  assert.equal(cache.today, today);
 });
 
 test("keeps yesterday fresh without rescanning during the same local day", () => {

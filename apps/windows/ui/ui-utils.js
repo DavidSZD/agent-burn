@@ -200,6 +200,16 @@ export function updateCachedReportsFromToday(periodCache, freshToday, updatedAt 
   }
 }
 
+export function updateCacheFromAllSnapshot(periodCache, freshAll, updatedAt = Date.now()) {
+  const entry = {
+    reportData: structuredClone(freshAll),
+    antigravityData: null,
+    updatedAt,
+  };
+  periodCache.all = entry;
+  return entry;
+}
+
 export function timelinePreloadOrder(periods, activePeriod) {
   return periods.filter((period) => period !== activePeriod);
 }

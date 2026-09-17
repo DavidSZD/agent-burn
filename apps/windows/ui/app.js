@@ -20,6 +20,7 @@ import {
   subscriptionPresentation,
   visibleTokenBreakdownEntries,
   updateCachedReportsFromToday,
+  updateCacheFromAllSnapshot,
 } from "./ui-utils.js";
 
 // Agent Burn Windows - Client Web / Tauri v2
@@ -231,9 +232,8 @@ function applyBackendRefresh(data, refreshedAtMs) {
   latestLiveQuotaReport = data;
   updateTopBarQuotaPill(data);
 
+  const entry = updateCacheFromAllSnapshot(periodCache, data, refreshedAtMs);
   if (currentPeriod === "all") {
-    const entry = { reportData: structuredClone(data), antigravityData: null, updatedAt: refreshedAtMs };
-    periodCache.all = entry;
     reportData = entry.reportData;
     fullReportData = entry.reportData;
   } else {
@@ -2195,22 +2195,6 @@ function renderSubscriptions() {
 }
 
 // ==========================================================================
-// Rafraîchissement automatique réel
-// ==========================================================================
-let refreshIntervalTimer = null;
-function setupAutoRefresh() {
-  if (refreshIntervalTimer) {
-    clearInterval(refreshIntervalTimer);
-    refreshIntervalTimer = null;
-  }
-  const mins = Math.max(1, appSettings?.refreshMinutes || 1);
-  refreshIntervalTimer = setInterval(async () => {
-    for (const key in harnessCache) delete harnessCache[key];
-    await refreshAllTimelineCaches(false);
-  }, mins * 60 * 1000);
-}
-
-// ==========================================================================
 // Paramètres (Settings)
 // ==========================================================================
 function initSettings() {
@@ -2255,7 +2239,6 @@ function initSettings() {
     .then((settings) => {
       appSettings = settings;
       applySettingsToControls();
-      setupAutoRefresh();
       return settings;
     })
     .catch((error) => {
@@ -2303,7 +2286,6 @@ async function saveSettingsFromControls() {
     antigravityUltraPrice: Number(document.getElementById("settings-antigravity-ultra-price")?.value) || null,
   };
   appSettings = await invokeTauri("set_settings", { settings });
-  setupAutoRefresh();
   for (const key in harnessCache) delete harnessCache[key];
   await loadData(true);
   void preloadTimelines();
