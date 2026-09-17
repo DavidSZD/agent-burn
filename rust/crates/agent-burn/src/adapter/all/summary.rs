@@ -698,6 +698,10 @@ struct ModelTotal {
     model: String,
     cost: f64,
     tokens: u64,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_write_tokens: u64,
+    cache_read_tokens: u64,
 }
 
 struct DayTotal {
@@ -781,11 +785,19 @@ impl Summary {
                             model: breakdown.model_name.clone(),
                             cost: 0.0,
                             tokens: 0,
+                            input_tokens: 0,
+                            output_tokens: 0,
+                            cache_write_tokens: 0,
+                            cache_read_tokens: 0,
                         });
                         models.len() - 1
                     });
                 models[index].cost += breakdown.cost;
                 models[index].tokens += tokens;
+                models[index].input_tokens += breakdown.input_tokens;
+                models[index].output_tokens += breakdown.output_tokens;
+                models[index].cache_write_tokens += breakdown.cache_creation_tokens;
+                models[index].cache_read_tokens += breakdown.cache_read_tokens;
             }
         }
 
@@ -845,6 +857,10 @@ impl Summary {
                     "model": model.model,
                     "totalCost": json_float(model.cost),
                     "totalTokens": model.tokens,
+                    "inputTokens": model.input_tokens,
+                    "outputTokens": model.output_tokens,
+                    "cacheWriteTokens": model.cache_write_tokens,
+                    "cacheReadTokens": model.cache_read_tokens,
                     "percentage": json_float(percentage(model.cost, self.total_cost)),
                 }))
                 .collect::<Vec<_>>(),
@@ -1276,6 +1292,23 @@ mod tests {
         assert_eq!(output["daily"][0]["cost"], 11.0);
         assert_eq!(output["agents"][0]["daily"][0]["cost"], 9.0);
         assert_eq!(output["agents"][0]["daily"][0]["date"], "2026-01-01");
+    }
+
+    #[test]
+    fn model_json_exposes_each_token_class() {
+        let rows = vec![day_row(
+            12.0,
+            100,
+            Vec::new(),
+            vec![model_token_breakdown("test-model", 10, 20, 30, 40, 12.0)],
+        )];
+
+        let output = Summary::from_rows(&rows).to_json();
+
+        assert_eq!(output["models"][0]["inputTokens"], 10);
+        assert_eq!(output["models"][0]["outputTokens"], 20);
+        assert_eq!(output["models"][0]["cacheWriteTokens"], 30);
+        assert_eq!(output["models"][0]["cacheReadTokens"], 40);
     }
 
     #[test]
