@@ -1100,6 +1100,7 @@ fn agent_color(agent: &str) -> Color {
         "codex" => Color::Green,
         "cursor" => Color::Red,
         "gemini" => Color::Blue,
+        "antigravity" => Color::Blue,
         "droid" => Color::Yellow,
         _ => Color::Cyan,
     }

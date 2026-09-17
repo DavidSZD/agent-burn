@@ -399,6 +399,22 @@ impl PricingMap {
             })
     }
 
+    pub(crate) fn find_exact_with_fallback(&self, model: &str) -> Option<Pricing> {
+        self.entries
+            .get(model)
+            .copied()
+            .or_else(|| {
+                self.enable_models_dev_fallback
+                    .then(|| models_dev_pricing().and_then(|map| map.entries.get(model).copied()))
+                    .flatten()
+            })
+            .or_else(|| {
+                self.enable_embedded_models_dev_fallback
+                    .then(|| embedded_models_dev_pricing().entries.get(model).copied())
+                    .flatten()
+            })
+    }
+
     fn find_entry_or_alias(&self, model: &str) -> Option<Pricing> {
         self.find_entry(model)
             .or_else(|| pricing_alias(model).and_then(|alias| self.find_entry(alias)))
@@ -567,6 +583,7 @@ impl PricingMap {
         for (model, input, output, cache_create, cache_read) in [
             ("gpt-5.6-luna", 0.2e-6, 1.2e-6, 0.25e-6, 0.02e-6),
             ("gpt-6-astra", 10e-6, 50e-6, 12.5e-6, 1e-6),
+            ("gemini-3.6-flash", 0.75e-6, 3.75e-6, 0.9375e-6, 0.075e-6),
         ] {
             self.entries.insert(
                 model.to_string(),

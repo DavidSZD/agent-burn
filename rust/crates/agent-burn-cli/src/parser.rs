@@ -131,6 +131,7 @@ fn parse_summary_command(
                     if !matches!(
                         name,
                         "claude"
+                            | "antigravity"
                             | "codex"
                             | "opencode"
                             | "amp"

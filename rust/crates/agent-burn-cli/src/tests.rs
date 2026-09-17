@@ -45,6 +45,15 @@ fn summary_accepts_specific_agents_without_becoming_a_harness_report() {
 }
 
 #[test]
+fn summary_accepts_antigravity_as_a_unified_agent() {
+    let cli = parse(&["agent-burn", "summary", "--agents", "antigravity", "--json"]);
+    let Some(Command::Summary(args)) = cli.command else {
+        panic!("expected summary")
+    };
+    assert_eq!(args.shared.agents, ["antigravity"]);
+}
+
+#[test]
 fn summary_rejects_unknown_or_empty_agents() {
     for agents in ["", "codex,", "typo"] {
         assert!(

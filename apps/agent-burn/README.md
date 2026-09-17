@@ -34,7 +34,7 @@ agent-burn summary --json
 
 macOS app: menu-bar quota for Codex, Claude, and Cursor, plus a dashboard across detected harnesses. Build locally with `just macos::run`. Details: [apps/macos](https://github.com/Melvynx/agent-burn/tree/main/apps/macos).
 
-Windows app: system-tray quota tooltip, live background polling, and responsive dashboard for Claude, Codex, Cursor, Antigravity, and Gemini. Build locally with `just windows::build` or run it with `just windows::run`. Antigravity support is provided by the Windows desktop layer and reads local data under `%USERPROFILE%\.gemini\antigravity`. Details: [apps/windows](https://github.com/DavidSZD/agent-burn/tree/main/apps/windows).
+Windows app: system-tray quota tooltip, live background polling, and responsive dashboard for Claude, Codex, Cursor, Antigravity, and Gemini. Build locally with `just windows::build` or run it with `just windows::run`. Antigravity usage is loaded by the shared CLI adapter; the Windows layer adds live plan and quota status. Details: [apps/windows](https://github.com/DavidSZD/agent-burn/tree/main/apps/windows).
 
 ## Subscription Value
 
@@ -78,6 +78,7 @@ Reads local logs. Nothing is uploaded.
 | Claude Code | `~/.claude`, `~/.config/claude/projects` |
 | Codex | `${CODEX_HOME:-~/.codex}` |
 | Cursor | Cursor `state.vscdb` plus the signed-in dashboard usage API |
+| Antigravity | `~/.gemini/antigravity*/conversations/*.db`, `~/.config/antigravity/conversations/*.db` |
 
 ## Acknowledgments
 

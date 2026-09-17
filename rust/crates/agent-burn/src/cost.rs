@@ -89,6 +89,13 @@ fn calculate_cost_from_tokens(
     let Some(pricing) = pricing.and_then(|pricing| pricing.find(model)) else {
         return 0.0;
     };
+    calculate_cost_from_pricing(usage, pricing)
+}
+
+pub(crate) fn calculate_cost_from_pricing(
+    usage: crate::TokenUsageRaw,
+    pricing: crate::pricing::Pricing,
+) -> f64 {
     let multiplier = if matches!(usage.speed, Some(Speed::Fast)) {
         pricing.fast_multiplier
     } else {

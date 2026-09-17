@@ -449,6 +449,7 @@ pub(super) fn agent_label(agent: &str) -> &str {
     match agent {
         "all" => "All",
         "claude" => "Claude",
+        "antigravity" => "Antigravity",
         "codex" => "Codex",
         "opencode" => "OpenCode",
         "amp" => "Amp",
