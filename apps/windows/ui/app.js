@@ -7,6 +7,7 @@ import {
   isTimelineCacheFresh,
   loadQuotaHistory,
   resetWindowStartDate,
+  shouldRefreshTimelineInBackground,
   timelineSelection,
   timelinePreloadOrder,
   timelinePeriodEntries,
@@ -310,7 +311,7 @@ async function preloadTimelines(refreshExisting = false) {
   const periods = timelinePreloadOrder(Object.keys(PERIOD_LABELS), currentPeriod);
   for (const period of periods) {
     if (period === "rtd") continue;
-    if (!refreshExisting && periodCache[period]) continue;
+    if (!refreshExisting && !shouldRefreshTimelineInBackground(period, periodCache[period])) continue;
     try {
       await requestTimeline(period, refreshExisting);
       updateTimelineAvailability();
