@@ -41,6 +41,24 @@ export function isTimelineCacheFresh(entry, now = Date.now()) {
   return Number.isFinite(entry?.updatedAt) && now - entry.updatedAt <= 5 * 60 * 1000;
 }
 
+export function latestTimelineUpdatedAt(periodCache) {
+  const timestamps = Object.values(periodCache || {})
+    .map((entry) => entry?.updatedAt)
+    .filter(Number.isFinite);
+  return timestamps.length > 0 ? Math.max(...timestamps) : null;
+}
+
+export function waitForInitialRefresh(
+  initialRefresh,
+  timeoutMs = 125_000,
+  schedule = setTimeout,
+) {
+  return Promise.race([
+    initialRefresh,
+    new Promise((resolve) => schedule(resolve, timeoutMs)),
+  ]);
+}
+
 function isSameLocalDay(leftTimestamp, rightTimestamp) {
   const left = new Date(leftTimestamp);
   const right = new Date(rightTimestamp);
@@ -59,9 +77,10 @@ export function refreshStaticTimelineFreshness(periodCache, updatedAt = Date.now
 
 export function shouldRefreshTimelineInBackground(period, entry, now = Date.now()) {
   if (!entry) return true;
-  return period === "yesterday"
-    && Number.isFinite(entry.updatedAt)
-    && !isSameLocalDay(entry.updatedAt, now);
+  if (period === "yesterday") {
+    return Number.isFinite(entry.updatedAt) && !isSameLocalDay(entry.updatedAt, now);
+  }
+  return !isTimelineCacheFresh(entry, now);
 }
 
 export function timelinePeriodEntries(periodLabels, includeResetToDate = true) {

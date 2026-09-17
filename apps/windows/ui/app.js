@@ -5,6 +5,7 @@ import {
   escapeHtml,
   getRestoredPeriod,
   isTimelineCacheFresh,
+  latestTimelineUpdatedAt,
   loadQuotaHistory,
   resetWindowStartDate,
   shouldRefreshTimelineInBackground,
@@ -21,6 +22,7 @@ import {
   visibleTokenBreakdownEntries,
   updateCachedReportsFromToday,
   updateCacheFromAllSnapshot,
+  waitForInitialRefresh,
 } from "./ui-utils.js";
 
 // Agent Burn Windows - Client Web / Tauri v2
@@ -64,7 +66,7 @@ let latestLiveQuotaReport = null;
 let currentSpendGranularity = "monthly"; // "Monthly" actif par défaut sur les captures
 let detectedAgents = [];
 const allKnownAgents = new Set();
-let lastUpdatedTime = Date.now();
+let lastUpdatedTime = 0;
 let lastBackendRefreshMs = 0;
 let lastBackendRevisionMs = 0;
 let appSettings = null;
@@ -75,6 +77,11 @@ const saveReportCache = createCoalescedSaver((data) => invokeTauri("save_report_
 const refreshAllTimelineCaches = createSingleFlight(performAllTimelineRefresh);
 const harnessCache = {};
 const summaryRequestGate = new RequestGate();
+const activeRefreshSources = new Set();
+let resolveInitialBackendRefresh;
+const initialBackendRefresh = new Promise((resolve) => {
+  resolveInitialBackendRefresh = resolve;
+});
 
 // Libellés des périodes (alignés avec UsagePeriod de macOS)
 const PERIOD_LABELS = {
@@ -208,8 +215,8 @@ window.addEventListener("DOMContentLoaded", async () => {
   updateTimelineAvailability();
   // On ne bloque le premier affichage que s'il n'existe encore aucune donnée.
   if (!periodCache[currentPeriod]) await loadData(true);
-  // Fill every timeline cache without changing the currently visible period.
-  void preloadTimelines();
+  // Let live quotas update first, then refresh every stale timeline in the background.
+  void refreshStaleTimelinesAfterInitialBackend();
 });
 
 function initBackendEvents() {
@@ -245,12 +252,15 @@ function applyBackendRefresh(data, refreshedAtMs) {
 
 async function syncBackendRefresh(data, refreshedAtMs) {
   if (!applyBackendRefresh(data, refreshedAtMs)) return;
+  resolveInitialBackendRefresh();
   try {
     quotaHistoryData = await invokeTauri("get_quota_history");
   } catch (_) {}
   renderHarnessTabs();
   if (currentTab === "summary") renderSummary();
   else if (currentTab !== "settings") renderHarnessView(currentTab);
+  saveReportCache({ summary: reportData, periods: periodCache, currentPeriod })
+    .catch((error) => showStatusError(`Unable to save report cache: ${error}`));
 }
 
 function initBackendRefreshPolling() {
@@ -276,10 +286,7 @@ async function initColdStart() {
     const cached = await invokeTauri("get_report_cache");
     if (cached?.periods && typeof cached.periods === "object") {
       Object.assign(periodCache, cached.periods);
-      const restoredAt = Date.now();
-      for (const entry of Object.values(periodCache)) {
-        if (entry && !Number.isFinite(entry.updatedAt)) entry.updatedAt = restoredAt;
-      }
+      lastUpdatedTime = latestTimelineUpdatedAt(periodCache) || 0;
     }
     if (cached?.currentPeriod) {
       currentPeriod = getRestoredPeriod(cached.currentPeriod, Object.keys(PERIOD_LABELS));
@@ -483,7 +490,7 @@ async function switchPeriod(newPeriod) {
   const cacheKey = timelineCacheKey(currentPeriod);
   const selection = timelineSelection(periodCache, cacheKey, reportData, antigravityData);
   if (!selection.pending) {
-    setTimelineRefreshing(false);
+    setTimelineRefreshing(false, "timeline");
     reportData = mergeLiveSubscription(selection.reportData, latestLiveQuotaReport);
     antigravityData = selection.antigravityData;
     computeDetectedAgents(reportData, antigravityData);
@@ -491,20 +498,26 @@ async function switchPeriod(newPeriod) {
     if (currentTab === "summary") renderSummary();
     else if (currentTab !== "settings") renderHarnessView(currentTab);
     if (!isTimelineCacheFresh(periodCache[cacheKey])) {
-      setTimelineRefreshing(true);
+      setTimelineRefreshing(true, "timeline");
       void loadData(true);
     }
     return;
   }
 
-  setTimelineRefreshing(true);
+  setTimelineRefreshing(true, "timeline");
   await loadData(true);
 }
 
-function setTimelineRefreshing(refreshing) {
+function setTimelineRefreshing(refreshing, source = "timeline") {
+  if (refreshing) activeRefreshSources.add(source);
+  else activeRefreshSources.delete(source);
+  const active = activeRefreshSources.size > 0;
   document.querySelectorAll(".timeline-refresh-status").forEach((status) => {
-    status.hidden = !refreshing;
+    status.hidden = !active;
   });
+  const refreshButton = document.getElementById("refresh-btn");
+  refreshButton?.classList.toggle("is-refreshing", active);
+  refreshButton?.setAttribute("aria-busy", String(active));
 }
 
 function updateTimelineAvailability() {
@@ -622,12 +635,12 @@ async function loadData(force = false) {
   } catch (err) {
     showStatusError(`Unable to load usage: ${err}`);
   } finally {
-    if (summaryRequestGate.isCurrent(requestGeneration)) setTimelineRefreshing(false);
+    if (summaryRequestGate.isCurrent(requestGeneration)) setTimelineRefreshing(false, "timeline");
   }
 }
 
 async function performAllTimelineRefresh(showIndicator = false) {
-  if (showIndicator) setTimelineRefreshing(true);
+  if (showIndicator) setTimelineRefreshing(true, "manual");
   try {
     const previousToday = periodCache.today;
     const summary = await invokeTauri("get_summary", { range: "today" });
@@ -651,8 +664,18 @@ async function performAllTimelineRefresh(showIndicator = false) {
   } catch (error) {
     showStatusError(`Unable to refresh timelines: ${error}`);
   } finally {
-    if (showIndicator) setTimelineRefreshing(false);
+    if (showIndicator) setTimelineRefreshing(false, "manual");
   }
+}
+
+async function refreshStaleTimelinesAfterInitialBackend() {
+  await waitForInitialRefresh(initialBackendRefresh);
+  const cacheKey = timelineCacheKey(currentPeriod);
+  if (!isTimelineCacheFresh(periodCache[cacheKey])) {
+    setTimelineRefreshing(true, "timeline");
+    await loadData(true);
+  }
+  await preloadTimelines();
 }
 
 // Mise à jour de la pilule de quota dans le header
@@ -2343,6 +2366,10 @@ function initFooterTimer() {
   if (!el) return;
 
   setInterval(() => {
+    if (!lastUpdatedTime) {
+      el.textContent = "Waiting for first update";
+      return;
+    }
     const sec = Math.floor((Date.now() - lastUpdatedTime) / 1000);
     const staleAfter = (appSettings?.refreshMinutes || 1) * 60 + 30;
     const dot = document.querySelector("#quota-menu-pill .quota-dot");

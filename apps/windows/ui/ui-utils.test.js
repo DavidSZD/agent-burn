@@ -15,6 +15,7 @@ import {
   timelineSelection,
   timelinePreloadOrder,
   isTimelineCacheFresh,
+  latestTimelineUpdatedAt,
   loadQuotaHistory,
   resetWindowStartDate,
   refreshStaticTimelineFreshness,
@@ -22,6 +23,7 @@ import {
   timelinePeriodEntries,
   updateCachedReportsFromToday,
   updateCacheFromAllSnapshot,
+  waitForInitialRefresh,
   subscriptionPresentation,
   visibleTokenBreakdownEntries,
 } from "./ui-utils.js";
@@ -106,6 +108,24 @@ test("refreshes a selected timeline only after its five minute freshness window"
   assert.equal(isTimelineCacheFresh({ reportData: {} }, 2_000), false);
 });
 
+test("restoring a cache never invents a recent update time", () => {
+  assert.equal(latestTimelineUpdatedAt({ all: { reportData: {} }, today: { updatedAt: 42 } }), 42);
+  assert.equal(latestTimelineUpdatedAt({ all: { reportData: {} } }), null);
+});
+
+test("timeline preloading waits for the initial live refresh", async () => {
+  let release;
+  const initialRefresh = new Promise((resolve) => { release = resolve; });
+  let finished = false;
+  const waiting = waitForInitialRefresh(initialRefresh, 1_000, () => 0).then(() => { finished = true; });
+
+  await Promise.resolve();
+  assert.equal(finished, false);
+  release();
+  await waiting;
+  assert.equal(finished, true);
+});
+
 test("derives reset-to-date start from a weekly provider reset", () => {
   assert.equal(resetWindowStartDate("2026-09-23T04:34:22Z"), "2026-09-16");
   assert.equal(resetWindowStartDate(null, 48 * 60, new Date("2026-09-16T12:00:00Z")), "2026-09-14");
@@ -183,7 +203,17 @@ test("refreshes yesterday in the background only after local midnight", () => {
     shouldRefreshTimelineInBackground("yesterday", yesterdayEntry, new Date(2026, 8, 17, 0, 1).getTime()),
     true,
   );
-  assert.equal(shouldRefreshTimelineInBackground("month", yesterdayEntry), false);
+  assert.equal(
+    shouldRefreshTimelineInBackground("month", yesterdayEntry, new Date(2026, 8, 16, 23, 59, 30).getTime()),
+    false,
+  );
+});
+
+test("preloads an old dynamic timeline before the user switches to it", () => {
+  const now = new Date(2026, 8, 17, 12, 0).getTime();
+
+  assert.equal(shouldRefreshTimelineInBackground("ytd", { updatedAt: now - 6 * 60 * 1000 }, now), true);
+  assert.equal(shouldRefreshTimelineInBackground("ytd", { updatedAt: now - 4 * 60 * 1000 }, now), false);
 });
 
 test("a newly detected agent is copied once into older timeline caches", () => {

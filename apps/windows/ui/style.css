@@ -326,6 +326,10 @@ body {
   border-color: var(--border);
 }
 
+.toolbar-btn.is-refreshing svg {
+  animation: timeline-spin 0.8s linear infinite;
+}
+
 /* ==========================================================================
    2. Main Content & Page Header
    ========================================================================== */
