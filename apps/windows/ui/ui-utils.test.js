@@ -543,6 +543,39 @@ test("partial source refresh replaces only that source and preserves slow provid
   assert.equal(periods.all.updatedAt, 200);
 });
 
+test("partial source refresh removes stale rows when a source returns empty data", () => {
+  const periods = {
+    all: {
+      reportData: {
+        totals: { totalCost: 12, totalTokens: 120 },
+        agents: [
+          { agent: "codex", totalCost: 10, totalTokens: 100 },
+          { agent: "antigravity", totalCost: 2, totalTokens: 20 },
+        ],
+        models: [],
+        subscription: {
+          agents: [
+            { agent: "codex", plan: "Free" },
+            { agent: "antigravity", plan: "Pro" },
+          ],
+        },
+      },
+      updatedAt: 100,
+    },
+  };
+
+  const merged = mergeSourceSnapshot(
+    periods,
+    { agents: [], models: [], subscription: { agents: [] } },
+    "antigravity",
+    200,
+  );
+
+  assert.deepEqual(merged.agents.map((agent) => agent.agent), ["codex"]);
+  assert.deepEqual(merged.subscription.agents.map((agent) => agent.agent), ["codex"]);
+  assert.deepEqual(periods.all.reportData.agents.map((agent) => agent.agent), ["codex"]);
+});
+
 test("partial source refresh merges every returned timeline", () => {
   const periods = {
     all: {

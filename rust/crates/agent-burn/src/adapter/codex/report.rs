@@ -265,6 +265,7 @@ pub(super) fn print_table_from_groups(
         first_column,
         "Models",
         "Input",
+        "Cache Creation",
         "Output",
         "Reasoning",
         "Cache Read",
@@ -280,6 +281,7 @@ pub(super) fn print_table_from_groups(
         Align::Right,
         Align::Right,
         Align::Right,
+        Align::Right,
     ];
     if shared.no_cost {
         headers.pop();
@@ -289,6 +291,7 @@ pub(super) fn print_table_from_groups(
         .with_terminal_width(crate::terminal_width())
         .with_date_compaction(true);
     let mut total_input = 0;
+    let mut total_cache_creation = 0;
     let mut total_cached = 0;
     let mut total_output = 0;
     let mut total_reasoning = 0;
@@ -302,6 +305,7 @@ pub(super) fn print_table_from_groups(
         );
         let cost = calculate_group_cost(group, pricing, speed);
         total_input += input_tokens;
+        total_cache_creation += group.cache_write_input_tokens;
         total_cached += group.cached_input_tokens;
         total_output += group.output_tokens;
         total_reasoning += group.reasoning_output_tokens;
@@ -312,6 +316,7 @@ pub(super) fn print_table_from_groups(
             label.clone(),
             models,
             format_number(input_tokens),
+            format_number(group.cache_write_input_tokens),
             format_number(group.output_tokens),
             format_number(group.reasoning_output_tokens),
             format_number(group.cached_input_tokens),
@@ -328,6 +333,7 @@ pub(super) fn print_table_from_groups(
         color(shared, "Total", Color::Yellow),
         String::new(),
         color(shared, format_number(total_input), Color::Yellow),
+        color(shared, format_number(total_cache_creation), Color::Yellow),
         color(shared, format_number(total_output), Color::Yellow),
         color(shared, format_number(total_reasoning), Color::Yellow),
         color(shared, format_number(total_cached), Color::Yellow),

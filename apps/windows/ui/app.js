@@ -278,7 +278,12 @@ function initBackendEvents() {
     const refreshedAtMs = Number(payload?.refreshedAtMs);
     if (!payload?.report || !Number.isFinite(generation) || generation < activeRefreshGeneration) return;
     activeRefreshGeneration = Math.max(activeRefreshGeneration, generation);
-    const merged = mergeSourceSnapshot(periodCache, payload.report, refreshedAtMs);
+    const merged = mergeSourceSnapshot(
+      periodCache,
+      payload.report,
+      typeof payload.source === "string" ? payload.source : null,
+      refreshedAtMs,
+    );
     lastUpdatedTime = refreshedAtMs;
     latestLiveQuotaReport = merged;
     reportData = currentPeriod === "all"

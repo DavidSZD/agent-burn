@@ -346,13 +346,23 @@ export function updateCacheFromTimelineSnapshot(periodCache, snapshot, updatedAt
 // Replace only the provider rows present in a partial refresh. This keeps a
 // slow provider's last valid values visible while a faster provider publishes
 // its new report, without double-counting shared model names.
-export function mergeSourceSnapshot(periodCache, sourceSnapshot, updatedAt = Date.now()) {
+const SOURCE_AGENT_NAMES = {
+  fast: new Set([
+    "codex", "claude", "cursor", "gemini", "hermes", "opencode", "openclaw",
+    "pi", "kimi", "qwen", "amp", "codebuff", "droid", "goose", "kilo", "copilot",
+  ]),
+  antigravity: new Set(["antigravity"]),
+};
+
+export function mergeSourceSnapshot(periodCache, sourceSnapshot, sourceOrUpdatedAt = null, updatedAt = Date.now()) {
+  const source = typeof sourceOrUpdatedAt === "string" ? sourceOrUpdatedAt : null;
+  if (typeof sourceOrUpdatedAt === "number") updatedAt = sourceOrUpdatedAt;
   const current = periodCache.all?.reportData || {
     totals: { totalCost: 0, totalTokens: 0 },
     agents: [],
     models: [],
   };
-  const merged = mergeSourceReports(current, sourceSnapshot);
+  const merged = mergeSourceReports(current, sourceSnapshot, source);
   periodCache.all = {
     reportData: merged,
     antigravityData: periodCache.all?.antigravityData || null,
@@ -368,10 +378,13 @@ export function mergeSourceSnapshot(periodCache, sourceSnapshot, updatedAt = Dat
   return merged;
 }
 
-function mergeSourceReports(currentReport, sourceReport) {
+function mergeSourceReports(currentReport, sourceReport, source = null) {
   const current = structuredClone(currentReport || {});
   const incomingAgents = Array.isArray(sourceReport?.agents) ? sourceReport.agents : [];
   const sourceNames = new Set(incomingAgents.map((agent) => agent?.agent).filter(Boolean));
+  if (sourceNames.size === 0 && source && SOURCE_AGENT_NAMES[source]) {
+    for (const agentName of SOURCE_AGENT_NAMES[source]) sourceNames.add(agentName);
+  }
   current.agents = (Array.isArray(current.agents) ? current.agents : [])
     .filter((agent) => !sourceNames.has(agent?.agent));
   current.agents.push(...structuredClone(incomingAgents));
@@ -400,6 +413,7 @@ function mergeSourceReports(currentReport, sourceReport) {
       current.timelineReports[period] = mergeSourceReports(
         current.timelineReports[period] || { totals: { totalCost: 0, totalTokens: 0 }, agents: [], models: [] },
         sourceTimeline,
+        source,
       );
     }
   }
@@ -414,6 +428,9 @@ function mergeSourceReports(currentReport, sourceReport) {
       ? sourceReport.subscription.agents
       : [];
     const names = new Set(incomingSubscriptions.map((agent) => agent?.agent).filter(Boolean));
+    if (names.size === 0 && source && SOURCE_AGENT_NAMES[source]) {
+      for (const agentName of SOURCE_AGENT_NAMES[source]) names.add(agentName);
+    }
     const existingSubscriptions = Array.isArray(existingSubscription.agents)
       ? existingSubscription.agents.filter((agent) => !names.has(agent?.agent))
       : [];

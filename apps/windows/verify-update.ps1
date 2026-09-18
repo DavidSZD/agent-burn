@@ -59,14 +59,9 @@ foreach ($file in $beforeFiles | Where-Object Exists) {
     if (-not (Test-Path -LiteralPath $afterPath)) {
         throw "Update removed $($file.Name). Backup: $backup"
     }
-    if ((Get-Item -LiteralPath $afterPath).Length -eq 0 -and $file.Length -gt 0) {
-        throw "Update truncated $($file.Name). Backup: $backup"
-    }
-    if ($file.Name -eq "settings.json") {
-        $afterHash = (Get-FileHash -LiteralPath $afterPath -Algorithm SHA256).Hash
-        if ($afterHash -ne $file.Hash) {
-            throw "Update changed settings.json. Backup: $backup"
-        }
+    $afterHash = (Get-FileHash -LiteralPath $afterPath -Algorithm SHA256).Hash
+    if ($afterHash -ne $file.Hash) {
+        throw "Update changed $($file.Name). Backup: $backup"
     }
     try {
         Get-Content -LiteralPath $afterPath -Raw | ConvertFrom-Json | Out-Null

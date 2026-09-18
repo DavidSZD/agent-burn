@@ -130,6 +130,7 @@ fn dedupe_codex_events(events: &mut Vec<CodexTokenUsageEvent>) {
             event.model.as_deref().map(CompactString::new),
             event.input_tokens,
             event.cached_input_tokens,
+            event.cache_write_input_tokens,
             event.output_tokens,
             event.reasoning_output_tokens,
             event.total_tokens,
@@ -169,6 +170,16 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].session_id, "session-a");
+    }
+
+    #[test]
+    fn keeps_events_that_only_differ_in_cache_write_tokens() {
+        let mut events = vec![codex_event("session-a"), codex_event("session-b")];
+        events[1].cache_write_input_tokens = 7;
+
+        dedupe_codex_events(&mut events);
+
+        assert_eq!(events.len(), 2);
     }
 
     #[test]

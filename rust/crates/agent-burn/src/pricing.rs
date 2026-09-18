@@ -447,7 +447,7 @@ impl PricingMap {
     }
 
     pub(crate) fn find(&self, model: &str) -> Option<Pricing> {
-        let key = normalized_pricing_key(model).into_owned();
+        let key = model.to_string();
         if let Ok(cache) = self.lookup_cache.lock() {
             if let Some(value) = cache.get(&key) {
                 return *value;
@@ -532,18 +532,22 @@ impl PricingMap {
     }
 
     pub(crate) fn long_context_threshold(&self, model: &str) -> u64 {
-        self.long_context_threshold_entry(model)
+        let canonical_model = pricing_alias(model).unwrap_or(model);
+        self.long_context_threshold_entry(canonical_model)
             .or_else(|| {
                 self.enable_models_dev_fallback
                     .then(|| {
-                        models_dev_pricing()
-                            .and_then(|pricing| pricing.long_context_threshold_entry(model))
+                        models_dev_pricing().and_then(|pricing| {
+                            pricing.long_context_threshold_entry(canonical_model)
+                        })
                     })
                     .flatten()
             })
             .or_else(|| {
                 self.enable_embedded_models_dev_fallback
-                    .then(|| embedded_models_dev_pricing().long_context_threshold_entry(model))
+                    .then(|| {
+                        embedded_models_dev_pricing().long_context_threshold_entry(canonical_model)
+                    })
                     .flatten()
             })
             .unwrap_or(200_000)
@@ -2258,6 +2262,7 @@ mod tests {
         assert_eq!(reserve.output, luna.output);
         assert_eq!(reserve.cache_read, luna.cache_read);
         assert_eq!(reserve.fast_multiplier, luna.fast_multiplier);
+        assert_eq!(pricing.long_context_threshold("gpt-reserve"), 272_000);
     }
 
     #[test]

@@ -181,21 +181,22 @@ fn authoritative_quota_window(quota: Option<&Value>) -> Option<(f64, Option<Stri
             .collect();
     }
 
-    let minimum = candidates
+    let tightest = candidates
         .iter()
         .filter_map(|bucket| {
-            bucket
+            let remaining = bucket
                 .get("remainingFraction")
                 .and_then(Value::as_f64)
-                .map(|fraction| (fraction * 100.0).clamp(0.0, 100.0))
+                .map(|fraction| (fraction * 100.0).clamp(0.0, 100.0))?;
+            Some((remaining, bucket))
         })
-        .min_by(f64::total_cmp)?;
-    let reset_time = candidates
-        .iter()
-        .filter_map(|bucket| bucket.get("resetTime").and_then(Value::as_str))
-        .min()
+        .min_by(|left, right| left.0.total_cmp(&right.0))?;
+    let reset_time = tightest
+        .1
+        .get("resetTime")
+        .and_then(Value::as_str)
         .map(str::to_owned);
-    Some((minimum, reset_time))
+    Some((tightest.0, reset_time))
 }
 
 fn update_window(
@@ -521,24 +522,31 @@ fn refresh_access_token(refresh_token: &str) -> Option<String> {
             form_encode(&client_secret),
             form_encode(refresh_token),
         );
-        let mut response = agent
+        let Ok(mut response) = agent
             .post(TOKEN_ENDPOINT)
             .header("Content-Type", "application/x-www-form-urlencoded")
             .send(form.as_bytes())
-            .ok()?;
+        else {
+            continue;
+        };
         if response.status().as_u16() != 200 {
             continue;
         }
-        let body = response
+        let Ok(body) = response
             .body_mut()
             .with_config()
             .limit(MAX_RESPONSE_BYTES)
             .read_to_string()
-            .ok()?;
-        let json = serde_json::from_str::<Value>(&body).ok()?;
-        if let Some(access_token) = json.get("access_token").and_then(Value::as_str) {
-            return Some(access_token.to_string());
-        }
+        else {
+            continue;
+        };
+        let Ok(json) = serde_json::from_str::<Value>(&body) else {
+            continue;
+        };
+        let Some(access_token) = json.get("access_token").and_then(Value::as_str) else {
+            continue;
+        };
+        return Some(access_token.to_string());
     }
     None
 }
@@ -868,6 +876,24 @@ mod tests {
         assert_eq!(
             plan.session_reset_time.as_deref(),
             Some("2026-09-18T09:34:22Z")
+        );
+    }
+
+    #[test]
+    fn weekly_reset_time_belongs_to_the_tightest_weekly_bucket() {
+        let load = json!({"currentTier": {"id": "pro-tier", "name": "Google AI Pro"}});
+        let quota = json!({"buckets": [
+            {"window": "weekly", "remainingFraction": 0.86, "resetTime": "2026-09-23T04:34:22Z"},
+            {"window": "weekly", "remainingFraction": 0.94, "resetTime": "2026-09-22T04:34:22Z"}
+        ]});
+
+        let plan = build_plan_from_responses(&load, None, None, Some(&quota))
+            .expect("cloud response should produce a plan");
+
+        assert_eq!(plan.weekly_remaining, Some(86.0));
+        assert_eq!(
+            plan.weekly_reset_time.as_deref(),
+            Some("2026-09-23T04:34:22Z")
         );
     }
 
