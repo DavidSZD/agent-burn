@@ -1,7 +1,7 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::summary::format_compact_tokens;
-use crate::{cli::SharedArgs, format_currency, json_float, Color};
+use crate::{Color, cli::SharedArgs, format_currency, json_float};
 
 /// Average days per month, for normalising a window's value to a monthly figure.
 const DAYS_PER_MONTH: f64 = 30.4375;

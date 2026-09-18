@@ -580,8 +580,23 @@ mod tests {
         let schema = generated_schema();
 
         for key in [
-            "amp", "claude", "codebuff", "codex", "copilot", "cursor", "droid", "gemini", "goose",
-            "hermes", "kilo", "kimi", "openclaw", "opencode", "pi", "qwen",
+            "amp",
+            "antigravity",
+            "claude",
+            "codebuff",
+            "codex",
+            "copilot",
+            "cursor",
+            "droid",
+            "gemini",
+            "goose",
+            "hermes",
+            "kilo",
+            "kimi",
+            "openclaw",
+            "opencode",
+            "pi",
+            "qwen",
         ] {
             assert!(
                 schema_property(&schema, &[key]).is_none(),

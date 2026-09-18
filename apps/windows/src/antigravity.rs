@@ -87,6 +87,22 @@ pub fn get_antigravity_data(period_str: Option<&str>) -> Result<AntigravitySumma
     get_antigravity_data_with_bounds(period, min_date, max_date)
 }
 
+pub(crate) fn get_live_antigravity_data(period: &str) -> AntigravitySummary {
+    AntigravitySummary {
+        period: period.to_string(),
+        session_count: 0,
+        total_tokens: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_read_tokens: 0,
+        total_cost: 0.0,
+        top_models: Vec::new(),
+        sessions: Vec::new(),
+        daily: Vec::new(),
+        plan: get_live_antigravity_plan(),
+    }
+}
+
 pub(crate) fn get_antigravity_data_with_bounds(
     period: &str,
     min_date: Option<DateTime<Utc>>,
@@ -494,6 +510,31 @@ fn get_agy_usage() -> Option<AgyUsage> {
         .and_then(|stdout| parse_agy_usage(&stdout))
 }
 
+fn plan_with_agy_usage(existing: Option<AntigravityPlan>, usage: AgyUsage) -> AntigravityPlan {
+    let mut plan = existing.unwrap_or_else(|| AntigravityPlan {
+        plan: "Unknown".to_string(),
+        price_per_month: 0.0,
+        email: None,
+        name: None,
+        quotas: Vec::new(),
+        weekly_remaining: None,
+        weekly_reset_time: None,
+        session_remaining: None,
+        session_reset_time: None,
+    });
+    plan.weekly_remaining = usage.weekly_remaining;
+    plan.weekly_reset_time = usage.weekly_reset_time;
+    plan.session_remaining = usage.session_remaining;
+    plan.session_reset_time = usage.session_reset_time;
+    plan
+}
+
+fn plan_has_complete_windows(plan: Option<&AntigravityPlan>) -> bool {
+    // The direct agy-quota endpoint guarantees the authoritative weekly
+    // REQUESTS bucket but does not promise a separate 5-hour window.
+    plan.is_some_and(|value| value.weekly_remaining.is_some())
+}
+
 fn get_live_antigravity_plan() -> Option<AntigravityPlan> {
     static CACHE: OnceLock<Mutex<Option<(std::time::Instant, Option<AntigravityPlan>)>>> =
         OnceLock::new();
@@ -506,27 +547,20 @@ fn get_live_antigravity_plan() -> Option<AntigravityPlan> {
         }
     }
 
-    let usage = get_agy_usage();
-    let mut plan = get_language_server_plan().or_else(load_cached_antigravity_plan);
-    if plan.is_none() && usage.is_some() {
-        plan = Some(AntigravityPlan {
-            plan: "Unknown".to_string(),
-            price_per_month: 0.0,
-            email: None,
-            name: None,
-            quotas: Vec::new(),
-            weekly_remaining: None,
-            weekly_reset_time: None,
-            session_remaining: None,
-            session_reset_time: None,
-        });
+    // Use the headless cloud endpoint first. The daily-cloudcode host returns
+    // the account's real weekly bucket without requiring Antigravity to be
+    // open. Fall back to the local language server, then `agy`, only when the
+    // direct API cannot provide a weekly quota.
+    let mut plan = crate::antigravity_cloud::fetch_plan();
+    if !plan_has_complete_windows(plan.as_ref()) {
+        plan = get_language_server_plan().or(plan);
+        if !plan_has_complete_windows(plan.as_ref()) {
+            if let Some(usage) = get_agy_usage() {
+                plan = Some(plan_with_agy_usage(plan, usage));
+            }
+        }
     }
-    if let (Some(plan), Some(usage)) = (plan.as_mut(), usage) {
-        plan.weekly_remaining = usage.weekly_remaining;
-        plan.weekly_reset_time = usage.weekly_reset_time;
-        plan.session_remaining = usage.session_remaining;
-        plan.session_reset_time = usage.session_reset_time;
-    }
+    let plan = plan.or_else(load_cached_antigravity_plan);
     if let Some(plan) = plan
         .as_ref()
         .filter(|plan| !plan.plan.eq_ignore_ascii_case("unknown"))
@@ -709,8 +743,10 @@ fn parse_live_status(status: &serde_json::Value) -> Option<AntigravityPlan> {
 
     let mut weekly_remaining: Option<f64> = None;
     let mut weekly_reset_time: Option<String> = None;
+    let mut weekly_preferred = false;
     let mut session_remaining: Option<f64> = None;
     let mut session_reset_time: Option<String> = None;
+    let mut session_preferred = false;
 
     if let Some(quota_summary) = status.get("quotaSummary") {
         if let Some(groups) = quota_summary.get("groups").and_then(|g| g.as_array()) {
@@ -719,6 +755,10 @@ fn parse_live_status(status: &serde_json::Value) -> Option<AntigravityPlan> {
                     for bucket in buckets {
                         let window = bucket.get("window").and_then(|w| w.as_str()).unwrap_or("");
                         let frac = bucket.get("remainingFraction").and_then(|f| f.as_f64());
+                        let bucket_id = bucket
+                            .get("bucketId")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or_default();
                         let reset = bucket
                             .get("resetTime")
                             .and_then(|r| r.as_str())
@@ -726,16 +766,34 @@ fn parse_live_status(status: &serde_json::Value) -> Option<AntigravityPlan> {
 
                         if window == "weekly" {
                             if let Some(rem_pct) = frac.map(|f| f * 100.0) {
-                                if weekly_remaining.is_none_or(|curr| rem_pct < curr) {
+                                let preferred = bucket_id.eq_ignore_ascii_case("gemini-weekly");
+                                let should_replace = if preferred {
+                                    !weekly_preferred
+                                        || weekly_remaining.is_none_or(|curr| rem_pct < curr)
+                                } else {
+                                    !weekly_preferred
+                                        && weekly_remaining.is_none_or(|curr| rem_pct < curr)
+                                };
+                                if should_replace {
                                     weekly_remaining = Some(rem_pct);
                                     weekly_reset_time = reset;
+                                    weekly_preferred = preferred;
                                 }
                             }
                         } else if window == "5h" {
                             if let Some(rem_pct) = frac.map(|f| f * 100.0) {
-                                if session_remaining.is_none_or(|curr| rem_pct < curr) {
+                                let is_preferred = bucket_id.eq_ignore_ascii_case("gemini-5h");
+                                let should_replace = if is_preferred {
+                                    !session_preferred
+                                        || session_remaining.is_none_or(|curr| rem_pct < curr)
+                                } else {
+                                    !session_preferred
+                                        && session_remaining.is_none_or(|curr| rem_pct < curr)
+                                };
+                                if should_replace {
                                     session_remaining = Some(rem_pct);
                                     session_reset_time = reset;
+                                    session_preferred = is_preferred;
                                 }
                             }
                         }
@@ -1091,6 +1149,12 @@ mod tests {
                     "displayName": "Gemini Models",
                     "buckets": [
                         {
+                            "bucketId": "other-weekly",
+                            "window": "weekly",
+                            "remainingFraction": 0.43,
+                            "resetTime": "2026-09-22T04:34:22Z"
+                        },
+                        {
                             "bucketId": "gemini-weekly",
                             "window": "weekly",
                             "remainingFraction": 0.9734,
@@ -1148,6 +1212,35 @@ Claude and GPT models\tWeekly Limit Remaining\t97%\t2026-09-23T15:31:31Z\n";
             "Claude and GPT models\tWeekly Limit Remaining\t97%\t2026-09-23T15:31:31Z"
         )
         .is_none());
+    }
+
+    #[test]
+    fn agy_fallback_fills_quota_without_erasing_existing_plan_details() {
+        let plan = AntigravityPlan {
+            plan: "Pro".to_string(),
+            price_per_month: 20.0,
+            email: Some("user@example.test".to_string()),
+            name: Some("User".to_string()),
+            quotas: Vec::new(),
+            weekly_remaining: None,
+            weekly_reset_time: None,
+            session_remaining: None,
+            session_reset_time: None,
+        };
+        let usage = AgyUsage {
+            weekly_remaining: Some(81.0),
+            weekly_reset_time: Some("2026-09-23T04:34:22Z".to_string()),
+            session_remaining: Some(64.0),
+            session_reset_time: Some("2026-09-17T09:34:22Z".to_string()),
+        };
+
+        let merged = plan_with_agy_usage(Some(plan), usage);
+
+        assert_eq!(merged.plan, "Pro");
+        assert_eq!(merged.price_per_month, 20.0);
+        assert_eq!(merged.email.as_deref(), Some("user@example.test"));
+        assert_eq!(merged.weekly_remaining, Some(81.0));
+        assert_eq!(merged.session_remaining, Some(64.0));
     }
 
     #[test]

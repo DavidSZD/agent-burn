@@ -3,20 +3,29 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
     process::Stdio,
-    sync::RwLock,
+    sync::{atomic::AtomicU64, RwLock},
 };
 use tokio::process::Command;
+
+#[cfg(windows)]
+use std::os::windows::process::CommandExt as _;
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 pub struct AppState {
     pub cli_path: Option<PathBuf>,
     pub settings: RwLock<AppSettings>,
     pub latest_refresh: RwLock<Option<RefreshSnapshot>>,
     pub summary_scan: tokio::sync::Mutex<()>,
+    pub refresh_generation: AtomicU64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RefreshSnapshot {
+    #[serde(default)]
+    pub generation: u64,
     pub refreshed_at_ms: i64,
     pub report: serde_json::Value,
 }
@@ -31,6 +40,7 @@ pub struct AppSettings {
     pub refresh_minutes: u64,
     pub quota_source: String,
     pub antigravity_ultra_price: Option<f64>,
+    pub hidden_agents: Vec<String>,
 }
 
 impl Default for AppSettings {
@@ -42,6 +52,7 @@ impl Default for AppSettings {
             refresh_minutes: 1,
             quota_source: "codex".to_string(),
             antigravity_ultra_price: None,
+            hidden_agents: Vec::new(),
         }
     }
 }
@@ -57,6 +68,14 @@ impl AppSettings {
         self.antigravity_ultra_price = self
             .antigravity_ultra_price
             .filter(|price| matches!(*price, 100.0 | 200.0));
+        self.hidden_agents = self
+            .hidden_agents
+            .drain(..)
+            .map(|agent| agent.trim().to_lowercase())
+            .filter(|agent| !agent.is_empty())
+            .collect();
+        self.hidden_agents.sort();
+        self.hidden_agents.dedup();
         self
     }
 }
@@ -70,6 +89,7 @@ impl AppState {
             settings: RwLock::new(settings),
             latest_refresh: RwLock::new(None),
             summary_scan: tokio::sync::Mutex::new(()),
+            refresh_generation: AtomicU64::new(0),
         }
     }
 }
@@ -143,10 +163,10 @@ pub fn resolve_cli_path_with_override(custom_path: Option<&str>) -> Option<PathB
     }
 
     // 4. Recherche dans le PATH Windows
-    if let Ok(output) = std::process::Command::new("where.exe")
-        .arg("agent-burn.exe")
-        .output()
-    {
+    let mut where_command = std::process::Command::new("where.exe");
+    #[cfg(windows)]
+    where_command.creation_flags(CREATE_NO_WINDOW);
+    if let Ok(output) = where_command.arg("agent-burn.exe").output() {
         if output.status.success() {
             let path_str = String::from_utf8_lossy(&output.stdout);
             for line in path_str.lines() {
@@ -187,7 +207,7 @@ async fn execute_cli_json_inner(
     let mut cmd = cli_command(cli_path)?;
 
     #[cfg(windows)]
-    cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW (masque tout terminal)
+    cmd.creation_flags(CREATE_NO_WINDOW); // masque tout terminal
 
     cmd.args(args);
     if settings.offline {
@@ -196,6 +216,7 @@ async fn execute_cli_json_inner(
     if !settings.codex_homes.trim().is_empty() {
         cmd.env("CODEX_HOME", settings.codex_homes.trim());
     }
+    cmd.env("AGENT_BURN_TIMELINE_CACHE", "1");
     cmd.arg("--json");
     cmd.arg("--no-color");
     cmd.stdout(Stdio::piped());
@@ -300,5 +321,16 @@ mod tests {
         }
         .normalized();
         assert_eq!(settings.antigravity_ultra_price, None);
+    }
+
+    #[test]
+    fn hidden_agents_are_normalized_and_deduplicated() {
+        let settings = AppSettings {
+            hidden_agents: vec![" Codex ".into(), "codex".into(), "".into()],
+            ..AppSettings::default()
+        }
+        .normalized();
+
+        assert_eq!(settings.hidden_agents, vec!["codex"]);
     }
 }

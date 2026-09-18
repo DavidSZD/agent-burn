@@ -1,12 +1,19 @@
 import { RequestGate } from "./request-gate.js";
 import {
+  aggregateTokenBreakdown,
   createCoalescedSaver,
+  createReplaceableCallback,
   createSingleFlight,
   escapeHtml,
   getRestoredPeriod,
   isTimelineCacheFresh,
+  latestTimelineUpdatedAt,
+  modelPricingTooltip,
+  modelPricingRows,
   loadQuotaHistory,
   resetWindowStartDate,
+  refreshStatusText,
+  restoredTab,
   shouldRefreshTimelineInBackground,
   timelineSelection,
   timelinePreloadOrder,
@@ -16,10 +23,14 @@ import {
   quotaPresentation,
   quotaRemainingPercent,
   mergeLiveSubscription,
+  selectedTimelineReport,
   persistQuotaSource,
   subscriptionPresentation,
   visibleTokenBreakdownEntries,
-  updateCachedReportsFromToday,
+  visibleAgents,
+  updateCacheFromTimelineSnapshot,
+  mergeSourceSnapshot,
+  waitForInitialRefresh,
 } from "./ui-utils.js";
 
 // Agent Burn Windows - Client Web / Tauri v2
@@ -63,10 +74,13 @@ let latestLiveQuotaReport = null;
 let currentSpendGranularity = "monthly"; // "Monthly" actif par défaut sur les captures
 let detectedAgents = [];
 const allKnownAgents = new Set();
-let lastUpdatedTime = Date.now();
+let lastUpdatedTime = 0;
 let lastBackendRefreshMs = 0;
 let lastBackendRevisionMs = 0;
 let appSettings = null;
+let automaticRefreshStartedAt = null;
+let nextAutomaticRefreshAt = null;
+let activeRefreshGeneration = 0;
 let settingsLoadPromise = Promise.resolve(null);
 const periodCache = {};
 const periodRequests = new Map();
@@ -74,6 +88,11 @@ const saveReportCache = createCoalescedSaver((data) => invokeTauri("save_report_
 const refreshAllTimelineCaches = createSingleFlight(performAllTimelineRefresh);
 const harnessCache = {};
 const summaryRequestGate = new RequestGate();
+const activeRefreshSources = new Set();
+let resolveInitialBackendRefresh;
+const initialBackendRefresh = new Promise((resolve) => {
+  resolveInitialBackendRefresh = resolve;
+});
 
 // Libellés des périodes (alignés avec UsagePeriod de macOS)
 const PERIOD_LABELS = {
@@ -198,22 +217,87 @@ window.addEventListener("DOMContentLoaded", async () => {
   initPeriods();
   initRefresh();
   initSettings();
+  // The backend collector starts independently of the WebView and its first
+  // event can arrive before listeners finish attaching. Start the footer
+  // clock locally so startup still shows Updating instead of stale cache age.
+  automaticRefreshStartedAt = Date.now();
+  nextAutomaticRefreshAt = automaticRefreshStartedAt + refreshIntervalMs();
+  setTimelineRefreshing(true, "startup");
   initFooterTimer();
   initBackendEvents();
   initBackendRefreshPolling();
 
   // Démarrage rapide avec le cache
+  await settingsLoadPromise;
+  if (Number.isFinite(automaticRefreshStartedAt)) {
+    nextAutomaticRefreshAt = automaticRefreshStartedAt + refreshIntervalMs();
+  }
   await initColdStart();
   updateTimelineAvailability();
   // On ne bloque le premier affichage que s'il n'existe encore aucune donnée.
   if (!periodCache[currentPeriod]) await loadData(true);
-  // Fill every timeline cache without changing the currently visible period.
-  void preloadTimelines();
+  currentTab = restoredTab(
+    localStorage.getItem("agent-burn-tab"),
+    visibleAgents(detectedAgents, appSettings?.hiddenAgents),
+  );
+  switchTab(currentTab);
+  // Let live quotas update first, then refresh every stale timeline in the background.
+  void refreshStaleTimelinesAfterInitialBackend();
 });
 
 function initBackendEvents() {
   const listen = getListen();
   if (!listen) return;
+  listen("refresh_started", (event) => {
+    const startedAtMs = Number(event?.payload?.startedAtMs);
+    const generation = Number(event?.payload?.generation);
+    if (Number.isFinite(generation)) activeRefreshGeneration = Math.max(activeRefreshGeneration, generation);
+    automaticRefreshStartedAt = Number.isFinite(startedAtMs) ? startedAtMs : Date.now();
+    nextAutomaticRefreshAt = automaticRefreshStartedAt + refreshIntervalMs();
+    setTimelineRefreshing(true, "automatic");
+    renderFooterStatus();
+  });
+  listen("refresh_finished", (event) => {
+    const generation = Number(event?.payload?.generation);
+    if (Number.isFinite(generation) && generation < activeRefreshGeneration) return;
+    const startedAtMs = Number(event?.payload?.startedAtMs);
+    const finishedAtMs = Number(event?.payload?.finishedAtMs);
+    const scheduleAnchor = Number.isFinite(startedAtMs)
+      ? startedAtMs
+      : (Number.isFinite(finishedAtMs) ? finishedAtMs : Date.now());
+    nextAutomaticRefreshAt = scheduleAnchor + refreshIntervalMs();
+    automaticRefreshStartedAt = null;
+    setTimelineRefreshing(false, "automatic");
+    setTimelineRefreshing(false, "startup");
+    setTimelineRefreshing(false, "timeline");
+    renderFooterStatus();
+  });
+  listen("refresh_source_completed", async (event) => {
+    const payload = event?.payload;
+    const generation = Number(payload?.generation);
+    const refreshedAtMs = Number(payload?.refreshedAtMs);
+    if (!payload?.report || !Number.isFinite(generation) || generation < activeRefreshGeneration) return;
+    activeRefreshGeneration = Math.max(activeRefreshGeneration, generation);
+    const merged = mergeSourceSnapshot(
+      periodCache,
+      payload.report,
+      typeof payload.source === "string" ? payload.source : null,
+      refreshedAtMs,
+    );
+    lastUpdatedTime = refreshedAtMs;
+    latestLiveQuotaReport = merged;
+    reportData = currentPeriod === "all"
+      ? merged
+      : selectedTimelineReport(periodCache, timelineCacheKey(currentPeriod), reportData, merged);
+    if (currentPeriod === "all") fullReportData = merged;
+    computeDetectedAgents(reportData, antigravityData);
+    updateTopBarQuotaPill(reportData);
+    renderHarnessTabs();
+    if (currentTab === "summary") renderSummary();
+    else if (currentTab !== "settings") renderHarnessView(currentTab);
+    saveReportCache({ summary: currentVisibleReport(), periods: periodCache, currentPeriod })
+      .catch((error) => showStatusError(`Unable to save partial report cache: ${error}`));
+  });
   listen("refresh_requested", async () => {
     await loadData(true);
   });
@@ -227,30 +311,41 @@ function initBackendEvents() {
 function applyBackendRefresh(data, refreshedAtMs) {
   if (!data || refreshedAtMs <= lastBackendRefreshMs) return false;
   lastBackendRefreshMs = refreshedAtMs;
+  setTimelineRefreshing(false, "startup");
   lastUpdatedTime = refreshedAtMs;
   latestLiveQuotaReport = data;
   updateTopBarQuotaPill(data);
 
+  const entry = updateCacheFromTimelineSnapshot(periodCache, data, refreshedAtMs);
   if (currentPeriod === "all") {
-    const entry = { reportData: structuredClone(data), antigravityData: null, updatedAt: refreshedAtMs };
-    periodCache.all = entry;
     reportData = entry.reportData;
     fullReportData = entry.reportData;
   } else {
-    reportData = mergeLiveSubscription(reportData, data);
+    reportData = selectedTimelineReport(periodCache, timelineCacheKey(currentPeriod), reportData, data);
   }
-  computeDetectedAgents(reportData, antigravityData);
+  computeDetectedAgents(data, antigravityData);
   return true;
 }
 
 async function syncBackendRefresh(data, refreshedAtMs) {
   if (!applyBackendRefresh(data, refreshedAtMs)) return;
+  // If the start/finish events were emitted before the WebView subscribed,
+  // reconstruct the next scheduled run from the completed snapshot instead
+  // of falling back to “Updated … ago” indefinitely.
+  if (!Number.isFinite(nextAutomaticRefreshAt) || nextAutomaticRefreshAt <= refreshedAtMs) {
+    nextAutomaticRefreshAt = refreshedAtMs + refreshIntervalMs();
+  }
+  automaticRefreshStartedAt = null;
+  setTimelineRefreshing(false, "automatic");
+  resolveInitialBackendRefresh();
   try {
     quotaHistoryData = await invokeTauri("get_quota_history");
   } catch (_) {}
   renderHarnessTabs();
   if (currentTab === "summary") renderSummary();
   else if (currentTab !== "settings") renderHarnessView(currentTab);
+  saveReportCache({ summary: currentVisibleReport(), periods: periodCache, currentPeriod })
+    .catch((error) => showStatusError(`Unable to save report cache: ${error}`));
 }
 
 function initBackendRefreshPolling() {
@@ -276,16 +371,14 @@ async function initColdStart() {
     const cached = await invokeTauri("get_report_cache");
     if (cached?.periods && typeof cached.periods === "object") {
       Object.assign(periodCache, cached.periods);
-      const restoredAt = Date.now();
-      for (const entry of Object.values(periodCache)) {
-        if (entry && !Number.isFinite(entry.updatedAt)) entry.updatedAt = restoredAt;
-      }
+      lastUpdatedTime = latestTimelineUpdatedAt(periodCache) || 0;
     }
     if (cached?.currentPeriod) {
       currentPeriod = getRestoredPeriod(cached.currentPeriod, Object.keys(PERIOD_LABELS));
       const select = document.getElementById("summary-period-select");
       if (select) select.value = currentPeriod;
     }
+    computeDetectedAgents(periodCache.all?.reportData || cached?.summary, cached?.antigravity);
     if (cached && (cached.summary || cached.antigravity)) {
       if (cached.antigravity) antigravityData = cached.antigravity;
       const selectedCache = periodCache[currentPeriod];
@@ -307,20 +400,24 @@ async function initColdStart() {
   }
 }
 
-async function preloadTimelines(refreshExisting = false) {
+async function preloadTimelines(refreshExisting = false, missingOnly = false) {
   const periods = timelinePreloadOrder(Object.keys(PERIOD_LABELS), currentPeriod);
-  for (const period of periods) {
-    if (period === "rtd") continue;
-    if (!refreshExisting && !shouldRefreshTimelineInBackground(period, periodCache[period])) continue;
+  await Promise.all(periods.map(async (period) => {
+    if (period === "rtd") return;
+    // The backend all-time snapshot normally contains every dynamic timeline.
+    // Do not launch one full CLI scan per period after that snapshot arrives;
+    // only fill a genuinely missing period (for example an old cache format).
+    if (missingOnly && periodCache[period]) return;
+    if (!refreshExisting && !shouldRefreshTimelineInBackground(period, periodCache[period])) return;
     try {
       await requestTimeline(period, refreshExisting);
       updateTimelineAvailability();
-      await saveReportCache({ summary: reportData, periods: periodCache, currentPeriod });
     } catch (error) {
       // A missing source for one period must not prevent the other periods loading.
       console.debug(`Unable to preload ${period}`, error);
     }
-  }
+  }));
+  await saveReportCache({ summary: currentVisibleReport(), periods: periodCache, currentPeriod });
 }
 
 // ==========================================================================
@@ -373,9 +470,10 @@ function renderHarnessTabs() {
   container.appendChild(generalBtn);
 
   // 2. Les agents détectés sous forme d'onglets directs (jusqu'à 8 pour inclure tous les agents actifs)
+  const shownAgents = visibleAgents(detectedAgents, appSettings?.hiddenAgents);
   const maxDirectTabs = 8;
-  const directAgents = detectedAgents.slice(0, maxDirectTabs);
-  const overflowAgents = detectedAgents.slice(maxDirectTabs);
+  const directAgents = shownAgents.slice(0, maxDirectTabs);
+  const overflowAgents = shownAgents.slice(maxDirectTabs);
 
   directAgents.forEach((agent) => {
     const btn = document.createElement("button");
@@ -435,6 +533,7 @@ function switchTab(tabId) {
     if (cached) reportData = mergeLiveSubscription(cached.reportData, latestLiveQuotaReport);
   }
   currentTab = tabId;
+  localStorage.setItem("agent-burn-tab", currentTab);
 
   // Mise à jour de la classe active sur les onglets
   renderHarnessTabs();
@@ -483,28 +582,38 @@ async function switchPeriod(newPeriod) {
   const cacheKey = timelineCacheKey(currentPeriod);
   const selection = timelineSelection(periodCache, cacheKey, reportData, antigravityData);
   if (!selection.pending) {
-    setTimelineRefreshing(false);
+    setTimelineRefreshing(false, "timeline");
     reportData = mergeLiveSubscription(selection.reportData, latestLiveQuotaReport);
     antigravityData = selection.antigravityData;
     computeDetectedAgents(reportData, antigravityData);
     renderHarnessTabs();
     if (currentTab === "summary") renderSummary();
     else if (currentTab !== "settings") renderHarnessView(currentTab);
-    if (!isTimelineCacheFresh(periodCache[cacheKey])) {
-      setTimelineRefreshing(true);
-      void loadData(true);
-    }
+    // A cached timeline is rendered immediately. Automatic backend refreshes
+    // hydrate every period, so switching periods never starts a second scan.
     return;
   }
 
-  setTimelineRefreshing(true);
+  setTimelineRefreshing(true, "timeline");
   await loadData(true);
 }
 
-function setTimelineRefreshing(refreshing) {
+function setTimelineRefreshing(refreshing, source = "timeline") {
+  if (refreshing) activeRefreshSources.add(source);
+  else activeRefreshSources.delete(source);
+  const active = activeRefreshSources.size > 0;
+  syncTimelineRefreshIndicators();
+}
+
+function syncTimelineRefreshIndicators() {
+  const active = activeRefreshSources.size > 0;
   document.querySelectorAll(".timeline-refresh-status").forEach((status) => {
-    status.hidden = !refreshing;
+    status.hidden = !active;
   });
+}
+
+function refreshIntervalMs() {
+  return Math.max(1, Number(appSettings?.refreshMinutes) || 1) * 60_000;
 }
 
 function updateTimelineAvailability() {
@@ -527,6 +636,10 @@ function updateTimelineAvailability() {
 
 function timelineCacheKey(period) {
   return period === "rtd" ? `rtd:${currentTab}` : period;
+}
+
+function currentVisibleReport() {
+  return selectedTimelineReport(periodCache, timelineCacheKey(currentPeriod), reportData, latestLiveQuotaReport);
 }
 
 function requestTimeline(period, force = false) {
@@ -616,25 +729,27 @@ async function loadData(force = false) {
     }
 
     // Sauvegarde en cache disque
-    saveReportCache({ summary: reportData, periods: periodCache, currentPeriod })
+    saveReportCache({ summary: currentVisibleReport(), periods: periodCache, currentPeriod })
       .catch((error) => showStatusError(`Unable to save report cache: ${error}`));
 
   } catch (err) {
     showStatusError(`Unable to load usage: ${err}`);
   } finally {
-    if (summaryRequestGate.isCurrent(requestGeneration)) setTimelineRefreshing(false);
+    if (summaryRequestGate.isCurrent(requestGeneration)) setTimelineRefreshing(false, "timeline");
   }
 }
 
 async function performAllTimelineRefresh(showIndicator = false) {
-  if (showIndicator) setTimelineRefreshing(true);
+  if (showIndicator) setTimelineRefreshing(true, "manual");
   try {
-    const previousToday = periodCache.today;
-    const summary = await invokeTauri("get_summary", { range: "today" });
-    if (previousToday) periodCache.today = previousToday;
-    updateCachedReportsFromToday(periodCache, summary);
+    // The all-time request carries the CLI's timeline matrix. Refreshing only
+    // Today left older cached periods stale even though the button appeared to
+    // succeed, so hydrate every timeline in one scan here.
+    const summary = await invokeTauri("get_summary", { range: null });
+    const refreshedAtMs = Date.now();
+    updateCacheFromTimelineSnapshot(periodCache, summary, refreshedAtMs);
     latestLiveQuotaReport = summary;
-    lastUpdatedTime = Date.now();
+    lastUpdatedTime = refreshedAtMs;
     lastBackendRefreshMs = Math.max(lastBackendRefreshMs, lastUpdatedTime);
 
     const selected = periodCache[timelineCacheKey(currentPeriod)];
@@ -646,13 +761,24 @@ async function performAllTimelineRefresh(showIndicator = false) {
       if (currentTab === "summary") renderSummary();
       else if (currentTab !== "settings") renderHarnessView(currentTab);
     }
-    await saveReportCache({ summary: reportData, periods: periodCache, currentPeriod });
-    void preloadTimelines();
+    await saveReportCache({ summary: currentVisibleReport(), periods: periodCache, currentPeriod });
+    void preloadTimelines(false, true);
   } catch (error) {
     showStatusError(`Unable to refresh timelines: ${error}`);
   } finally {
-    if (showIndicator) setTimelineRefreshing(false);
+    if (showIndicator) setTimelineRefreshing(false, "manual");
   }
+}
+
+async function refreshStaleTimelinesAfterInitialBackend() {
+  await waitForInitialRefresh(initialBackendRefresh);
+  setTimelineRefreshing(false, "startup");
+  const cacheKey = timelineCacheKey(currentPeriod);
+  if (!periodCache[cacheKey]) {
+    setTimelineRefreshing(true, "timeline");
+    await loadData(true);
+  }
+  await preloadTimelines(false, true);
 }
 
 // Mise à jour de la pilule de quota dans le header
@@ -745,6 +871,9 @@ function updateTopBarQuotaPill(data) {
 function renderSummary() {
   if (!reportData) return;
 
+  const visibleReport = currentVisibleReport();
+  if (visibleReport) reportData = visibleReport;
+
   // 1. Sous-titre de période
   const periodLabel = PERIOD_LABELS[currentPeriod] || "All time";
   document.querySelectorAll(".period-subtitle").forEach((el) => {
@@ -790,6 +919,17 @@ function renderSummary() {
 
   // 5. Tableau des modèles
   renderModelsTable(models, cost, "summary-models-tbody", "summary-models-count", "summary-filter-input");
+
+  const breakdownGrid = document.getElementById("summary-token-breakdown-grid");
+  if (breakdownGrid) {
+    const breakdown = aggregateTokenBreakdown(reportData.agents);
+    breakdownGrid.innerHTML = visibleTokenBreakdownEntries(breakdown).map(([label, value]) => `
+      <div class="token-metric-item">
+        <span class="token-metric-label">${escapeHtml(label)}</span>
+        <span class="token-metric-val">${formatCompactTokens(value || 0)}</span>
+      </div>
+    `).join("");
+  }
 
   // 6. Abonnements
   renderSubscriptions();
@@ -1062,8 +1202,11 @@ function renderHarnessView(agent) {
         <table class="macos-table" id="harness-models-table">
           <thead>
             <tr>
-              <th class="col-model sortable" data-sort="model">Model <span class="sort-indicator"></span></th>
-              <th class="col-tokens text-right sortable" data-sort="tokens">Tokens <span class="sort-indicator"></span></th>
+              <th class="col-model">Model</th>
+              <th class="col-token-part text-right sortable" data-sort="input">Input <span class="sort-indicator"></span></th>
+              <th class="col-token-part text-right sortable" data-sort="cacheRead">Cached input <span class="sort-indicator"></span></th>
+              <th class="col-token-part text-right sortable" data-sort="cacheWrite">Cache write <span class="sort-indicator"></span></th>
+              <th class="col-token-part text-right sortable" data-sort="output">Output <span class="sort-indicator"></span></th>
               <th class="col-spend text-right sortable" data-sort="spend">Spend <span class="sort-indicator">↓</span></th>
               <th class="col-share text-right sortable" data-sort="share">Share <span class="sort-indicator"></span></th>
             </tr>
@@ -1179,6 +1322,7 @@ function renderHarnessView(agent) {
   if (hasQuota) {
     renderBurndownSVG("burndown-svg-wrapper", subscriptionAgent);
   }
+  syncTimelineRefreshIndicators();
 }
 
 // État d'horizon de la carte quota (5 timelines macOS : rte, rtd, today, week, month)
@@ -2107,8 +2251,15 @@ function renderModelsTable(models, totalCost, tbodyId, countId, searchInputId) {
       let res = 0;
       if (modelsSortState.column === "spend" || modelsSortState.column === "share") {
         res = (a.totalCost || 0) - (b.totalCost || 0);
-      } else if (modelsSortState.column === "tokens") {
-        res = (a.totalTokens || 0) - (b.totalTokens || 0);
+      } else if (["input", "output", "cacheRead", "cacheWrite"].includes(modelsSortState.column)) {
+        const fields = {
+          input: "inputTokens",
+          output: "outputTokens",
+          cacheRead: "cacheReadTokens",
+          cacheWrite: "cacheWriteTokens",
+        };
+        const field = fields[modelsSortState.column];
+        res = (a[field] || 0) - (b[field] || 0);
       } else if (modelsSortState.column === "model") {
         res = (a.model || "").localeCompare(b.model || "");
       }
@@ -2116,16 +2267,29 @@ function renderModelsTable(models, totalCost, tbodyId, countId, searchInputId) {
     });
 
     if (filtered.length === 0) {
-      tbody.innerHTML = `<tr><td colspan="4" style="text-align:center;color:var(--text-muted);padding:18px;">No models match your filter.</td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="7" style="text-align:center;color:var(--text-muted);padding:18px;">No models match your filter.</td></tr>`;
       return;
     }
 
     filtered.forEach((m) => {
       const share = totalCost > 0 ? ((m.totalCost || 0) / totalCost) * 100 : m.percentage || 0;
+      const pricingTitle = modelPricingTooltip(m.pricing);
+      const pricingRows = modelPricingRows(m.pricing);
+      const pricingContent = pricingRows.length > 0
+        ? pricingRows.map(([label, value]) => `
+            <div class="model-price-row">
+              <span>${escapeHtml(label)}</span>
+              <strong>${escapeHtml(value)}<small>/1M</small></strong>
+            </div>
+          `).join("")
+        : `<div class="model-price-unavailable">Pricing unavailable</div>`;
       const tr = document.createElement("tr");
       tr.innerHTML = `
-        <td class="col-model" title="${escapeHtml(m.model)}">${escapeHtml(m.model)}</td>
-        <td class="col-tokens text-right">${formatCompactTokens(m.totalTokens)}</td>
+        <td class="col-model"><span>${escapeHtml(m.model)}</span><span class="model-price-wrap"><button class="model-price-info" type="button" aria-label="${escapeHtml(pricingTitle)}"><svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="7.25"></circle><path d="M12.4 7.4c-.55-.42-1.33-.68-2.2-.68-1.2 0-2.05.52-2.05 1.3 0 .83.7 1.12 2.02 1.38 1.75.34 2.75.92 2.75 2.25 0 1.39-1.17 2.35-2.92 2.35-.98 0-1.94-.29-2.65-.82M10 5.55v8.9"></path></svg></button><span class="model-price-popover" role="tooltip"><span class="model-price-heading">API pricing</span><span class="model-price-unit">USD per 1M tokens</span>${pricingContent}</span></span></td>
+        <td class="col-token-part text-right">${formatCompactTokens(m.inputTokens || 0)}</td>
+        <td class="col-token-part text-right">${formatCompactTokens(m.cacheReadTokens || 0)}</td>
+        <td class="col-token-part text-right">${formatCompactTokens(m.cacheWriteTokens || 0)}</td>
+        <td class="col-token-part text-right">${formatCompactTokens(m.outputTokens || 0)}</td>
         <td class="col-spend text-right">${formatCurrency(m.totalCost)}</td>
         <td class="col-share text-right">${share.toFixed(1)}%</td>
       `;
@@ -2138,6 +2302,7 @@ function renderModelsTable(models, totalCost, tbodyId, countId, searchInputId) {
   // Écouteurs de clic sur les en-têtes de colonnes
   if (table && !table.dataset.sortInitialized) {
     table.dataset.sortInitialized = "true";
+    table._modelsSortCallback = createReplaceableCallback(updateRows);
     table.querySelectorAll("th.sortable").forEach((th) => {
       th.addEventListener("click", () => {
         const col = th.dataset.sort;
@@ -2148,9 +2313,11 @@ function renderModelsTable(models, totalCost, tbodyId, countId, searchInputId) {
           modelsSortState.direction = col === "model" ? "asc" : "desc";
         }
         const currentInput = document.getElementById(searchInputId);
-        updateRows(currentInput ? currentInput.value : "");
+        table._modelsSortCallback.run(currentInput ? currentInput.value : "");
       });
     });
+  } else if (table) {
+    table._modelsSortCallback.replace(updateRows);
   }
 
   updateRows();
@@ -2192,22 +2359,6 @@ function renderSubscriptions() {
     `;
     list.appendChild(div);
   });
-}
-
-// ==========================================================================
-// Rafraîchissement automatique réel
-// ==========================================================================
-let refreshIntervalTimer = null;
-function setupAutoRefresh() {
-  if (refreshIntervalTimer) {
-    clearInterval(refreshIntervalTimer);
-    refreshIntervalTimer = null;
-  }
-  const mins = Math.max(1, appSettings?.refreshMinutes || 1);
-  refreshIntervalTimer = setInterval(async () => {
-    for (const key in harnessCache) delete harnessCache[key];
-    await refreshAllTimelineCaches(false);
-  }, mins * 60 * 1000);
 }
 
 // ==========================================================================
@@ -2255,7 +2406,6 @@ function initSettings() {
     .then((settings) => {
       appSettings = settings;
       applySettingsToControls();
-      setupAutoRefresh();
       return settings;
     })
     .catch((error) => {
@@ -2301,12 +2451,12 @@ async function saveSettingsFromControls() {
     refreshMinutes: Number(document.getElementById("settings-refresh-select")?.value || 1),
     quotaSource: appSettings?.quotaSource || "antigravity",
     antigravityUltraPrice: Number(document.getElementById("settings-antigravity-ultra-price")?.value) || null,
+    hiddenAgents: appSettings?.hiddenAgents || [],
   };
   appSettings = await invokeTauri("set_settings", { settings });
-  setupAutoRefresh();
   for (const key in harnessCache) delete harnessCache[key];
   await loadData(true);
-  void preloadTimelines();
+  void preloadTimelines(false, true);
 }
 
 function renderSettings() {
@@ -2335,9 +2485,25 @@ function renderSettings() {
             <img src="${getAgentBrandIcon(agent)}" width="22" height="22" style="border-radius:4px;" />
             <strong>${escapeHtml(getAgentDisplayName(agent))}</strong>
           </div>
-          <span class="status-badge-ok">Active & detected</span>
+          <label class="switch" title="Show ${escapeHtml(getAgentDisplayName(agent))} in the tab bar">
+            <input type="checkbox" data-agent-tab-toggle="${escapeHtml(agent)}" ${appSettings?.hiddenAgents?.includes(agent) ? "" : "checked"} />
+            <span class="slider"></span>
+          </label>
         `;
         list.appendChild(row);
+      });
+      list.querySelectorAll("[data-agent-tab-toggle]").forEach((toggle) => {
+        toggle.addEventListener("change", async () => {
+          const agent = toggle.dataset.agentTabToggle;
+          const hidden = new Set(appSettings?.hiddenAgents || []);
+          if (toggle.checked) hidden.delete(agent);
+          else hidden.add(agent);
+          appSettings = await invokeTauri("set_settings", {
+            settings: { ...appSettings, hiddenAgents: [...hidden] },
+          });
+          if (!toggle.checked && currentTab === agent) switchTab("summary");
+          else renderHarnessTabs();
+        });
       });
     }
   }
@@ -2360,20 +2526,30 @@ function initFooterTimer() {
   const el = document.getElementById("footer-status-text");
   if (!el) return;
 
-  setInterval(() => {
-    const sec = Math.floor((Date.now() - lastUpdatedTime) / 1000);
-    const staleAfter = (appSettings?.refreshMinutes || 1) * 60 + 30;
-    const dot = document.querySelector("#quota-menu-pill .quota-dot");
-    if (sec > staleAfter && dot) {
-      dot.className = "quota-dot stale";
-    }
-    if (sec < 5) {
-      el.textContent = "Updated just now";
-    } else if (sec < 60) {
-      el.textContent = `Updated ${sec} sec ago`;
-    } else {
-      const min = Math.floor(sec / 60);
-      el.textContent = `Updated ${min} min ago`;
-    }
-  }, 1000);
+  setInterval(renderFooterStatus, 1000);
+  renderFooterStatus();
+}
+
+function renderFooterStatus(now = Date.now()) {
+  const el = document.getElementById("footer-status-text");
+  if (!el) return;
+
+  const visibleUpdatedAt = periodCache[timelineCacheKey(currentPeriod)]?.updatedAt;
+  el.textContent = refreshStatusText(
+    {
+      updatedAt: visibleUpdatedAt,
+      refreshStartedAt: automaticRefreshStartedAt,
+      nextRefreshAt: nextAutomaticRefreshAt,
+    },
+    now,
+  );
+
+  const elapsedSeconds = Number.isFinite(automaticRefreshStartedAt)
+    ? Math.max(0, Math.floor((now - automaticRefreshStartedAt) / 1000))
+    : Number.isFinite(visibleUpdatedAt)
+      ? Math.max(0, Math.floor((now - visibleUpdatedAt) / 1000))
+      : 0;
+  const staleAfter = (appSettings?.refreshMinutes || 1) * 60 + 30;
+  const dot = document.querySelector("#quota-menu-pill .quota-dot");
+  if (dot) dot.classList.toggle("stale", elapsedSeconds > staleAfter && !Number.isFinite(automaticRefreshStartedAt));
 }

@@ -34,7 +34,7 @@ agent-burn summary --json
 
 macOS app: menu-bar quota for Codex, Claude, and Cursor, plus a dashboard across detected harnesses. Build locally with `just macos::run`. Details: [apps/macos](https://github.com/Melvynx/agent-burn/tree/main/apps/macos).
 
-Windows app: system-tray quota tooltip, live background polling, and responsive dashboard for Claude, Codex, Cursor, Antigravity, and Gemini. Build locally with `just windows::build` or run it with `just windows::run`. Antigravity support is provided by the Windows desktop layer and reads local data under `%USERPROFILE%\.gemini\antigravity`. Details: [apps/windows](https://github.com/DavidSZD/agent-burn/tree/main/apps/windows).
+Windows app: system-tray quota tooltip, live background polling, and responsive dashboard for Claude, Codex, Cursor, Antigravity, and Gemini. Build locally with `just windows::build` or run it with `just windows::run`. Antigravity usage is loaded by the shared CLI adapter; live plan and quota status use the local language server when available and the authenticated Code Assist API otherwise, without starting a terminal. Details: [apps/windows](https://github.com/DavidSZD/agent-burn/tree/main/apps/windows).
 
 ## Subscription Value
 
@@ -71,13 +71,19 @@ Plan overrides:
 
 ## Data Sources
 
-Reads local logs. Nothing is uploaded.
+Reads local logs; local usage data is not uploaded. Live quota checks contact the relevant provider API directly when enabled.
 
 | Source | Default location |
 | --- | --- |
 | Claude Code | `~/.claude`, `~/.config/claude/projects` |
 | Codex | `${CODEX_HOME:-~/.codex}` |
 | Cursor | Cursor `state.vscdb` plus the signed-in dashboard usage API |
+| Antigravity | `~/.gemini/antigravity*/conversations/*.db`, `~/.config/antigravity/conversations/*.db` |
+
+On Windows, Antigravity live plan and quota use its local language server when
+available, or the authenticated Code Assist API through the Windows Credential
+Manager when the app is closed. No Antigravity CLI process is started for
+background refreshes.
 
 ## Acknowledgments
 

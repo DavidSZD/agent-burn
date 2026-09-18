@@ -1,5 +1,7 @@
 use std::{
     borrow::Cow,
+    env, fs,
+    path::PathBuf,
     sync::{Mutex, OnceLock},
     time::{Duration, Instant},
 };
@@ -60,8 +62,19 @@ impl Pricing {
 pub(crate) struct PricingMap {
     entries: FxHashMap<String, Pricing>,
     context_limits: FxHashMap<String, u64>,
+    long_context_thresholds: FxHashMap<String, u64>,
+    lookup_cache: Mutex<FxHashMap<String, Option<Pricing>>>,
+    historical: Vec<PricingPeriod>,
     enable_models_dev_fallback: bool,
     enable_embedded_models_dev_fallback: bool,
+}
+
+#[derive(Debug, Clone)]
+struct PricingPeriod {
+    model: String,
+    start_ms: i64,
+    end_ms: Option<i64>,
+    pricing: Pricing,
 }
 
 #[derive(Debug, Deserialize)]
@@ -74,6 +87,8 @@ struct LiteLlmPricing {
     output_cost_per_token_above_200k_tokens: Option<f64>,
     cache_creation_input_token_cost_above_200k_tokens: Option<f64>,
     cache_read_input_token_cost_above_200k_tokens: Option<f64>,
+    #[serde(alias = "long_context_threshold")]
+    long_context_threshold: Option<u64>,
     max_input_tokens: Option<u64>,
     provider_specific_entry: Option<ProviderSpecificEntry>,
 }
@@ -95,6 +110,8 @@ struct CompactLiteLlmPricing {
     cra: Option<f64>,
     ctx: Option<u64>,
     fast: Option<f64>,
+    #[serde(alias = "long_context_threshold")]
+    lct: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -163,6 +180,26 @@ struct ModelsDevCost {
     output: Option<f64>,
     cache_read: Option<f64>,
     cache_write: Option<f64>,
+    tiers: Option<Vec<ModelsDevCostTier>>,
+    context_over_200k: Option<ModelsDevCostTier>,
+    #[serde(alias = "long_context_threshold")]
+    long_context_threshold: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ModelsDevCostTier {
+    input: Option<f64>,
+    output: Option<f64>,
+    cache_read: Option<f64>,
+    cache_write: Option<f64>,
+    tier: Option<ModelsDevTierSpec>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ModelsDevTierSpec {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    size: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -186,12 +223,21 @@ impl FastMultiplierOverrides {
         if let Some(multiplier) = self.exact.get(model) {
             return Some(*multiplier);
         }
-        let normalized = model.replace(['.', '@'], "-");
-        normalized.split(['/', ':']).find_map(|part| {
-            self.normalized_prefix
-                .iter()
-                .find_map(|(base, multiplier)| {
-                    matches_model_suffix(part, base).then_some(*multiplier)
+        if let Some(multiplier) = pricing_alias(model).and_then(|alias| self.exact.get(alias)) {
+            return Some(*multiplier);
+        }
+        model.split(['/', ':']).find_map(|part| {
+            self.exact
+                .get(part)
+                .copied()
+                .or_else(|| pricing_alias(part).and_then(|alias| self.exact.get(alias).copied()))
+                .or_else(|| {
+                    let normalized = part.replace(['.', '@'], "-");
+                    self.normalized_prefix
+                        .iter()
+                        .find_map(|(base, multiplier)| {
+                            matches_model_suffix(&normalized, base).then_some(*multiplier)
+                        })
                 })
         })
     }
@@ -203,6 +249,7 @@ impl PricingMap {
         let fast_multiplier_overrides = FastMultiplierOverrides::load();
         map.load_json_with_overrides(BUILD_TIME_PRICING_JSON, &fast_multiplier_overrides);
         map.put_builtin_pricing(&fast_multiplier_overrides);
+        map.put_builtin_historical_pricing();
         // Resolve models that LiteLLM and the built-in table miss from the
         // embedded models.dev snapshot. This works offline, unlike the network
         // source gated by `enable_models_dev_fallback`.
@@ -254,6 +301,9 @@ impl PricingMap {
         json: &str,
         fast_multiplier_overrides: &FastMultiplierOverrides,
     ) -> usize {
+        if let Ok(mut cache) = self.lookup_cache.lock() {
+            cache.clear();
+        }
         let Ok(raw) = serde_json::from_str::<FxHashMap<String, serde_json::Value>>(json) else {
             return 0;
         };
@@ -269,6 +319,7 @@ impl PricingMap {
                 continue;
             };
             let context_limit = pricing.max_input_tokens;
+            let long_context_threshold = pricing.long_context_threshold;
             let cache_read_explicit = pricing.cache_read_input_token_cost.is_some();
             let fast_multiplier = pricing
                 .provider_specific_entry
@@ -294,7 +345,11 @@ impl PricingMap {
                 },
             );
             if let Some(context_limit) = context_limit {
-                self.context_limits.insert(model, context_limit);
+                self.context_limits.insert(model.clone(), context_limit);
+            }
+            if let Some(threshold) = long_context_threshold {
+                self.long_context_thresholds
+                    .insert(model.clone(), threshold);
             }
             loaded_count += 1;
         }
@@ -302,17 +357,29 @@ impl PricingMap {
     }
 
     fn load_models_dev_json_missing(&mut self, json: &str) -> Option<usize> {
+        if let Ok(mut cache) = self.lookup_cache.lock() {
+            cache.clear();
+        }
         let raw = parse_models_dev_json(json)?;
+        let fast_multiplier_overrides = FastMultiplierOverrides::load();
         Some(match raw {
             ModelsDevJson::Providers(providers) => providers
                 .into_values()
-                .map(|provider| self.load_models_dev_models(provider.models))
+                .map(|provider| {
+                    self.load_models_dev_models(provider.models, &fast_multiplier_overrides)
+                })
                 .sum(),
-            ModelsDevJson::Models(models) => self.load_models_dev_models(models),
+            ModelsDevJson::Models(models) => {
+                self.load_models_dev_models(models, &fast_multiplier_overrides)
+            }
         })
     }
 
-    fn load_models_dev_models(&mut self, models: FxHashMap<String, ModelsDevModel>) -> usize {
+    fn load_models_dev_models(
+        &mut self,
+        models: FxHashMap<String, ModelsDevModel>,
+        fast_multiplier_overrides: &FastMultiplierOverrides,
+    ) -> usize {
         let mut loaded_count = 0;
         for (model_key, model) in models {
             let model_id = model.id.unwrap_or(model_key);
@@ -331,6 +398,11 @@ impl PricingMap {
             let input = input / 1_000_000.0;
             let output = output / 1_000_000.0;
             let cache_read_explicit = cost.cache_read.is_some();
+            let context_tier = Self::models_dev_context_tier(&cost);
+            let long_context_threshold = cost
+                .long_context_threshold
+                .or_else(|| context_tier.and_then(|tier| tier.tier.as_ref()?.size))
+                .or_else(|| context_tier.map(|_| 200_000));
             self.entries.insert(
                 model_id.clone(),
                 Pricing {
@@ -345,15 +417,29 @@ impl PricingMap {
                         .map(|value| value / 1_000_000.0)
                         .unwrap_or(input * 0.1),
                     cache_read_explicit,
-                    input_above_200k: None,
-                    output_above_200k: None,
-                    cache_create_above_200k: None,
-                    cache_read_above_200k: None,
-                    fast_multiplier: 1.0,
+                    input_above_200k: context_tier
+                        .and_then(|tier| tier.input)
+                        .map(|value| value / 1_000_000.0),
+                    output_above_200k: context_tier
+                        .and_then(|tier| tier.output)
+                        .map(|value| value / 1_000_000.0),
+                    cache_create_above_200k: context_tier
+                        .and_then(|tier| tier.cache_write)
+                        .map(|value| value / 1_000_000.0),
+                    cache_read_above_200k: context_tier
+                        .and_then(|tier| tier.cache_read)
+                        .map(|value| value / 1_000_000.0),
+                    fast_multiplier: fast_multiplier_overrides
+                        .multiplier_for(&model_id)
+                        .unwrap_or(1.0),
                 },
             );
             if let Some(context_limit) = model.limit.and_then(|limit| limit.context) {
-                self.context_limits.insert(model_id, context_limit);
+                self.context_limits.insert(model_id.clone(), context_limit);
+            }
+            if let Some(threshold) = long_context_threshold {
+                self.long_context_thresholds
+                    .insert(model_id.clone(), threshold);
             }
             loaded_count += 1;
         }
@@ -361,6 +447,36 @@ impl PricingMap {
     }
 
     pub(crate) fn find(&self, model: &str) -> Option<Pricing> {
+        let key = model.to_string();
+        if let Ok(cache) = self.lookup_cache.lock() {
+            if let Some(value) = cache.get(&key) {
+                return *value;
+            }
+        }
+        let result = self.find_uncached(model);
+        if let Ok(mut cache) = self.lookup_cache.lock() {
+            cache.insert(key, result);
+        }
+        result
+    }
+
+    pub(crate) fn find_at(&self, model: &str, timestamp_ms: Option<i64>) -> Option<Pricing> {
+        if let Some(timestamp_ms) = timestamp_ms {
+            let normalized = normalized_pricing_key(model);
+            if let Some(period) = self.historical.iter().find(|period| {
+                (period.model == model
+                    || period.model == normalized.as_ref()
+                    || pricing_key_matches(&period.model, model, normalized.as_ref()))
+                    && timestamp_ms >= period.start_ms
+                    && period.end_ms.is_none_or(|end| timestamp_ms < end)
+            }) {
+                return Some(period.pricing);
+            }
+        }
+        self.find(model)
+    }
+
+    fn find_uncached(&self, model: &str) -> Option<Pricing> {
         self.find_entry_or_alias(model)
             .or_else(|| {
                 self.enable_models_dev_fallback
@@ -375,6 +491,22 @@ impl PricingMap {
             .or_else(|| {
                 self.enable_embedded_models_dev_fallback
                     .then(|| embedded_models_dev_pricing().find_entry_or_alias(model))
+                    .flatten()
+            })
+    }
+
+    pub(crate) fn find_exact_with_fallback(&self, model: &str) -> Option<Pricing> {
+        self.entries
+            .get(model)
+            .copied()
+            .or_else(|| {
+                self.enable_models_dev_fallback
+                    .then(|| models_dev_pricing().and_then(|map| map.entries.get(model).copied()))
+                    .flatten()
+            })
+            .or_else(|| {
+                self.enable_embedded_models_dev_fallback
+                    .then(|| embedded_models_dev_pricing().entries.get(model).copied())
                     .flatten()
             })
     }
@@ -397,6 +529,46 @@ impl PricingMap {
                 })
                 .map(|(_, pricing)| *pricing)
         })
+    }
+
+    pub(crate) fn long_context_threshold(&self, model: &str) -> u64 {
+        let canonical_model = pricing_alias(model).unwrap_or(model);
+        self.long_context_threshold_entry(canonical_model)
+            .or_else(|| {
+                self.enable_models_dev_fallback
+                    .then(|| {
+                        models_dev_pricing().and_then(|pricing| {
+                            pricing.long_context_threshold_entry(canonical_model)
+                        })
+                    })
+                    .flatten()
+            })
+            .or_else(|| {
+                self.enable_embedded_models_dev_fallback
+                    .then(|| {
+                        embedded_models_dev_pricing().long_context_threshold_entry(canonical_model)
+                    })
+                    .flatten()
+            })
+            .unwrap_or(200_000)
+    }
+
+    fn long_context_threshold_entry(&self, model: &str) -> Option<u64> {
+        self.long_context_thresholds
+            .get(model)
+            .copied()
+            .or_else(|| {
+                let normalized_model = normalized_pricing_key(model);
+                self.long_context_thresholds
+                    .iter()
+                    .filter(|(candidate, _)| {
+                        pricing_key_matches(candidate, model, normalized_model.as_ref())
+                    })
+                    .max_by(|(left, _), (right, _)| {
+                        left.len().cmp(&right.len()).then_with(|| right.cmp(left))
+                    })
+                    .map(|(_, threshold)| *threshold)
+            })
     }
 
     pub(crate) fn context_limit(&self, model: &str) -> Option<u64> {
@@ -443,6 +615,26 @@ impl PricingMap {
         for (model, override_value) in overrides {
             self.apply_override(model, override_value);
         }
+    }
+
+    fn models_dev_context_tier(cost: &ModelsDevCost) -> Option<&ModelsDevCostTier> {
+        cost.tiers
+            .as_deref()
+            .into_iter()
+            .flatten()
+            .filter(|tier| {
+                tier.tier
+                    .as_ref()
+                    .and_then(|spec| spec.kind.as_deref())
+                    .is_none_or(|kind| kind.eq_ignore_ascii_case("context"))
+            })
+            .min_by_key(|tier| {
+                tier.tier
+                    .as_ref()
+                    .and_then(|spec| spec.size)
+                    .unwrap_or(u64::MAX)
+            })
+            .or(cost.context_over_200k.as_ref())
     }
 
     fn apply_override(&mut self, model: &str, override_value: &PricingOverride) {
@@ -528,6 +720,9 @@ impl PricingMap {
         };
 
         self.entries.insert(model.to_string(), pricing);
+        if let Ok(mut cache) = self.lookup_cache.lock() {
+            cache.clear();
+        }
         if let Some(limit) = override_value.max_input_tokens {
             self.context_limits.insert(model.to_string(), limit);
         }
@@ -539,11 +734,47 @@ impl PricingMap {
     }
 
     #[cfg(test)]
+    fn lookup_cache_len(&self) -> usize {
+        self.lookup_cache
+            .lock()
+            .map(|cache| cache.len())
+            .unwrap_or(0)
+    }
+
+    #[cfg(test)]
     fn models_dev_fallback_enabled(&self) -> bool {
         self.enable_models_dev_fallback
     }
 
     fn put_builtin_pricing(&mut self, fast_multiplier_overrides: &FastMultiplierOverrides) {
+        for (model, input, output, cache_create, cache_read) in [
+            ("gpt-5.6-luna", 0.2e-6, 1.2e-6, 0.25e-6, 0.02e-6),
+            ("gpt-6-astra", 10e-6, 50e-6, 12.5e-6, 1e-6),
+            ("gemini-3.6-flash", 0.75e-6, 3.75e-6, 0.9375e-6, 0.075e-6),
+        ] {
+            self.entries.insert(
+                model.to_string(),
+                Pricing {
+                    input,
+                    output,
+                    cache_create,
+                    cache_read,
+                    cache_read_explicit: true,
+                    input_above_200k: None,
+                    output_above_200k: None,
+                    cache_create_above_200k: None,
+                    cache_read_above_200k: None,
+                    fast_multiplier: fast_multiplier_overrides
+                        .multiplier_for(model)
+                        .unwrap_or(1.0),
+                },
+            );
+            if matches!(model, "gpt-5.6-luna" | "gpt-6-astra") {
+                self.long_context_thresholds
+                    .insert(model.to_string(), 272_000);
+            }
+            self.context_limits.insert(model.to_string(), 1_050_000);
+        }
         self.entries.insert(
             "claude-opus-4-5".to_string(),
             Pricing {
@@ -995,6 +1226,47 @@ impl PricingMap {
             self.context_limits.insert(model.to_string(), 200_000);
         }
     }
+
+    fn put_builtin_historical_pricing(&mut self) {
+        // DeepSeek v4 pricing changed during the 2026-08-17 rollout. Keep the
+        // periods explicit so dated Antigravity events are charged using the
+        // rate that was active when they were recorded.
+        let base = self
+            .entries
+            .get("deepseek-v4-flash")
+            .copied()
+            .unwrap_or(Pricing {
+                input: 0.3e-6,
+                output: 1.2e-6,
+                cache_create: 0.0,
+                cache_read: 0.006e-6,
+                cache_read_explicit: true,
+                input_above_200k: None,
+                output_above_200k: None,
+                cache_create_above_200k: None,
+                cache_read_above_200k: None,
+                fast_multiplier: 1.0,
+            });
+        let split = crate::parse_ts_timestamp("2026-08-17T12:00:00Z")
+            .expect("valid built-in pricing period")
+            .as_millis();
+        let mut before = base;
+        before.input = 0.44e-6;
+        let mut after = base;
+        after.input = 0.22e-6;
+        self.historical.push(PricingPeriod {
+            model: "deepseek-v4-flash".to_string(),
+            start_ms: i64::MIN,
+            end_ms: Some(split),
+            pricing: before,
+        });
+        self.historical.push(PricingPeriod {
+            model: "deepseek-v4-flash".to_string(),
+            start_ms: split,
+            end_ms: None,
+            pricing: after,
+        });
+    }
 }
 
 fn parse_litellm_pricing(value: Value) -> Option<LiteLlmPricing> {
@@ -1013,6 +1285,7 @@ fn parse_litellm_pricing(value: Value) -> Option<LiteLlmPricing> {
             cache_creation_input_token_cost_above_200k_tokens: compact.cca,
             cache_read_input_token_cost_above_200k_tokens: compact.cra,
             max_input_tokens: compact.ctx,
+            long_context_threshold: compact.lct,
             provider_specific_entry: compact
                 .fast
                 .map(|fast| ProviderSpecificEntry { fast: Some(fast) }),
@@ -1065,12 +1338,22 @@ fn models_dev_entry_has_required_cost(value: &Value) -> bool {
 
 /// Matches pricing keys across provider/model aliases while preserving version boundaries.
 fn pricing_key_matches(candidate: &str, model: &str, normalized_model: &str) -> bool {
+    if is_generic_pricing_key(candidate) {
+        return false;
+    }
     if contains_pricing_key(model, candidate) || contains_pricing_key(candidate, model) {
         return true;
     }
     let normalized_candidate = normalized_pricing_key(candidate);
     contains_pricing_key(normalized_model, normalized_candidate.as_ref())
         || contains_pricing_key(normalized_candidate.as_ref(), normalized_model)
+}
+
+fn is_generic_pricing_key(candidate: &str) -> bool {
+    matches!(
+        candidate.to_ascii_lowercase().as_str(),
+        "auto" | "default" | "latest" | "unknown"
+    )
 }
 
 /// Finds a key only when the surrounding bytes are non-alphanumeric boundaries.
@@ -1134,6 +1417,8 @@ fn normalized_pricing_key(value: &str) -> Cow<'_, str> {
 /// canonical pricing keys.
 fn pricing_alias(model: &str) -> Option<&'static str> {
     match model {
+        "gpt-reserve" => Some("gpt-5.6-luna"),
+        "gpt-5.6" => Some("gpt-5.6-sol"),
         "gpt-5.3-spark" => Some("gpt-5.3-codex-spark"),
         _ => None,
     }
@@ -1166,8 +1451,13 @@ fn embedded_models_dev_pricing() -> &'static PricingMap {
     static EMBEDDED_MODELS_DEV_PRICING: OnceLock<PricingMap> = OnceLock::new();
     EMBEDDED_MODELS_DEV_PRICING.get_or_init(|| {
         let mut map = PricingMap::default();
-        map.load_models_dev_json_missing(BUILD_TIME_MODELS_DEV_JSON)
+        let loaded = map
+            .load_models_dev_json_missing(BUILD_TIME_MODELS_DEV_JSON)
             .expect("embedded models-dev-pricing.json must parse");
+        assert!(
+            loaded > 0,
+            "embedded models-dev-pricing.json must not be empty"
+        );
         map
     })
 }
@@ -1188,9 +1478,15 @@ where
         }
     };
     let mut map = PricingMap::default();
-    if map.load_models_dev_json_missing(&json).is_none() {
+    let Some(loaded) = map.load_models_dev_json_missing(&json) else {
         if should_log_pricing_refresh_details() {
             eprintln!("WARN  Failed to parse models.dev pricing; using LiteLLM pricing.");
+        }
+        return None;
+    };
+    if loaded == 0 {
+        if should_log_pricing_refresh_details() {
+            eprintln!("WARN  models.dev pricing snapshot is empty; using LiteLLM pricing.");
         }
         return None;
     }
@@ -1206,26 +1502,132 @@ fn fetch_models_dev_json() -> std::io::Result<String> {
 }
 
 fn fetch_json_url(url: &str) -> std::io::Result<String> {
+    let cache = PricingHttpCache::for_url(url);
     let agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(PRICING_FETCH_TIMEOUT_SECONDS)))
         .build()
         .new_agent();
-    let mut response = agent
-        .get(url)
-        .call()
-        .map_err(|error| std::io::Error::other(error.to_string()))?;
-    if response.status().as_u16() != 200 {
-        return Err(std::io::Error::other(format!(
-            "HTTP {}",
-            response.status().as_u16()
-        )));
+    let mut request = agent.get(url);
+    if let Some(etag) = cache.etag() {
+        request = request.header("If-None-Match", &etag);
     }
-    response
+    let mut response = match request.call() {
+        Ok(response) => response,
+        Err(error) => {
+            return cache
+                .body()
+                .ok_or_else(|| std::io::Error::other(error.to_string()));
+        }
+    };
+    let status = response.status().as_u16();
+    if status == 304 {
+        return cache.body().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "304 response without cache",
+            )
+        });
+    }
+    if status != 200 {
+        return cache.body().ok_or_else(|| {
+            std::io::Error::other(format!("HTTP {status}; no usable cached pricing"))
+        });
+    }
+    let body = response
         .body_mut()
         .with_config()
         .limit(PRICING_FETCH_MAX_BYTES)
         .read_to_string()
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))?;
+    if !body.trim().is_empty() {
+        let etag = response
+            .headers()
+            .get("etag")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        cache.store(&body, etag.as_deref());
+    }
+    Ok(body)
+}
+
+#[derive(Debug, Clone)]
+struct PricingHttpCache {
+    body_path: PathBuf,
+    meta_path: PathBuf,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct PricingHttpCacheMeta {
+    etag: Option<String>,
+}
+
+impl PricingHttpCache {
+    fn for_url(url: &str) -> Self {
+        let root = env::var_os("LOCALAPPDATA")
+            .or_else(|| env::var_os("XDG_CACHE_HOME"))
+            .or_else(|| env::var_os("HOME"))
+            .map(PathBuf::from)
+            .unwrap_or_else(env::temp_dir);
+        let name = if url == LITELLM_PRICING_URL {
+            "litellm"
+        } else if url == MODELS_DEV_API_URL {
+            "models-dev"
+        } else {
+            "remote"
+        };
+        let dir = root.join("Agent Burn").join("pricing-cache");
+        Self {
+            body_path: dir.join(format!("{name}.json")),
+            meta_path: dir.join(format!("{name}.meta.json")),
+        }
+    }
+
+    fn body(&self) -> Option<String> {
+        let body = fs::read_to_string(&self.body_path).ok()?;
+        (body.len() as u64 <= PRICING_FETCH_MAX_BYTES && !body.trim().is_empty()).then_some(body)
+    }
+
+    fn etag(&self) -> Option<String> {
+        serde_json::from_str::<PricingHttpCacheMeta>(&fs::read_to_string(&self.meta_path).ok()?)
+            .ok()
+            .and_then(|meta| meta.etag)
+            .filter(|etag| !etag.trim().is_empty())
+    }
+
+    fn store(&self, body: &str, etag: Option<&str>) {
+        if body.len() as u64 > PRICING_FETCH_MAX_BYTES {
+            return;
+        }
+        let Some(parent) = self.body_path.parent() else {
+            return;
+        };
+        if fs::create_dir_all(parent).is_err() {
+            return;
+        }
+        let body_tmp = self.body_path.with_extension("json.tmp");
+        if fs::write(&body_tmp, body).is_ok() {
+            replace_cache_file(&body_tmp, &self.body_path);
+        }
+        let meta = PricingHttpCacheMeta {
+            etag: etag.map(str::to_string),
+        };
+        if let Ok(meta_json) = serde_json::to_vec(&meta) {
+            let meta_tmp = self.meta_path.with_extension("meta.json.tmp");
+            if fs::write(&meta_tmp, meta_json).is_ok() {
+                replace_cache_file(&meta_tmp, &self.meta_path);
+            }
+        }
+    }
+}
+
+fn replace_cache_file(tmp: &std::path::Path, target: &std::path::Path) {
+    if fs::rename(tmp, target).is_err() {
+        // Windows does not replace an existing file with rename. The target
+        // is an expendable pricing cache, so remove only that exact path and
+        // retry; the embedded snapshot remains the source of truth offline.
+        let _ = fs::remove_file(target);
+        let _ = fs::rename(tmp, target);
+    }
 }
 
 #[cfg(test)]
@@ -1242,6 +1644,14 @@ mod tests {
         let pricing = PricingMap::load_embedded();
         assert!(pricing.len() > 0);
         assert!(pricing.find("claude-sonnet-4-20250514").is_some());
+    }
+
+    #[test]
+    fn caches_successful_and_missing_model_lookups() {
+        let pricing = PricingMap::load_embedded();
+        let _ = pricing.find("gpt-5.6-sol");
+        let _ = pricing.find("model-that-does-not-exist");
+        assert!(pricing.lookup_cache_len() >= 2);
     }
 
     #[test]
@@ -1707,6 +2117,51 @@ mod tests {
     }
 
     #[test]
+    fn embedded_models_dev_snapshot_is_non_empty_and_contains_core_providers() {
+        let map = embedded_models_dev_pricing();
+        assert!(map.len() >= 20);
+        assert!(map.find_entry_or_alias("gpt-5.6-luna").is_some());
+        assert!(map.find_entry_or_alias("kimi-k3").is_some());
+        assert!(map.find_entry_or_alias("deepseek-v4-pro").is_some());
+        assert_eq!(map.long_context_threshold("gpt-5.6-luna"), 272_000);
+        let luna = map.find_entry_or_alias("gpt-5.6-luna").unwrap();
+        assert!((luna.input_above_200k.unwrap() - 0.4e-6).abs() < 1e-15);
+        assert!((luna.cache_create_above_200k.unwrap() - 0.5e-6).abs() < 1e-15);
+    }
+
+    #[test]
+    fn pricing_http_cache_round_trips_body_and_etag() {
+        let fixture = fs_fixture!({});
+        let cache = super::PricingHttpCache {
+            body_path: fixture.path("cache/pricing.json"),
+            meta_path: fixture.path("cache/pricing.meta.json"),
+        };
+        cache.store("{\"ok\":true}", Some("\"v1\""));
+        assert_eq!(cache.body().as_deref(), Some("{\"ok\":true}"));
+        assert_eq!(cache.etag().as_deref(), Some("\"v1\""));
+    }
+
+    #[test]
+    fn dated_pricing_uses_the_rate_active_at_event_time() {
+        let pricing = PricingMap::load_embedded();
+        let before = crate::parse_ts_timestamp("2026-08-17T11:59:59Z")
+            .unwrap()
+            .as_millis();
+        let after = crate::parse_ts_timestamp("2026-08-17T12:00:00Z")
+            .unwrap()
+            .as_millis();
+
+        let old_rate = pricing
+            .find_at("deepseek/deepseek-v4-flash", Some(before))
+            .expect("historical DeepSeek rate should resolve through a provider prefix");
+        let new_rate = pricing
+            .find_at("deepseek-v4-flash", Some(after))
+            .expect("current DeepSeek rate should resolve");
+
+        assert!(old_rate.input > new_rate.input);
+    }
+
+    #[test]
     fn offline_resolves_models_only_in_embedded_models_dev() {
         use agent_burn_cli::PricingOverride;
         let offline = PricingMap::load_with_overrides(
@@ -1794,6 +2249,20 @@ mod tests {
         assert_eq!(pricing.find("gpt-5.5").unwrap().fast_multiplier, 2.5);
         assert_eq!(pricing.find("gpt-5.4").unwrap().fast_multiplier, 2.0);
         assert_eq!(pricing.find("gpt-5.3-codex").unwrap().fast_multiplier, 2.0);
+        assert_eq!(pricing.find("gpt-6-astra").unwrap().fast_multiplier, 2.0);
+    }
+
+    #[test]
+    fn embedded_pricing_resolves_codex_gpt_reserve_to_gpt_5_6_luna() {
+        let pricing = PricingMap::load_embedded();
+        let reserve = pricing.find("gpt-reserve").expect("reserve alias pricing");
+        let luna = pricing.find("gpt-5.6-luna").expect("luna pricing");
+
+        assert_eq!(reserve.input, luna.input);
+        assert_eq!(reserve.output, luna.output);
+        assert_eq!(reserve.cache_read, luna.cache_read);
+        assert_eq!(reserve.fast_multiplier, luna.fast_multiplier);
+        assert_eq!(pricing.long_context_threshold("gpt-reserve"), 272_000);
     }
 
     #[test]
@@ -1970,7 +2439,7 @@ mod tests {
 
         assert!(pricing.find("claude-opus-4-8-20270898").is_some());
         assert!(pricing.find("claude-opus-4-9").is_none());
-        assert!(pricing.find("claude-opus-5").is_none());
+        assert!(pricing.find("claude-opus-9").is_none());
     }
 
     #[test]

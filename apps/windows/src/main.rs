@@ -1,6 +1,7 @@
 #![windows_subsystem = "windows"]
 
 mod antigravity;
+mod antigravity_cloud;
 mod app;
 mod archive;
 mod autostart;
@@ -24,6 +25,13 @@ fn close_action() -> CloseAction {
 
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_shell::init())
         .manage(AppState::new())
         .setup(|app| {

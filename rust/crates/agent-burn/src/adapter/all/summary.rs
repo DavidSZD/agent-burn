@@ -8,10 +8,10 @@ use crate::{
     Color, IsoDate, MILLIS_PER_DAY, ModelBreakdown, PricingMap, Result, TimestampMs,
     adapter::{claude, codex, cursor},
     cli::{AgentReportKind, SharedArgs, SummaryArgs, SummaryRange, WeekDay},
-    cost::tiered_cost,
+    cost::tiered_cost_with_threshold,
     fast::FxHashMap,
-    format_currency, format_date_tz, format_utc_date, json_float, parse_iso_date, parse_tz,
-    print_json_or_jq, utc_now, wants_json, week_start,
+    format_currency, format_date_tz, format_naive_date, format_utc_date, json_float,
+    parse_iso_date, parse_tz, print_json_or_jq, utc_now, wants_json, week_start,
 };
 
 use super::{
@@ -98,6 +98,13 @@ pub(super) fn run(args: SummaryArgs) -> Result<()> {
 
     if wants_json(&shared) {
         let mut output = detail::to_json(&summary, &result.rows);
+        if range.is_none() && std::env::var("AGENT_BURN_TIMELINE_CACHE").as_deref() == Ok("1") {
+            let timezone = parse_tz(shared.timezone.as_deref());
+            let today = format_date_tz(utc_now(), timezone.as_ref());
+            if let Some(today) = parse_iso_date(&today) {
+                output["timelineReports"] = timeline_json_reports(&result.rows, today);
+            }
+        }
         if value
             && (shared.agents.is_empty() || shared.agents.iter().any(|agent| agent == "cursor"))
             && let Some(account) = cursor::load_account(shared.offline)
@@ -200,6 +207,35 @@ fn range_bounds(today: IsoDate, range: SummaryRange) -> (Option<IsoDate>, Option
         .then(|| today.checked_add_days(-1))
         .flatten();
     (since, until)
+}
+
+fn timeline_json_reports(rows: &[AllRow], today: IsoDate) -> Value {
+    let ranges = [
+        ("today", SummaryRange::Today),
+        ("yesterday", SummaryRange::Yesterday),
+        ("wtd", SummaryRange::Wtd),
+        ("mtd", SummaryRange::Mtd),
+        ("ytd", SummaryRange::Ytd),
+        ("week", SummaryRange::Week),
+        ("month", SummaryRange::Month),
+    ];
+    let mut reports = serde_json::Map::new();
+    for (name, range) in ranges {
+        let (since, until) = range_bounds(today, range);
+        let since = since.map(format_naive_date);
+        let until = until.map(format_naive_date);
+        let filtered = rows
+            .iter()
+            .filter(|row| {
+                since.as_ref().is_none_or(|start| &row.period >= start)
+                    && until.as_ref().is_none_or(|end| &row.period <= end)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let summary = Summary::from_rows(&filtered);
+        reports.insert(name.to_string(), detail::to_json(&summary, &filtered));
+    }
+    Value::Object(reports)
 }
 
 fn compact_date(date: IsoDate) -> String {
@@ -511,23 +547,27 @@ fn estimated_model_category_costs(
     } else {
         model_pricing.cache_read
     };
+    let threshold = pricing.long_context_threshold(&model.model_name);
     CategoryCosts {
-        input: tiered_cost(
+        input: tiered_cost_with_threshold(
             model.input_tokens,
             model_pricing.input,
             model_pricing.input_above_200k,
+            threshold,
         ),
-        output: tiered_cost(
+        output: tiered_cost_with_threshold(
             model.output_tokens,
             model_pricing.output,
             model_pricing.output_above_200k,
+            threshold,
         ),
-        cache_creation: tiered_cost(
+        cache_creation: tiered_cost_with_threshold(
             model.cache_creation_tokens,
             model_pricing.cache_create,
             model_pricing.cache_create_above_200k,
+            threshold,
         ),
-        cache_read: tiered_cost(
+        cache_read: tiered_cost_with_threshold(
             model.cache_read_tokens,
             cache_read_rate,
             if agent == "codex" && !model_pricing.cache_read_explicit {
@@ -535,6 +575,7 @@ fn estimated_model_category_costs(
             } else {
                 model_pricing.cache_read_above_200k
             },
+            threshold,
         ),
     }
     .scale(multiplier)
@@ -698,6 +739,10 @@ struct ModelTotal {
     model: String,
     cost: f64,
     tokens: u64,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_write_tokens: u64,
+    cache_read_tokens: u64,
 }
 
 struct DayTotal {
@@ -781,11 +826,19 @@ impl Summary {
                             model: breakdown.model_name.clone(),
                             cost: 0.0,
                             tokens: 0,
+                            input_tokens: 0,
+                            output_tokens: 0,
+                            cache_write_tokens: 0,
+                            cache_read_tokens: 0,
                         });
                         models.len() - 1
                     });
                 models[index].cost += breakdown.cost;
                 models[index].tokens += tokens;
+                models[index].input_tokens += breakdown.input_tokens;
+                models[index].output_tokens += breakdown.output_tokens;
+                models[index].cache_write_tokens += breakdown.cache_creation_tokens;
+                models[index].cache_read_tokens += breakdown.cache_read_tokens;
             }
         }
 
@@ -845,6 +898,10 @@ impl Summary {
                     "model": model.model,
                     "totalCost": json_float(model.cost),
                     "totalTokens": model.tokens,
+                    "inputTokens": model.input_tokens,
+                    "outputTokens": model.output_tokens,
+                    "cacheWriteTokens": model.cache_write_tokens,
+                    "cacheReadTokens": model.cache_read_tokens,
                     "percentage": json_float(percentage(model.cost, self.total_cost)),
                 }))
                 .collect::<Vec<_>>(),
@@ -1100,6 +1157,7 @@ fn agent_color(agent: &str) -> Color {
         "codex" => Color::Green,
         "cursor" => Color::Red,
         "gemini" => Color::Blue,
+        "antigravity" => Color::Blue,
         "droid" => Color::Yellow,
         _ => Color::Cyan,
     }
@@ -1275,6 +1333,51 @@ mod tests {
         assert_eq!(output["daily"][0]["cost"], 11.0);
         assert_eq!(output["agents"][0]["daily"][0]["cost"], 9.0);
         assert_eq!(output["agents"][0]["daily"][0]["date"], "2026-01-01");
+    }
+
+    #[test]
+    fn model_json_exposes_each_token_class() {
+        let rows = vec![day_row(
+            12.0,
+            100,
+            Vec::new(),
+            vec![model_token_breakdown("test-model", 10, 20, 30, 40, 12.0)],
+        )];
+
+        let output = Summary::from_rows(&rows).to_json();
+
+        assert_eq!(output["models"][0]["inputTokens"], 10);
+        assert_eq!(output["models"][0]["outputTokens"], 20);
+        assert_eq!(output["models"][0]["cacheWriteTokens"], 30);
+        assert_eq!(output["models"][0]["cacheReadTokens"], 40);
+    }
+
+    #[test]
+    fn one_loaded_report_builds_every_timeline_cache() {
+        let mut yesterday = day_row(
+            2.0,
+            20,
+            Vec::new(),
+            vec![model_token_breakdown("old", 20, 0, 0, 0, 2.0)],
+        );
+        yesterday.period = "2026-09-16".into();
+        let mut today = day_row(
+            3.0,
+            30,
+            Vec::new(),
+            vec![model_token_breakdown("new", 30, 0, 0, 0, 3.0)],
+        );
+        today.period = "2026-09-17".into();
+
+        let reports = timeline_json_reports(
+            &[yesterday, today],
+            IsoDate::from_ymd(2026, 9, 17).expect("valid date"),
+        );
+
+        assert_eq!(reports["today"]["totals"]["totalTokens"], 30);
+        assert_eq!(reports["yesterday"]["totals"]["totalTokens"], 20);
+        assert_eq!(reports["ytd"]["totals"]["totalTokens"], 50);
+        assert_eq!(reports["today"]["models"][0]["inputTokens"], 30);
     }
 
     #[test]

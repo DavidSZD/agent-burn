@@ -15,7 +15,8 @@ The system-tray tooltip provides live quota remaining for detected providers. Po
 - **Local-First & Offline**: Reads local logs directly. No source code or prompts ever leave your machine.
 - **Recoverable history**: Atomic cache and backup files plus an append-only journal recover the latest report after cache corruption.
 - **Instant timeline switching**: Persisted period caches open immediately; stale selections refresh unobtrusively while startup preloads the remaining periods in the background.
-- **Antigravity without the desktop app**: Live weekly and five-hour quotas are collected through the authenticated `agy` CLI, with the local language server and persisted account tier used for plan detection.
+- **Antigravity without the desktop app**: Live weekly and five-hour quotas first use the Windows Credential Manager and Code Assist API, then the local language server, with the authenticated `agy` CLI retained only as a compatibility fallback.
+- **Pricing snapshot**: The embedded `models.dev` snapshot was regenerated on 2026-09-18 and validated for GPT-5.6, Antigravity/Gemini, Kimi K3, and DeepSeek models, including long-context tiers.
 
 ## Architecture
 
@@ -28,7 +29,7 @@ apps/windows/
 │   ├── main.rs         # Application entry point and Tauri setup
 │   ├── app.rs          # App state, settings, and CLI path resolver
 │   ├── tray.rs         # Windows System Tray (Taskbar Notification Area)
-│   ├── background.rs   # Async background polling worker (every 60s)
+│   ├── background.rs   # Concurrent provider refresh coordinator
 │   └── commands.rs     # Tauri IPC commands (get_summary, get_harness, refresh)
 ├── ui/
 │   ├── index.html      # Responsive dashboard UI (Geist / dark flame theme)
@@ -62,9 +63,12 @@ The release bundle contains `agent-burn.exe`; the desktop application never down
 Build or download an installer with a version newer than the installed copy, close Agent Burn from its tray menu, then launch it in update mode:
 
 ```powershell
-Start-Process '.\Agent Burn_0.1.19_x64-setup.exe' -ArgumentList '/UPDATE' -Wait
+Start-Process '.\Agent Burn_0.1.57_x64-setup.exe' -ArgumentList '/UPDATE' -Wait
 ```
 
 Update mode replaces the application in place without showing the uninstall/data-removal flow. Dashboard settings and history under `%LOCALAPPDATA%\Agent Burn` are preserved. Automatic network updates are not enabled, so release installers remain the explicit update channel until a signed release feed is configured.
 
 Unknown subscription records are displayed as Free instead of receiving a fabricated monthly price. Antigravity Pro is valued at $20/month; Antigravity Ultra users select either $100 or $200/month in Settings. Provider-qualified and effort-qualified model identifiers are normalized only through tested aliases backed by the embedded pricing snapshot.
+To validate an actual production installer without deleting the existing data,
+run `verify-update.ps1` with the setup path. It keeps a temporary backup and
+checks settings, report cache, and quota history after `/UPDATE`.

@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   createCoalescedSaver,
   createSingleFlight,
+  aggregateTokenBreakdown,
   escapeHtml,
   getRestoredPeriod,
   timelineStartDate,
@@ -11,18 +12,30 @@ import {
   quotaPresentation,
   quotaRemainingPercent,
   mergeLiveSubscription,
+  selectedTimelineReport,
   persistQuotaSource,
   timelineSelection,
   timelinePreloadOrder,
   isTimelineCacheFresh,
+  latestTimelineUpdatedAt,
+  modelPricingTooltip,
+  modelPricingRows,
+  createReplaceableCallback,
+  restoredTab,
   loadQuotaHistory,
   resetWindowStartDate,
   refreshStaticTimelineFreshness,
   shouldRefreshTimelineInBackground,
   timelinePeriodEntries,
   updateCachedReportsFromToday,
+  updateCacheFromAllSnapshot,
+  updateCacheFromTimelineSnapshot,
+  mergeSourceSnapshot,
+  refreshStatusText,
+  waitForInitialRefresh,
   subscriptionPresentation,
   visibleTokenBreakdownEntries,
+  visibleAgents,
 } from "./ui-utils.js";
 
 test("coalesced saves keep the in-flight write and only the newest pending state", async () => {
@@ -80,6 +93,20 @@ test("quota history is loaded independently from a timeline refresh", async () =
   assert.deepEqual(result, history);
 });
 
+test("selected timeline data remains the source for the saved general report", () => {
+  const selected = {
+    daily: [{ date: "2026-09-18", cost: 4.5, tokens: 12 }],
+    totals: { totalCost: 4.5, totalTokens: 12 },
+  };
+  const fallback = { totals: { totalCost: 0, totalTokens: 0 } };
+  const live = { subscription: { agents: [{ agent: "codex", plan: "Free" }] } };
+
+  assert.deepEqual(
+    selectedTimelineReport({ mtd: { reportData: selected } }, "mtd", fallback, live),
+    { ...selected, subscription: live.subscription },
+  );
+});
+
 test("keeps the current dashboard visible while an uncached timeline loads", () => {
   const currentReport = { totals: { totalCost: 12 } };
 
@@ -105,6 +132,93 @@ test("refreshes a selected timeline only after its five minute freshness window"
   assert.equal(isTimelineCacheFresh({ reportData: {} }, 2_000), false);
 });
 
+test("shows elapsed time while an automatic refresh is running", () => {
+  assert.equal(
+    refreshStatusText({ updatedAt: 1_000, refreshStartedAt: 10_000 }, 72_500),
+    "Last update 1 min 11 sec ago · Updating · 1 min 2 sec",
+  );
+});
+
+test("shows the next automatic refresh when idle", () => {
+  assert.equal(
+    refreshStatusText({ updatedAt: 1_000, nextRefreshAt: 72_500 }, 12_500),
+    "Last update 11 sec ago · Next refresh in 1 min",
+  );
+});
+
+test("switches from zero-second countdown to updating", () => {
+  assert.equal(
+    refreshStatusText({ updatedAt: 1_000, nextRefreshAt: 12_000 }, 12_000),
+    "Last update 11 sec ago · Updating · 0 sec",
+  );
+});
+
+test("restoring a cache never invents a recent update time", () => {
+  assert.equal(latestTimelineUpdatedAt({ all: { reportData: {} }, today: { updatedAt: 42 } }), 42);
+  assert.equal(latestTimelineUpdatedAt({ all: { reportData: {} } }), null);
+});
+
+test("general token breakdown sums every detected harness", () => {
+  assert.deepEqual(aggregateTokenBreakdown([
+    { tokenBreakdown: { input: 10, output: 3, cacheRead: 5 } },
+    { tokenBreakdown: { input: 7, output: 2, cacheWrite: 4 } },
+  ]), { input: 17, output: 5, cacheWrite: 4, cacheRead: 5 });
+});
+
+test("restores only tabs that still exist", () => {
+  assert.equal(restoredTab("codex", ["codex", "antigravity"]), "codex");
+  assert.equal(restoredTab("settings", []), "settings");
+  assert.equal(restoredTab("missing", ["codex"]), "summary");
+});
+
+test("hidden harnesses are removed only from the tab bar", () => {
+  assert.deepEqual(visibleAgents(["antigravity", "codex"], ["antigravity"]), ["codex"]);
+});
+
+test("model pricing tooltip shows every available token rate", () => {
+  assert.equal(
+    modelPricingTooltip({ inputPerM: 1.25, outputPerM: 10, cacheReadPerM: 0.125, cacheWritePerM: 1.5625 }),
+    "Input $1.25 / 1M · Cached input $0.125 / 1M · Cache write $1.5625 / 1M · Output $10 / 1M",
+  );
+  assert.equal(modelPricingTooltip(null), "Pricing unavailable");
+});
+
+test("model pricing rows expose structured rates for the custom popover", () => {
+  assert.deepEqual(
+    modelPricingRows({ inputPerM: 1.25, outputPerM: 10, cacheReadPerM: 0.125, cacheWritePerM: 1.5625 }),
+    [
+      ["Input", "$1.25"],
+      ["Cached input", "$0.125"],
+      ["Cache write", "$1.5625"],
+      ["Output", "$10"],
+    ],
+  );
+  assert.deepEqual(modelPricingRows(null), []);
+});
+
+test("model table sort callbacks always use the latest rendered dataset", () => {
+  const rendered = [];
+  const callback = createReplaceableCallback((sort) => rendered.push(["old", sort]));
+  callback.replace((sort) => rendered.push(["current", sort]));
+
+  callback.run("input");
+
+  assert.deepEqual(rendered, [["current", "input"]]);
+});
+
+test("timeline preloading waits for the initial live refresh", async () => {
+  let release;
+  const initialRefresh = new Promise((resolve) => { release = resolve; });
+  let finished = false;
+  const waiting = waitForInitialRefresh(initialRefresh, 1_000, () => 0).then(() => { finished = true; });
+
+  await Promise.resolve();
+  assert.equal(finished, false);
+  release();
+  await waiting;
+  assert.equal(finished, true);
+});
+
 test("derives reset-to-date start from a weekly provider reset", () => {
   assert.equal(resetWindowStartDate("2026-09-23T04:34:22Z"), "2026-09-16");
   assert.equal(resetWindowStartDate(null, 48 * 60, new Date("2026-09-16T12:00:00Z")), "2026-09-14");
@@ -126,6 +240,55 @@ test("a fresh today report advances every timeline that contains today", () => {
   assert.equal(cache.ytd.updatedAt, 500);
   assert.deepEqual(cache.yesterday.reportData.totals, { totalCost: 5, totalTokens: 50 });
   assert.equal(cache.yesterday.updatedAt, 500);
+});
+
+test("a fresh today report advances per-model token classes", () => {
+  const cache = {
+    today: { reportData: { totals: {}, daily: [], agents: [], models: [{ model: "m", totalTokens: 10, inputTokens: 4, outputTokens: 1, cacheReadTokens: 5, cacheWriteTokens: 0 }] }, updatedAt: 1 },
+    all: { reportData: { totals: {}, daily: [], agents: [], models: [{ model: "m", totalTokens: 20, inputTokens: 8, outputTokens: 2, cacheReadTokens: 10, cacheWriteTokens: 0 }] }, updatedAt: 1 },
+  };
+  const freshToday = { totals: {}, daily: [], agents: [], models: [{ model: "m", totalTokens: 15, inputTokens: 6, outputTokens: 2, cacheReadTokens: 7, cacheWriteTokens: 0 }] };
+
+  updateCachedReportsFromToday(cache, freshToday, 500);
+
+  assert.deepEqual(cache.all.reportData.models[0], {
+    model: "m", totalTokens: 25, inputTokens: 10, outputTokens: 3, cacheReadTokens: 12, cacheWriteTokens: 0, percentage: 100,
+  });
+});
+
+test("a backend all-time snapshot refreshes the all-time cache without replacing other timelines", () => {
+  const today = { reportData: { totals: { totalCost: 2 } }, updatedAt: 10 };
+  const cache = {
+    all: { reportData: { totals: { totalCost: 8 } }, updatedAt: 10 },
+    today,
+  };
+  const freshAll = { totals: { totalCost: 12 }, subscription: { agents: [] } };
+
+  const entry = updateCacheFromAllSnapshot(cache, freshAll, 500);
+
+  assert.equal(entry, cache.all);
+  assert.deepEqual(cache.all, { reportData: freshAll, antigravityData: null, updatedAt: 500 });
+  assert.equal(cache.today, today);
+});
+
+test("one backend snapshot refreshes every included timeline", () => {
+  const cache = { today: { reportData: { totals: { totalTokens: 1 } }, updatedAt: 1 } };
+  const snapshot = {
+    totals: { totalTokens: 100 },
+    subscription: { agents: [{ agent: "codex", plan: "Free" }] },
+    timelineReports: {
+      today: { totals: { totalTokens: 10 }, agents: [], models: [] },
+      ytd: { totals: { totalTokens: 50 }, agents: [], models: [] },
+    },
+  };
+
+  updateCacheFromTimelineSnapshot(cache, snapshot, 500);
+
+  assert.equal(cache.all.reportData.timelineReports, undefined);
+  assert.equal(cache.today.reportData.totals.totalTokens, 10);
+  assert.equal(cache.today.reportData.subscription.agents[0].agent, "codex");
+  assert.equal(cache.today.updatedAt, 500);
+  assert.equal(cache.ytd.updatedAt, 500);
 });
 
 test("keeps yesterday fresh without rescanning during the same local day", () => {
@@ -167,7 +330,17 @@ test("refreshes yesterday in the background only after local midnight", () => {
     shouldRefreshTimelineInBackground("yesterday", yesterdayEntry, new Date(2026, 8, 17, 0, 1).getTime()),
     true,
   );
-  assert.equal(shouldRefreshTimelineInBackground("month", yesterdayEntry), false);
+  assert.equal(
+    shouldRefreshTimelineInBackground("month", yesterdayEntry, new Date(2026, 8, 16, 23, 59, 30).getTime()),
+    false,
+  );
+});
+
+test("preloads an old dynamic timeline before the user switches to it", () => {
+  const now = new Date(2026, 8, 17, 12, 0).getTime();
+
+  assert.equal(shouldRefreshTimelineInBackground("ytd", { updatedAt: now - 6 * 60 * 1000 }, now), true);
+  assert.equal(shouldRefreshTimelineInBackground("ytd", { updatedAt: now - 4 * 60 * 1000 }, now), false);
 });
 
 test("a newly detected agent is copied once into older timeline caches", () => {
@@ -253,6 +426,13 @@ test("does not invent a paid subscription price when none was detected", () => {
   });
 });
 
+test("an explicitly detected free plan has a zero monthly price", () => {
+  assert.deepEqual(subscriptionPresentation({ plan: "Free", pricePerMonth: 0 }), {
+    plan: "Free",
+    monthlyPrice: 0,
+  });
+});
+
 test("keeps a detected plan without inventing its unknown monthly price", () => {
   assert.deepEqual(subscriptionPresentation({ plan: "Pro", pricePerMonth: null }), {
     plan: "Pro",
@@ -333,4 +513,128 @@ test("live quota refresh waits for the first timeline report", () => {
   };
 
   assert.equal(mergeLiveSubscription(null, live), null);
+});
+
+test("partial source refresh replaces only that source and preserves slow providers", () => {
+  const periods = {
+    all: {
+      reportData: {
+        totals: { totalCost: 12, totalTokens: 120 },
+        agents: [
+          { agent: "codex", totalCost: 10, totalTokens: 100 },
+          { agent: "antigravity", totalCost: 2, totalTokens: 20 },
+        ],
+        models: [],
+        subscription: { agents: [{ agent: "antigravity", plan: "Pro" }] },
+      },
+      updatedAt: 100,
+    },
+  };
+  const merged = mergeSourceSnapshot(periods, {
+    totals: { totalCost: 11, totalTokens: 110 },
+    agents: [{ agent: "codex", totalCost: 11, totalTokens: 110 }],
+    models: [],
+    subscription: { agents: [{ agent: "codex", plan: "Free" }] },
+  }, 200);
+
+  assert.deepEqual(merged.agents.map((agent) => agent.agent), ["antigravity", "codex"]);
+  assert.equal(merged.totals.totalCost, 13);
+  assert.deepEqual(merged.subscription.agents.map((agent) => agent.agent), ["antigravity", "codex"]);
+  assert.equal(periods.all.updatedAt, 200);
+});
+
+test("partial source refresh removes stale rows when a source returns empty data", () => {
+  const periods = {
+    all: {
+      reportData: {
+        totals: { totalCost: 12, totalTokens: 120 },
+        agents: [
+          { agent: "codex", totalCost: 10, totalTokens: 100 },
+          { agent: "antigravity", totalCost: 2, totalTokens: 20 },
+        ],
+        models: [],
+        subscription: {
+          agents: [
+            { agent: "codex", plan: "Free" },
+            { agent: "antigravity", plan: "Pro" },
+          ],
+        },
+      },
+      updatedAt: 100,
+    },
+  };
+
+  const merged = mergeSourceSnapshot(
+    periods,
+    { agents: [], models: [], subscription: { agents: [] } },
+    "antigravity",
+    200,
+  );
+
+  assert.deepEqual(merged.agents.map((agent) => agent.agent), ["codex"]);
+  assert.deepEqual(merged.subscription.agents.map((agent) => agent.agent), ["codex"]);
+  assert.deepEqual(periods.all.reportData.agents.map((agent) => agent.agent), ["codex"]);
+});
+
+test("partial source refresh merges every returned timeline", () => {
+  const periods = {
+    all: {
+      reportData: {
+        totals: { totalCost: 2, totalTokens: 20 },
+        agents: [{ agent: "antigravity", totalCost: 2, totalTokens: 20 }],
+        models: [],
+        timelineReports: {
+          today: {
+            totals: { totalCost: 2, totalTokens: 20 },
+            agents: [{ agent: "antigravity", totalCost: 2, totalTokens: 20 }],
+            models: [],
+          },
+        },
+      },
+      updatedAt: 100,
+    },
+  };
+
+  mergeSourceSnapshot(periods, {
+    totals: { totalCost: 3, totalTokens: 30 },
+    agents: [{ agent: "codex", totalCost: 3, totalTokens: 30 }],
+    models: [],
+    timelineReports: {
+      today: {
+        totals: { totalCost: 3, totalTokens: 30 },
+        agents: [{ agent: "codex", totalCost: 3, totalTokens: 30 }],
+        models: [],
+      },
+      ytd: {
+        totals: { totalCost: 3, totalTokens: 30 },
+        agents: [{ agent: "codex", totalCost: 3, totalTokens: 30 }],
+        models: [],
+      },
+    },
+  }, 200);
+
+  assert.equal(periods.all.reportData.timelineReports.today.totals.totalTokens, 50);
+  assert.deepEqual(
+    periods.all.reportData.timelineReports.today.agents.map((agent) => agent.agent),
+    ["antigravity", "codex"],
+  );
+  assert.equal(periods.all.reportData.timelineReports.ytd.totals.totalTokens, 30);
+});
+
+test("partial source refresh rebuilds general daily spend from agent rows", () => {
+  const periodCache = {
+    all: {
+      reportData: {
+        agents: [{ agent: "codex", daily: [{ date: "2026-09-18", cost: 2, tokens: 10 }] }],
+        models: [],
+      },
+    },
+  };
+
+  const merged = mergeSourceSnapshot(periodCache, {
+    agents: [{ agent: "antigravity", daily: [{ date: "2026-09-18", cost: 3, tokens: 20 }] }],
+    models: [],
+  });
+
+  assert.deepEqual(merged.daily, [{ date: "2026-09-18", cost: 5, tokens: 30 }]);
 });

@@ -132,6 +132,7 @@ pub(crate) struct LoadedFile {
 pub(crate) struct CodexRawUsage {
     pub(crate) input_tokens: u64,
     pub(crate) cached_input_tokens: u64,
+    pub(crate) cache_write_input_tokens: u64,
     pub(crate) output_tokens: u64,
     pub(crate) reasoning_output_tokens: u64,
     pub(crate) total_tokens: u64,
@@ -144,6 +145,7 @@ pub(crate) struct CodexTokenUsageEvent {
     pub(crate) model: Option<String>,
     pub(crate) input_tokens: u64,
     pub(crate) cached_input_tokens: u64,
+    pub(crate) cache_write_input_tokens: u64,
     pub(crate) output_tokens: u64,
     pub(crate) reasoning_output_tokens: u64,
     pub(crate) total_tokens: u64,
@@ -154,6 +156,7 @@ pub(crate) struct CodexTokenUsageEvent {
 pub(crate) struct CodexModelUsage {
     pub(crate) input_tokens: u64,
     pub(crate) cached_input_tokens: u64,
+    pub(crate) cache_write_input_tokens: u64,
     pub(crate) output_tokens: u64,
     pub(crate) reasoning_output_tokens: u64,
     pub(crate) total_tokens: u64,
@@ -164,6 +167,7 @@ pub(crate) struct CodexModelUsage {
 pub(crate) struct CodexGroup {
     pub(crate) input_tokens: u64,
     pub(crate) cached_input_tokens: u64,
+    pub(crate) cache_write_input_tokens: u64,
     pub(crate) output_tokens: u64,
     pub(crate) reasoning_output_tokens: u64,
     pub(crate) total_tokens: u64,

@@ -17,13 +17,63 @@ export function visibleTokenBreakdownEntries(breakdown) {
   return entries;
 }
 
+export function aggregateTokenBreakdown(agents) {
+  const total = { input: 0, output: 0, cacheWrite: 0, cacheRead: 0 };
+  for (const agent of agents || []) {
+    const breakdown = agent?.tokenBreakdown || {};
+    for (const key of Object.keys(total)) total[key] += Number(breakdown[key]) || 0;
+  }
+  return total;
+}
+
+export function visibleAgents(detectedAgents, hiddenAgents) {
+  const hidden = new Set(hiddenAgents || []);
+  return (detectedAgents || []).filter((agent) => !hidden.has(agent));
+}
+
+export function restoredTab(storedTab, detectedAgents) {
+  if (storedTab === "summary" || storedTab === "settings") return storedTab;
+  return (detectedAgents || []).includes(storedTab) ? storedTab : "summary";
+}
+
+export function modelPricingTooltip(pricing) {
+  if (!pricing) return "Pricing unavailable";
+  return modelPricingRows(pricing)
+    .map(([label, value]) => `${label} ${value} / 1M`)
+    .join(" · ");
+}
+
+export function modelPricingRows(pricing) {
+  if (!pricing) return [];
+  const rate = (value) => `$${Number(value).toString()}`;
+  return [
+    ["Input", rate(pricing.inputPerM)],
+    ["Cached input", rate(pricing.cacheReadPerM)],
+    ["Cache write", rate(pricing.cacheWritePerM)],
+    ["Output", rate(pricing.outputPerM)],
+  ];
+}
+
+export function createReplaceableCallback(callback) {
+  let current = callback;
+  return {
+    replace(next) {
+      current = next;
+    },
+    run(...args) {
+      return current(...args);
+    },
+  };
+}
+
 export function subscriptionPresentation(subscription) {
   const rawPlan = String(subscription?.plan || "").trim();
   const unknownPlan = !rawPlan || /^(unknown|plan not detected)$/i.test(rawPlan);
+  const explicitlyFree = /^free$/i.test(rawPlan);
   const price = Number(subscription?.pricePerMonth);
   return {
     plan: unknownPlan ? "Free" : rawPlan,
-    monthlyPrice: Number.isFinite(price) && price > 0 ? price : null,
+    monthlyPrice: explicitlyFree ? 0 : (Number.isFinite(price) && price > 0 ? price : null),
   };
 }
 
@@ -39,6 +89,64 @@ export function timelineSelection(periodCache, period, currentReport, currentAnt
 
 export function isTimelineCacheFresh(entry, now = Date.now()) {
   return Number.isFinite(entry?.updatedAt) && now - entry.updatedAt <= 5 * 60 * 1000;
+}
+
+function formatElapsedSeconds(seconds) {
+  if (seconds < 60) return `${seconds} sec`;
+  const minutes = Math.floor(seconds / 60);
+  const remainingSeconds = seconds % 60;
+  return remainingSeconds > 0 ? `${minutes} min ${remainingSeconds} sec` : `${minutes} min`;
+}
+
+function lastUpdateLabel(updatedAt, now) {
+  if (!Number.isFinite(updatedAt)) return null;
+  const elapsedSeconds = Math.max(0, Math.floor((now - updatedAt) / 1000));
+  return elapsedSeconds < 5
+    ? "Last update just now"
+    : `Last update ${formatElapsedSeconds(elapsedSeconds)} ago`;
+}
+
+export function refreshStatusText({ updatedAt, refreshStartedAt, nextRefreshAt } = {}, now = Date.now()) {
+  const lastUpdate = lastUpdateLabel(updatedAt, now);
+  if (Number.isFinite(refreshStartedAt)) {
+    const elapsedSeconds = Math.max(0, Math.floor((now - refreshStartedAt) / 1000));
+    const status = `Updating · ${formatElapsedSeconds(elapsedSeconds)}`;
+    return lastUpdate ? `${lastUpdate} · ${status}` : status;
+  }
+  if (Number.isFinite(nextRefreshAt)) {
+    if (nextRefreshAt <= now) {
+      const elapsedSeconds = Math.max(0, Math.floor((now - nextRefreshAt) / 1000));
+      const status = `Updating · ${formatElapsedSeconds(elapsedSeconds)}`;
+      return lastUpdate ? `${lastUpdate} · ${status}` : status;
+    }
+    const untilNext = Math.max(0, Math.ceil((nextRefreshAt - now) / 1000));
+    const status = `Next refresh in ${formatElapsedSeconds(untilNext)}`;
+    return lastUpdate ? `${lastUpdate} · ${status}` : status;
+  }
+  if (!Number.isFinite(updatedAt)) return "Waiting for first update";
+
+  const elapsedSeconds = Math.max(0, Math.floor((now - updatedAt) / 1000));
+  if (elapsedSeconds < 5) return "Updated just now";
+  if (elapsedSeconds < 60) return `Updated ${elapsedSeconds} sec ago`;
+  return `Updated ${Math.floor(elapsedSeconds / 60)} min ago`;
+}
+
+export function latestTimelineUpdatedAt(periodCache) {
+  const timestamps = Object.values(periodCache || {})
+    .map((entry) => entry?.updatedAt)
+    .filter(Number.isFinite);
+  return timestamps.length > 0 ? Math.max(...timestamps) : null;
+}
+
+export function waitForInitialRefresh(
+  initialRefresh,
+  timeoutMs = 125_000,
+  schedule = setTimeout,
+) {
+  return Promise.race([
+    initialRefresh,
+    new Promise((resolve) => schedule(resolve, timeoutMs)),
+  ]);
 }
 
 function isSameLocalDay(leftTimestamp, rightTimestamp) {
@@ -59,9 +167,10 @@ export function refreshStaticTimelineFreshness(periodCache, updatedAt = Date.now
 
 export function shouldRefreshTimelineInBackground(period, entry, now = Date.now()) {
   if (!entry) return true;
-  return period === "yesterday"
-    && Number.isFinite(entry.updatedAt)
-    && !isSameLocalDay(entry.updatedAt, now);
+  if (period === "yesterday") {
+    return Number.isFinite(entry.updatedAt) && !isSameLocalDay(entry.updatedAt, now);
+  }
+  return !isTimelineCacheFresh(entry, now);
 }
 
 export function timelinePeriodEntries(periodLabels, includeResetToDate = true) {
@@ -132,8 +241,18 @@ function applyRowsDelta(targetRows, freshRows, previousRows, key) {
       continue;
     }
     const previous = (previousRows || []).find((row) => row?.[key] === id) || {};
-    applyNumberDelta(target, fresh, previous, "totalCost");
-    applyNumberDelta(target, fresh, previous, "totalTokens");
+    for (const field of [
+      "totalCost",
+      "totalTokens",
+      "inputTokens",
+      "outputTokens",
+      "cacheReadTokens",
+      "cacheWriteTokens",
+    ]) {
+      if (fresh?.[field] != null || previous?.[field] != null || target?.[field] != null) {
+        applyNumberDelta(target, fresh, previous, field);
+      }
+    }
   }
 }
 
@@ -200,6 +319,144 @@ export function updateCachedReportsFromToday(periodCache, freshToday, updatedAt 
   }
 }
 
+export function updateCacheFromAllSnapshot(periodCache, freshAll, updatedAt = Date.now()) {
+  const entry = {
+    reportData: structuredClone(freshAll),
+    antigravityData: null,
+    updatedAt,
+  };
+  periodCache.all = entry;
+  return entry;
+}
+
+export function updateCacheFromTimelineSnapshot(periodCache, snapshot, updatedAt = Date.now()) {
+  const allReport = structuredClone(snapshot);
+  delete allReport.timelineReports;
+  const allEntry = updateCacheFromAllSnapshot(periodCache, allReport, updatedAt);
+  for (const [period, report] of Object.entries(snapshot?.timelineReports || {})) {
+    periodCache[period] = {
+      reportData: mergeLiveSubscription(structuredClone(report), allReport),
+      antigravityData: null,
+      updatedAt,
+    };
+  }
+  return allEntry;
+}
+
+// Replace only the provider rows present in a partial refresh. This keeps a
+// slow provider's last valid values visible while a faster provider publishes
+// its new report, without double-counting shared model names.
+const SOURCE_AGENT_NAMES = {
+  fast: new Set([
+    "codex", "claude", "cursor", "gemini", "hermes", "opencode", "openclaw",
+    "pi", "kimi", "qwen", "amp", "codebuff", "droid", "goose", "kilo", "copilot",
+  ]),
+  antigravity: new Set(["antigravity"]),
+};
+
+export function mergeSourceSnapshot(periodCache, sourceSnapshot, sourceOrUpdatedAt = null, updatedAt = Date.now()) {
+  const source = typeof sourceOrUpdatedAt === "string" ? sourceOrUpdatedAt : null;
+  if (typeof sourceOrUpdatedAt === "number") updatedAt = sourceOrUpdatedAt;
+  const current = periodCache.all?.reportData || {
+    totals: { totalCost: 0, totalTokens: 0 },
+    agents: [],
+    models: [],
+  };
+  const merged = mergeSourceReports(current, sourceSnapshot, source);
+  periodCache.all = {
+    reportData: merged,
+    antigravityData: periodCache.all?.antigravityData || null,
+    updatedAt,
+  };
+  for (const [period, timelineReport] of Object.entries(merged.timelineReports || {})) {
+    periodCache[period] = {
+      reportData: mergeLiveSubscription(structuredClone(timelineReport), merged),
+      antigravityData: periodCache[period]?.antigravityData || null,
+      updatedAt,
+    };
+  }
+  return merged;
+}
+
+function mergeSourceReports(currentReport, sourceReport, source = null) {
+  const current = structuredClone(currentReport || {});
+  const incomingAgents = Array.isArray(sourceReport?.agents) ? sourceReport.agents : [];
+  const sourceNames = new Set(incomingAgents.map((agent) => agent?.agent).filter(Boolean));
+  if (sourceNames.size === 0 && source && SOURCE_AGENT_NAMES[source]) {
+    for (const agentName of SOURCE_AGENT_NAMES[source]) sourceNames.add(agentName);
+  }
+  current.agents = (Array.isArray(current.agents) ? current.agents : [])
+    .filter((agent) => !sourceNames.has(agent?.agent));
+  current.agents.push(...structuredClone(incomingAgents));
+  recomputeDailyFromAgents(current);
+
+  const incomingModels = Array.isArray(sourceReport?.models) ? sourceReport.models : [];
+  if (incomingModels.length > 0) {
+    const sourceModelNames = new Set(incomingModels.map((model) => model?.model).filter(Boolean));
+    current.models = (Array.isArray(current.models) ? current.models : [])
+      .filter((model) => !sourceModelNames.has(model?.model));
+    current.models.push(...structuredClone(incomingModels));
+    const totalCost = current.models.reduce((sum, model) => sum + (Number(model.totalCost) || 0), 0);
+    for (const model of current.models) {
+      model.percentage = totalCost > 0 ? ((Number(model.totalCost) || 0) / totalCost) * 100 : 0;
+    }
+  }
+
+  // The backend includes the same per-period matrix used to warm every
+  // timeline. Merge it recursively so partial provider refreshes update each
+  // cached period while preserving slower providers' last valid rows.
+  if (sourceReport?.timelineReports && typeof sourceReport.timelineReports === "object") {
+    current.timelineReports = current.timelineReports && typeof current.timelineReports === "object"
+      ? current.timelineReports
+      : {};
+    for (const [period, sourceTimeline] of Object.entries(sourceReport.timelineReports)) {
+      current.timelineReports[period] = mergeSourceReports(
+        current.timelineReports[period] || { totals: { totalCost: 0, totalTokens: 0 }, agents: [], models: [] },
+        sourceTimeline,
+        source,
+      );
+    }
+  }
+
+  const totalCost = current.agents.reduce((sum, agent) => sum + (Number(agent.totalCost) || 0), 0);
+  const totalTokens = current.agents.reduce((sum, agent) => sum + (Number(agent.totalTokens) || 0), 0);
+  current.totals = { totalCost, totalTokens };
+
+  if (sourceReport?.subscription) {
+    const existingSubscription = current.subscription || {};
+    const incomingSubscriptions = Array.isArray(sourceReport.subscription.agents)
+      ? sourceReport.subscription.agents
+      : [];
+    const names = new Set(incomingSubscriptions.map((agent) => agent?.agent).filter(Boolean));
+    if (names.size === 0 && source && SOURCE_AGENT_NAMES[source]) {
+      for (const agentName of SOURCE_AGENT_NAMES[source]) names.add(agentName);
+    }
+    const existingSubscriptions = Array.isArray(existingSubscription.agents)
+      ? existingSubscription.agents.filter((agent) => !names.has(agent?.agent))
+      : [];
+    current.subscription = {
+      ...existingSubscription,
+      ...structuredClone(sourceReport.subscription),
+      agents: [...existingSubscriptions, ...structuredClone(incomingSubscriptions)],
+    };
+  }
+  return current;
+}
+
+function recomputeDailyFromAgents(report) {
+  const byDate = new Map();
+  for (const agent of report.agents || []) {
+    for (const day of agent.daily || []) {
+      if (!day?.date) continue;
+      const current = byDate.get(day.date) || { date: day.date, cost: 0, tokens: 0 };
+      current.cost += Number(day.cost) || 0;
+      current.tokens += Number(day.tokens) || 0;
+      byDate.set(day.date, current);
+    }
+  }
+  if (byDate.size > 0) report.daily = [...byDate.values()].sort((left, right) => left.date.localeCompare(right.date));
+}
+
 export function timelinePreloadOrder(periods, activePeriod) {
   return periods.filter((period) => period !== activePeriod);
 }
@@ -250,6 +507,19 @@ export function quotaRemainingPercent(agent) {
 export function mergeLiveSubscription(currentReport, liveReport) {
   if (!currentReport || !liveReport?.subscription) return currentReport;
   return { ...currentReport, subscription: liveReport.subscription };
+}
+
+export function selectedTimelineReport(periodCache, cacheKey, fallbackReport, liveReport) {
+  const cachedReport = periodCache?.[cacheKey]?.reportData;
+  const report = cachedReport || fallbackReport;
+  if (!report) return report;
+  const selected = Array.isArray(report.daily) && report.daily.length > 0
+    ? report
+    : structuredClone(report);
+  if (!Array.isArray(selected.daily) || selected.daily.length === 0) {
+    recomputeDailyFromAgents(selected);
+  }
+  return mergeLiveSubscription(selected, liveReport);
 }
 
 export async function persistQuotaSource(settingsPromise, quotaSource, persist) {
