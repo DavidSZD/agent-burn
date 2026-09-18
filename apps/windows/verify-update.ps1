@@ -26,9 +26,22 @@ $backup = Join-Path ([IO.Path]::GetTempPath()) ("agent-burn-update-{0}" -f (Get-
 New-Item -ItemType Directory -Path $backup | Out-Null
 Copy-Item -LiteralPath $data.Path -Destination (Join-Path $backup "Agent Burn") -Recurse
 
-$beforeFiles = @("settings.json", "report_cache.json", "quota_history.json") | ForEach-Object {
+$beforeFiles = @(
+    "settings.json",
+    "report-cache.json",
+    "quota-archive.json",
+    "usage-journal.json",
+    "metrics-history.json",
+    "antigravity-plan.json"
+) | ForEach-Object {
     $path = Join-Path $data.Path $_
-    [pscustomobject]@{ Name = $_; Exists = Test-Path -LiteralPath $path; Length = if (Test-Path -LiteralPath $path) { (Get-Item -LiteralPath $path).Length } else { 0 } }
+    $exists = Test-Path -LiteralPath $path
+    [pscustomobject]@{
+        Name = $_
+        Exists = $exists
+        Length = if ($exists) { (Get-Item -LiteralPath $path).Length } else { 0 }
+        Hash = if ($exists) { (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash } else { $null }
+    }
 }
 
 Write-Host "Running $installer /UPDATE ..." -ForegroundColor Cyan
@@ -48,6 +61,17 @@ foreach ($file in $beforeFiles | Where-Object Exists) {
     }
     if ((Get-Item -LiteralPath $afterPath).Length -eq 0 -and $file.Length -gt 0) {
         throw "Update truncated $($file.Name). Backup: $backup"
+    }
+    if ($file.Name -eq "settings.json") {
+        $afterHash = (Get-FileHash -LiteralPath $afterPath -Algorithm SHA256).Hash
+        if ($afterHash -ne $file.Hash) {
+            throw "Update changed settings.json. Backup: $backup"
+        }
+    }
+    try {
+        Get-Content -LiteralPath $afterPath -Raw | ConvertFrom-Json | Out-Null
+    } catch {
+        throw "Update left invalid JSON in $($file.Name). Backup: $backup"
     }
 }
 
