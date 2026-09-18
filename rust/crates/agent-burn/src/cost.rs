@@ -314,4 +314,88 @@ mod tests {
         );
         assert!((cost - 356_000.0).abs() < f64::EPSILON);
     }
+
+    #[test]
+    fn uses_the_base_rate_just_before_a_model_specific_threshold() {
+        let mut pricing = PricingMap::default();
+        pricing.load_json(
+            r#"{
+                "long-model": {
+                    "input_cost_per_token": 1.0,
+                    "output_cost_per_token": 1.0,
+                    "input_cost_per_token_above_200k_tokens": 3.0,
+                    "long_context_threshold": 272000
+                }
+            }"#,
+        );
+
+        let cost = calculate_cost_for_usage(
+            Some("long-model"),
+            TokenUsageRaw {
+                input_tokens: 271_999,
+                ..TokenUsageRaw::default()
+            },
+            None,
+            CostMode::Calculate,
+            Some(&pricing),
+        );
+
+        assert!((cost - 271_999.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn keeps_the_base_rate_at_a_model_specific_threshold() {
+        let mut pricing = PricingMap::default();
+        pricing.load_json(
+            r#"{
+                "long-model": {
+                    "input_cost_per_token": 1.0,
+                    "output_cost_per_token": 1.0,
+                    "input_cost_per_token_above_200k_tokens": 3.0,
+                    "long_context_threshold": 272000
+                }
+            }"#,
+        );
+
+        let cost = calculate_cost_for_usage(
+            Some("long-model"),
+            TokenUsageRaw {
+                input_tokens: 272_000,
+                ..TokenUsageRaw::default()
+            },
+            None,
+            CostMode::Calculate,
+            Some(&pricing),
+        );
+
+        assert!((cost - 272_000.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn applies_the_long_context_rate_only_after_a_model_specific_threshold() {
+        let mut pricing = PricingMap::default();
+        pricing.load_json(
+            r#"{
+                "long-model": {
+                    "input_cost_per_token": 1.0,
+                    "output_cost_per_token": 1.0,
+                    "input_cost_per_token_above_200k_tokens": 3.0,
+                    "long_context_threshold": 272000
+                }
+            }"#,
+        );
+
+        let cost = calculate_cost_for_usage(
+            Some("long-model"),
+            TokenUsageRaw {
+                input_tokens: 272_001,
+                ..TokenUsageRaw::default()
+            },
+            None,
+            CostMode::Calculate,
+            Some(&pricing),
+        );
+
+        assert!((cost - 272_003.0).abs() < f64::EPSILON);
+    }
 }
