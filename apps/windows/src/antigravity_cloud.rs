@@ -41,15 +41,17 @@ pub(crate) fn build_plan_from_responses(
     let mut session_remaining = None;
     let mut session_reset_time = None;
     let mut session_preferred = false;
+    let mut weekly_preferred = false;
 
-    // The open-source reference intentionally does not infer the authoritative
-    // Gemini quota from the summary endpoint. That endpoint can expose a
-    // different project bucket (43% in the user's account) while the direct
-    // REQUESTS buckets report the actual 86% account quota.
+    // The open-source reference treats retrieveUserQuota's REQUESTS buckets
+    // as the authoritative account meter. Some responses also contain a
+    // five-hour bucket; never let that short window become the dashboard's
+    // weekly window just because it has the lower remaining percentage.
     if let Some((remaining, reset_time)) = authoritative_quota_window(quota_buckets) {
         weekly_remaining = Some(remaining);
         weekly_reset_time = reset_time;
     }
+    let weekly_from_authoritative_endpoint = weekly_remaining.is_some();
 
     if let Some(summary) = quota_summary {
         let summary = summary.get("response").unwrap_or(summary);
@@ -72,12 +74,18 @@ pub(crate) fn build_plan_from_responses(
                         .get("bucketId")
                         .and_then(Value::as_str)
                         .unwrap_or_default();
-                    match bucket
-                        .get("window")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                    {
-                        "5h" | "five_hour" | "five-hour" => update_window(
+                    match quota_window_kind(bucket) {
+                        Some(QuotaWindowKind::Weekly) if !weekly_from_authoritative_endpoint => {
+                            update_window(
+                                &mut weekly_remaining,
+                                &mut weekly_reset_time,
+                                remaining,
+                                reset,
+                                bucket_id.eq_ignore_ascii_case("gemini-weekly"),
+                                &mut weekly_preferred,
+                            )
+                        }
+                        Some(QuotaWindowKind::FiveHour) => update_window(
                             &mut session_remaining,
                             &mut session_reset_time,
                             remaining,
@@ -85,7 +93,8 @@ pub(crate) fn build_plan_from_responses(
                             bucket_id.eq_ignore_ascii_case("gemini-5h"),
                             &mut session_preferred,
                         ),
-                        _ => {}
+                        Some(QuotaWindowKind::Weekly) => {}
+                        None => {}
                     }
                 }
             }
@@ -105,23 +114,88 @@ pub(crate) fn build_plan_from_responses(
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuotaWindowKind {
+    Weekly,
+    FiveHour,
+}
+
+fn quota_window_kind(bucket: &Value) -> Option<QuotaWindowKind> {
+    let window = bucket
+        .get("window")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let bucket_id = bucket
+        .get("bucketId")
+        .or_else(|| bucket.get("modelId"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+
+    if matches!(
+        window.as_str(),
+        "5h" | "five_hour" | "five-hour" | "session"
+    ) || bucket_id.contains("5h")
+        || bucket_id.contains("five-hour")
+    {
+        return Some(QuotaWindowKind::FiveHour);
+    }
+    if window == "weekly" || bucket_id.contains("weekly") {
+        return Some(QuotaWindowKind::Weekly);
+    }
+    None
+}
+
 fn authoritative_quota_window(quota: Option<&Value>) -> Option<(f64, Option<String>)> {
     let buckets = quota
         .and_then(|value| value.get("response").unwrap_or(value).get("buckets"))
         .and_then(Value::as_array)?;
-    let mut remaining = Vec::new();
-    let mut reset_times = Vec::new();
-    for bucket in buckets {
-        if let Some(fraction) = bucket.get("remainingFraction").and_then(Value::as_f64) {
-            remaining.push((fraction * 100.0).clamp(0.0, 100.0));
-        }
-        if let Some(reset) = bucket.get("resetTime").and_then(Value::as_str) {
-            reset_times.push(reset.to_string());
-        }
+
+    // Prefer explicitly weekly buckets. The direct endpoint normally returns
+    // only REQUESTS buckets, in which case tokenType=REQUESTS is the signal.
+    // If neither marker exists, retain compatibility with older payloads and
+    // accept all non-five-hour buckets.
+    let mut candidates = buckets
+        .iter()
+        .filter(|bucket| quota_window_kind(bucket) == Some(QuotaWindowKind::Weekly))
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        candidates = buckets
+            .iter()
+            .filter(|bucket| {
+                quota_window_kind(bucket) != Some(QuotaWindowKind::FiveHour)
+                    && bucket
+                        .get("tokenType")
+                        .and_then(Value::as_str)
+                        .is_some_and(|token_type| token_type.eq_ignore_ascii_case("REQUESTS"))
+            })
+            .collect();
     }
-    let minimum = remaining.into_iter().min_by(f64::total_cmp)?;
-    reset_times.sort();
-    Some((minimum, reset_times.into_iter().next()))
+    if candidates.is_empty() {
+        candidates = buckets
+            .iter()
+            .filter(|bucket| quota_window_kind(bucket) != Some(QuotaWindowKind::FiveHour))
+            .collect();
+    }
+
+    let minimum = candidates
+        .iter()
+        .filter_map(|bucket| {
+            bucket
+                .get("remainingFraction")
+                .and_then(Value::as_f64)
+                .map(|fraction| (fraction * 100.0).clamp(0.0, 100.0))
+        })
+        .min_by(f64::total_cmp)?;
+    let reset_time = candidates
+        .iter()
+        .filter_map(|bucket| bucket.get("resetTime").and_then(Value::as_str))
+        .min()
+        .map(str::to_owned);
+    Some((minimum, reset_time))
 }
 
 fn update_window(
@@ -768,6 +842,33 @@ mod tests {
         assert_eq!(plan.quotas[0].model_id.as_deref(), Some("chat_20706"));
         assert_eq!(plan.quotas[0].remaining, 42.0);
         assert_eq!(plan.weekly_remaining, Some(42.0));
+    }
+
+    #[test]
+    fn cloud_plan_never_uses_the_five_hour_bucket_as_weekly_quota() {
+        let load = json!({"currentTier": {"id": "pro-tier", "name": "Google AI Pro"}});
+        let summary = json!({"groups": [{"buckets": [
+            {"bucketId": "gemini-weekly", "window": "weekly", "remainingFraction": 0.86, "resetTime": "2026-09-23T04:34:22Z"},
+            {"bucketId": "gemini-5h", "window": "5h", "remainingFraction": 0.43, "resetTime": "2026-09-18T09:34:22Z"}
+        ]}]});
+        let quota = json!({"buckets": [
+            {"tokenType": "REQUESTS", "modelId": "gemini-3-pro", "remainingFraction": 0.86, "resetTime": "2026-09-23T04:34:22Z"},
+            {"tokenType": "REQUESTS", "modelId": "gemini-3-pro-5h", "window": "5h", "remainingFraction": 0.43, "resetTime": "2026-09-18T09:34:22Z"}
+        ]});
+
+        let plan = build_plan_from_responses(&load, Some(&summary), None, Some(&quota))
+            .expect("cloud response should produce a plan");
+
+        assert_eq!(plan.weekly_remaining, Some(86.0));
+        assert_eq!(
+            plan.weekly_reset_time.as_deref(),
+            Some("2026-09-23T04:34:22Z")
+        );
+        assert_eq!(plan.session_remaining, Some(43.0));
+        assert_eq!(
+            plan.session_reset_time.as_deref(),
+            Some("2026-09-18T09:34:22Z")
+        );
     }
 
     #[test]
