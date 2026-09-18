@@ -54,8 +54,19 @@ struct ParsedEventsCache {
 static PARSED_EVENTS_CACHE: OnceLock<Mutex<Option<ParsedEventsCache>>> = OnceLock::new();
 
 fn load_parsed_events(database_paths: &[PathBuf]) -> Result<Vec<AntigravityUsageEvent>> {
-    let signature = antigravity_signature(database_paths);
     let cache = PARSED_EVENTS_CACHE.get_or_init(|| Mutex::new(None));
+    load_parsed_events_with_cache(database_paths, cache, parse_sqlite_file)
+}
+
+fn load_parsed_events_with_cache<F>(
+    database_paths: &[PathBuf],
+    cache: &Mutex<Option<ParsedEventsCache>>,
+    mut parse: F,
+) -> Result<Vec<AntigravityUsageEvent>>
+where
+    F: FnMut(&Path) -> Result<Vec<AntigravityUsageEvent>>,
+{
+    let signature = antigravity_signature(database_paths);
     if let Ok(guard) = cache.lock() {
         if let Some(cached) = guard.as_ref() {
             if cached.signature == signature {
@@ -66,7 +77,7 @@ fn load_parsed_events(database_paths: &[PathBuf]) -> Result<Vec<AntigravityUsage
 
     let mut parsed_events = Vec::new();
     for database_path in database_paths {
-        parsed_events.extend(parse_sqlite_file(database_path)?);
+        parsed_events.extend(parse(database_path)?);
     }
 
     if let Ok(mut guard) = cache.lock() {
@@ -151,6 +162,7 @@ fn deduplicate_events(
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
+    use std::sync::Mutex;
 
     use agent_burn_test_support::{EnvVarsGuard, Fixture};
     use serde_json::json;
@@ -306,6 +318,91 @@ mod tests {
         std::fs::remove_file(&second).unwrap();
         let removed_database = antigravity_signature(std::slice::from_ref(&database));
         assert_ne!(added_database, removed_database);
+    }
+
+    #[test]
+    fn reuses_parsed_events_when_database_signatures_are_unchanged() {
+        let fixture = Fixture::new();
+        let database = fixture.path("conversations/session.db");
+        std::fs::create_dir_all(database.parent().unwrap()).unwrap();
+        std::fs::write(&database, b"db").unwrap();
+        let cache = Mutex::new(None);
+        let mut parse_calls = 0;
+
+        load_parsed_events_with_cache(std::slice::from_ref(&database), &cache, |_path| {
+            parse_calls += 1;
+            Ok(Vec::new())
+        })
+        .unwrap();
+        load_parsed_events_with_cache(std::slice::from_ref(&database), &cache, |_path| {
+            panic!("an unchanged database must not be parsed again")
+        })
+        .unwrap();
+
+        assert_eq!(parse_calls, 1);
+    }
+
+    #[test]
+    fn reparses_events_when_database_or_wal_signatures_change() {
+        let fixture = Fixture::new();
+        let database = fixture.path("conversations/session.db");
+        std::fs::create_dir_all(database.parent().unwrap()).unwrap();
+        std::fs::write(&database, b"db").unwrap();
+        let cache = Mutex::new(None);
+        let mut parse_calls = 0;
+        load_parsed_events_with_cache(std::slice::from_ref(&database), &cache, |_: &Path| {
+            parse_calls += 1;
+            Ok::<_, crate::CliError>(Vec::new())
+        })
+        .unwrap();
+        std::fs::write(&database, b"database changed").unwrap();
+        load_parsed_events_with_cache(std::slice::from_ref(&database), &cache, |_: &Path| {
+            parse_calls += 1;
+            Ok(Vec::new())
+        })
+        .unwrap();
+        std::fs::write(format!("{}-wal", database.display()), b"wal").unwrap();
+        load_parsed_events_with_cache(std::slice::from_ref(&database), &cache, |_: &Path| {
+            parse_calls += 1;
+            Ok(Vec::new())
+        })
+        .unwrap();
+
+        assert_eq!(parse_calls, 3);
+    }
+
+    #[test]
+    fn reparses_events_when_a_database_is_added_or_removed() {
+        let fixture = Fixture::new();
+        let database = fixture.path("conversations/session.db");
+        let second_database = fixture.path("conversations/second.db");
+        std::fs::create_dir_all(database.parent().unwrap()).unwrap();
+        std::fs::write(&database, b"db").unwrap();
+        std::fs::write(&second_database, b"second").unwrap();
+        let cache = Mutex::new(None);
+        let mut parse_calls = 0;
+
+        load_parsed_events_with_cache(std::slice::from_ref(&database), &cache, |_: &Path| {
+            parse_calls += 1;
+            Ok::<_, crate::CliError>(Vec::new())
+        })
+        .unwrap();
+        load_parsed_events_with_cache(
+            &[database.clone(), second_database.clone()],
+            &cache,
+            |_: &Path| {
+                parse_calls += 1;
+                Ok(Vec::new())
+            },
+        )
+        .unwrap();
+        load_parsed_events_with_cache(std::slice::from_ref(&database), &cache, |_: &Path| {
+            parse_calls += 1;
+            Ok(Vec::new())
+        })
+        .unwrap();
+
+        assert_eq!(parse_calls, 4);
     }
 
     #[test]
