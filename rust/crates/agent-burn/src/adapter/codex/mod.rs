@@ -171,12 +171,8 @@ mod tests {
             is_fallback: false,
         };
 
-        let cost = calculate_codex_model_cost(
-            "gpt-5.6-test",
-            &usage,
-            &pricing,
-            CodexSpeed::Standard,
-        );
+        let cost =
+            calculate_codex_model_cost("gpt-5.6-test", &usage, &pricing, CodexSpeed::Standard);
 
         assert!((cost - 0.000198).abs() < f64::EPSILON);
     }

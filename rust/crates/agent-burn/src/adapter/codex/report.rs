@@ -83,8 +83,14 @@ fn group_json(
     row
 }
 
-pub(crate) fn non_cached_input_tokens(input_tokens: u64, cached_input_tokens: u64) -> u64 {
-    input_tokens.saturating_sub(cached_input_tokens)
+pub(crate) fn non_cached_input_tokens(
+    input_tokens: u64,
+    cached_input_tokens: u64,
+    cache_write_input_tokens: u64,
+) -> u64 {
+    input_tokens
+        .saturating_sub(cached_input_tokens)
+        .saturating_sub(cache_write_input_tokens)
 }
 
 fn billable_input_tokens(
@@ -289,7 +295,11 @@ pub(super) fn print_table_from_groups(
     let mut total_tokens = 0;
     let mut total_cost = 0.0;
     for (label, group) in groups {
-        let input_tokens = non_cached_input_tokens(group.input_tokens, group.cached_input_tokens);
+        let input_tokens = non_cached_input_tokens(
+            group.input_tokens,
+            group.cached_input_tokens,
+            group.cache_write_input_tokens,
+        );
         let cost = calculate_group_cost(group, pricing, speed);
         total_input += input_tokens;
         total_cached += group.cached_input_tokens;

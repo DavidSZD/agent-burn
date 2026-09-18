@@ -4,8 +4,8 @@ use jiff::tz::TimeZone as JiffTimeZone;
 
 use crate::{
     LoadedEntry, PricingMap, Result, TimestampMs, TokenUsageRaw, UsageEntry, UsageMessage,
-    calculate_cost_for_usage, calculate_cost_from_pricing, cli::CostMode, cli_error,
-    format_date_tz,
+    calculate_cost_for_usage_at, calculate_cost_from_pricing_with_threshold, cli::CostMode,
+    cli_error, format_date_tz,
 };
 
 const DEFAULT_MODEL: &str = "gemini-internal-model";
@@ -983,7 +983,7 @@ fn calculate_antigravity_cost(
     model: &str,
     provider: Option<u64>,
     usage: TokenUsageRaw,
-    _timestamp: TimestampMs,
+    timestamp: TimestampMs,
     mode: CostMode,
     pricing: &PricingMap,
 ) -> f64 {
@@ -995,21 +995,30 @@ fn calculate_antigravity_cost(
                 model_candidates(model, provider)
                     .into_iter()
                     .find_map(|candidate| find_exact_pricing_with_alias(pricing, &candidate))
-                    .map(|model_pricing| calculate_cost_from_pricing(usage, model_pricing))
+                    .map(|model_pricing| {
+                        calculate_cost_from_pricing_with_threshold(
+                            usage,
+                            model_pricing,
+                            pricing.long_context_threshold(model),
+                        )
+                    })
                     .unwrap_or(0.0)
             } else {
                 model_candidates(model, provider)
                     .into_iter()
                     .find_map(|candidate| {
-                        pricing.find(&candidate).map(|_| {
-                            calculate_cost_for_usage(
-                                Some(&candidate),
-                                usage,
-                                None,
-                                CostMode::Calculate,
-                                Some(pricing),
-                            )
-                        })
+                        pricing
+                            .find_at(&candidate, Some(timestamp.as_millis()))
+                            .map(|_| {
+                                calculate_cost_for_usage_at(
+                                    Some(&candidate),
+                                    usage,
+                                    None,
+                                    Some(timestamp.as_millis()),
+                                    CostMode::Calculate,
+                                    Some(pricing),
+                                )
+                            })
                     })
                     .unwrap_or(0.0)
             }
@@ -1687,7 +1696,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires timestamp-aware pricing migration"]
     fn legacy_models_keep_timestamp_aware_pricing() {
         let pricing = PricingMap::load_embedded();
         let usage = TokenUsageRaw {

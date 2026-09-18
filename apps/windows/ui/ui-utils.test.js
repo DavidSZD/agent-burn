@@ -12,6 +12,7 @@ import {
   quotaPresentation,
   quotaRemainingPercent,
   mergeLiveSubscription,
+  selectedTimelineReport,
   persistQuotaSource,
   timelineSelection,
   timelinePreloadOrder,
@@ -29,6 +30,8 @@ import {
   updateCachedReportsFromToday,
   updateCacheFromAllSnapshot,
   updateCacheFromTimelineSnapshot,
+  mergeSourceSnapshot,
+  refreshStatusText,
   waitForInitialRefresh,
   subscriptionPresentation,
   visibleTokenBreakdownEntries,
@@ -90,6 +93,20 @@ test("quota history is loaded independently from a timeline refresh", async () =
   assert.deepEqual(result, history);
 });
 
+test("selected timeline data remains the source for the saved general report", () => {
+  const selected = {
+    daily: [{ date: "2026-09-18", cost: 4.5, tokens: 12 }],
+    totals: { totalCost: 4.5, totalTokens: 12 },
+  };
+  const fallback = { totals: { totalCost: 0, totalTokens: 0 } };
+  const live = { subscription: { agents: [{ agent: "codex", plan: "Free" }] } };
+
+  assert.deepEqual(
+    selectedTimelineReport({ mtd: { reportData: selected } }, "mtd", fallback, live),
+    { ...selected, subscription: live.subscription },
+  );
+});
+
 test("keeps the current dashboard visible while an uncached timeline loads", () => {
   const currentReport = { totals: { totalCost: 12 } };
 
@@ -113,6 +130,20 @@ test("refreshes a selected timeline only after its five minute freshness window"
   assert.equal(isTimelineCacheFresh({ updatedAt: 1_000 }, 300_999), true);
   assert.equal(isTimelineCacheFresh({ updatedAt: 1_000 }, 301_001), false);
   assert.equal(isTimelineCacheFresh({ reportData: {} }, 2_000), false);
+});
+
+test("shows elapsed time while an automatic refresh is running", () => {
+  assert.equal(
+    refreshStatusText({ updatedAt: 1_000, refreshStartedAt: 10_000 }, 72_500),
+    "Updating · 1 min 2 sec",
+  );
+});
+
+test("shows the next automatic refresh when idle", () => {
+  assert.equal(
+    refreshStatusText({ updatedAt: 1_000, nextRefreshAt: 72_500 }, 12_500),
+    "Next refresh in 1 min",
+  );
 });
 
 test("restoring a cache never invents a recent update time", () => {
@@ -475,4 +506,95 @@ test("live quota refresh waits for the first timeline report", () => {
   };
 
   assert.equal(mergeLiveSubscription(null, live), null);
+});
+
+test("partial source refresh replaces only that source and preserves slow providers", () => {
+  const periods = {
+    all: {
+      reportData: {
+        totals: { totalCost: 12, totalTokens: 120 },
+        agents: [
+          { agent: "codex", totalCost: 10, totalTokens: 100 },
+          { agent: "antigravity", totalCost: 2, totalTokens: 20 },
+        ],
+        models: [],
+        subscription: { agents: [{ agent: "antigravity", plan: "Pro" }] },
+      },
+      updatedAt: 100,
+    },
+  };
+  const merged = mergeSourceSnapshot(periods, {
+    totals: { totalCost: 11, totalTokens: 110 },
+    agents: [{ agent: "codex", totalCost: 11, totalTokens: 110 }],
+    models: [],
+    subscription: { agents: [{ agent: "codex", plan: "Free" }] },
+  }, 200);
+
+  assert.deepEqual(merged.agents.map((agent) => agent.agent), ["antigravity", "codex"]);
+  assert.equal(merged.totals.totalCost, 13);
+  assert.deepEqual(merged.subscription.agents.map((agent) => agent.agent), ["antigravity", "codex"]);
+  assert.equal(periods.all.updatedAt, 200);
+});
+
+test("partial source refresh merges every returned timeline", () => {
+  const periods = {
+    all: {
+      reportData: {
+        totals: { totalCost: 2, totalTokens: 20 },
+        agents: [{ agent: "antigravity", totalCost: 2, totalTokens: 20 }],
+        models: [],
+        timelineReports: {
+          today: {
+            totals: { totalCost: 2, totalTokens: 20 },
+            agents: [{ agent: "antigravity", totalCost: 2, totalTokens: 20 }],
+            models: [],
+          },
+        },
+      },
+      updatedAt: 100,
+    },
+  };
+
+  mergeSourceSnapshot(periods, {
+    totals: { totalCost: 3, totalTokens: 30 },
+    agents: [{ agent: "codex", totalCost: 3, totalTokens: 30 }],
+    models: [],
+    timelineReports: {
+      today: {
+        totals: { totalCost: 3, totalTokens: 30 },
+        agents: [{ agent: "codex", totalCost: 3, totalTokens: 30 }],
+        models: [],
+      },
+      ytd: {
+        totals: { totalCost: 3, totalTokens: 30 },
+        agents: [{ agent: "codex", totalCost: 3, totalTokens: 30 }],
+        models: [],
+      },
+    },
+  }, 200);
+
+  assert.equal(periods.all.reportData.timelineReports.today.totals.totalTokens, 50);
+  assert.deepEqual(
+    periods.all.reportData.timelineReports.today.agents.map((agent) => agent.agent),
+    ["antigravity", "codex"],
+  );
+  assert.equal(periods.all.reportData.timelineReports.ytd.totals.totalTokens, 30);
+});
+
+test("partial source refresh rebuilds general daily spend from agent rows", () => {
+  const periodCache = {
+    all: {
+      reportData: {
+        agents: [{ agent: "codex", daily: [{ date: "2026-09-18", cost: 2, tokens: 10 }] }],
+        models: [],
+      },
+    },
+  };
+
+  const merged = mergeSourceSnapshot(periodCache, {
+    agents: [{ agent: "antigravity", daily: [{ date: "2026-09-18", cost: 3, tokens: 20 }] }],
+    models: [],
+  });
+
+  assert.deepEqual(merged.daily, [{ date: "2026-09-18", cost: 5, tokens: 30 }]);
 });

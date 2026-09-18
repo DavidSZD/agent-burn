@@ -1,4 +1,10 @@
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    fs,
+    path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
+    time::SystemTime,
+};
 
 use crate::{LoadedEntry, PricingMap, Result, cli::SharedArgs, parse_tz};
 
@@ -19,16 +25,80 @@ pub fn load_entries(shared: &SharedArgs, pricing: &PricingMap) -> Result<Vec<Loa
 fn load_entries_inner(shared: &SharedArgs, pricing: &PricingMap) -> Result<Vec<LoadedEntry>> {
     let timezone = parse_tz(shared.timezone.as_deref());
     let database_paths = conversation_db_paths()?;
-    let mut parsed_events = Vec::new();
-    for database_path in database_paths {
-        parsed_events.extend(parse_sqlite_file(&database_path)?);
-    }
+    let parsed_events = load_parsed_events(&database_paths)?;
     let mut events = deduplicate_events(parsed_events);
     events.sort_by_key(|event| event.timestamp);
     Ok(events
         .into_iter()
         .map(|event| event_to_loaded(event, timezone.as_ref(), shared.mode, pricing))
         .collect())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileFingerprint {
+    size: u64,
+    modified: Option<SystemTime>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AntigravitySignature {
+    files: Vec<(PathBuf, Option<FileFingerprint>, Option<FileFingerprint>)>,
+}
+
+#[derive(Debug)]
+struct ParsedEventsCache {
+    signature: AntigravitySignature,
+    events: Vec<AntigravityUsageEvent>,
+}
+
+static PARSED_EVENTS_CACHE: OnceLock<Mutex<Option<ParsedEventsCache>>> = OnceLock::new();
+
+fn load_parsed_events(database_paths: &[PathBuf]) -> Result<Vec<AntigravityUsageEvent>> {
+    let signature = antigravity_signature(database_paths);
+    let cache = PARSED_EVENTS_CACHE.get_or_init(|| Mutex::new(None));
+    if let Ok(guard) = cache.lock() {
+        if let Some(cached) = guard.as_ref() {
+            if cached.signature == signature {
+                return Ok(cached.events.clone());
+            }
+        }
+    }
+
+    let mut parsed_events = Vec::new();
+    for database_path in database_paths {
+        parsed_events.extend(parse_sqlite_file(database_path)?);
+    }
+
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some(ParsedEventsCache {
+            signature,
+            events: parsed_events.clone(),
+        });
+    }
+    Ok(parsed_events)
+}
+
+/// Returns a deterministic signature for all Antigravity databases and their
+/// SQLite WAL files.  A changed size/mtime, added database, deleted database,
+/// or changed WAL invalidates the parsed-event cache.
+fn antigravity_signature(database_paths: &[PathBuf]) -> AntigravitySignature {
+    let mut files = database_paths
+        .iter()
+        .map(|path| {
+            let wal = PathBuf::from(format!("{}-wal", path.display()));
+            (path.clone(), file_fingerprint(path), file_fingerprint(&wal))
+        })
+        .collect::<Vec<_>>();
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    AntigravitySignature { files }
+}
+
+fn file_fingerprint(path: &Path) -> Option<FileFingerprint> {
+    let metadata = fs::metadata(path).ok()?;
+    Some(FileFingerprint {
+        size: metadata.len(),
+        modified: metadata.modified().ok(),
+    })
 }
 
 fn deduplicate_events(
@@ -207,6 +277,35 @@ mod tests {
         assert_eq!(entries[1].data.message.usage.output_tokens, 75);
         assert_eq!(entries[1].extra_total_tokens, 25);
         assert!(entries[0].cost > 0.0);
+    }
+
+    #[test]
+    fn signature_invalidates_database_wal_and_file_set_changes() {
+        let fixture = Fixture::new();
+        let database = fixture.path("conversations/session.db");
+        std::fs::create_dir_all(database.parent().unwrap()).unwrap();
+        std::fs::write(&database, b"db").unwrap();
+        let first = antigravity_signature(std::slice::from_ref(&database));
+
+        std::fs::write(format!("{}-wal", database.display()), b"wal").unwrap();
+        let with_wal = antigravity_signature(std::slice::from_ref(&database));
+        assert_ne!(first, with_wal);
+
+        std::fs::write(&database, b"database changed").unwrap();
+        let changed_db = antigravity_signature(std::slice::from_ref(&database));
+        assert_ne!(with_wal, changed_db);
+
+        std::fs::remove_file(format!("{}-wal", database.display())).unwrap();
+        let removed_wal = antigravity_signature(std::slice::from_ref(&database));
+        assert_ne!(changed_db, removed_wal);
+
+        let second = fixture.path("conversations/second.db");
+        std::fs::write(&second, b"second database").unwrap();
+        let added_database = antigravity_signature(&[database.clone(), second.clone()]);
+        assert_ne!(removed_wal, added_database);
+        std::fs::remove_file(&second).unwrap();
+        let removed_database = antigravity_signature(std::slice::from_ref(&database));
+        assert_ne!(added_database, removed_database);
     }
 
     #[test]

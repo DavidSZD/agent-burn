@@ -26,9 +26,9 @@ pub(crate) use adapter::claude::{
 #[cfg(test)]
 pub(crate) use adapter::claude::{load_daily_summaries, load_entries};
 pub(crate) use cost::{
-    calculate_cost, calculate_cost_for_usage, calculate_cost_from_pricing,
-    missing_pricing_model_for_candidates, missing_pricing_model_for_token_total,
-    missing_pricing_model_for_usage,
+    calculate_cost, calculate_cost_for_usage, calculate_cost_for_usage_at,
+    calculate_cost_from_pricing_with_threshold, missing_pricing_model_for_candidates,
+    missing_pricing_model_for_token_total, missing_pricing_model_for_usage,
 };
 pub(crate) use date_utils::*;
 pub(crate) use logger::{debug_log, log_level};

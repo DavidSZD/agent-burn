@@ -11,10 +11,11 @@ pub(crate) fn calculate_cost(
     mode: CostMode,
     pricing: Option<&PricingMap>,
 ) -> f64 {
-    calculate_cost_for_usage(
+    calculate_cost_for_usage_at(
         data.message.model.as_deref(),
         data.message.usage,
         data.cost_usd,
+        parse_timestamp_ms(&data.timestamp),
         mode,
         pricing,
     )
@@ -27,12 +28,22 @@ pub(crate) fn calculate_cost_for_usage(
     mode: CostMode,
     pricing: Option<&PricingMap>,
 ) -> f64 {
+    calculate_cost_for_usage_at(model, usage, cost_usd, None, mode, pricing)
+}
+
+pub(crate) fn calculate_cost_for_usage_at(
+    model: Option<&str>,
+    usage: crate::TokenUsageRaw,
+    cost_usd: Option<f64>,
+    timestamp_ms: Option<i64>,
+    mode: CostMode,
+    pricing: Option<&PricingMap>,
+) -> f64 {
     match mode {
         CostMode::Display => cost_usd.unwrap_or(0.0),
-        CostMode::Auto => {
-            cost_usd.unwrap_or_else(|| calculate_cost_from_tokens(model, usage, pricing))
-        }
-        CostMode::Calculate => calculate_cost_from_tokens(model, usage, pricing),
+        CostMode::Auto => cost_usd
+            .unwrap_or_else(|| calculate_cost_from_tokens_at(model, usage, timestamp_ms, pricing)),
+        CostMode::Calculate => calculate_cost_from_tokens_at(model, usage, timestamp_ms, pricing),
     }
 }
 
@@ -83,18 +94,46 @@ fn calculate_cost_from_tokens(
     usage: crate::TokenUsageRaw,
     pricing: Option<&PricingMap>,
 ) -> f64 {
+    calculate_cost_from_tokens_at(model, usage, None, pricing)
+}
+
+fn calculate_cost_from_tokens_at(
+    model: Option<&str>,
+    usage: crate::TokenUsageRaw,
+    timestamp_ms: Option<i64>,
+    pricing: Option<&PricingMap>,
+) -> f64 {
     let Some(model) = model else {
         return 0.0;
     };
-    let Some(pricing) = pricing.and_then(|pricing| pricing.find(model)) else {
+    let Some(pricing_map) = pricing else {
         return 0.0;
     };
-    calculate_cost_from_pricing(usage, pricing)
+    let Some(pricing) = pricing_map.find_at(model, timestamp_ms) else {
+        return 0.0;
+    };
+    calculate_cost_from_pricing_with_threshold(
+        usage,
+        pricing,
+        pricing_map.long_context_threshold(model),
+    )
+}
+
+fn parse_timestamp_ms(timestamp: &str) -> Option<i64> {
+    crate::parse_ts_timestamp(timestamp).map(crate::TimestampMs::as_millis)
 }
 
 pub(crate) fn calculate_cost_from_pricing(
     usage: crate::TokenUsageRaw,
     pricing: crate::pricing::Pricing,
+) -> f64 {
+    calculate_cost_from_pricing_with_threshold(usage, pricing, 200_000)
+}
+
+pub(crate) fn calculate_cost_from_pricing_with_threshold(
+    usage: crate::TokenUsageRaw,
+    pricing: crate::pricing::Pricing,
+    threshold: u64,
 ) -> f64 {
     let multiplier = if matches!(usage.speed, Some(Speed::Fast)) {
         pricing.fast_multiplier
@@ -114,39 +153,51 @@ pub(crate) fn calculate_cost_from_pricing(
     let cache_create_1h_cost_above_200k = pricing
         .input_above_200k
         .map(|c| c * CACHE_CREATE_1H_INPUT_MULTIPLIER);
-    (tiered_cost(usage.input_tokens, pricing.input, pricing.input_above_200k)
-        + tiered_cost(
-            usage.output_tokens,
-            pricing.output,
-            pricing.output_above_200k,
-        )
-        + tiered_cost(
-            cache_create_5m_tokens,
-            pricing.cache_create,
-            pricing.cache_create_above_200k,
-        )
-        + tiered_cost(
-            cache_create_1h_tokens,
-            cache_create_1h_cost,
-            cache_create_1h_cost_above_200k,
-        )
-        + tiered_cost(
-            usage.cache_read_input_tokens,
-            pricing.cache_read,
-            pricing.cache_read_above_200k,
-        ))
-        * multiplier
+    (tiered_cost_with_threshold(
+        usage.input_tokens,
+        pricing.input,
+        pricing.input_above_200k,
+        threshold,
+    ) + tiered_cost_with_threshold(
+        usage.output_tokens,
+        pricing.output,
+        pricing.output_above_200k,
+        threshold,
+    ) + tiered_cost_with_threshold(
+        cache_create_5m_tokens,
+        pricing.cache_create,
+        pricing.cache_create_above_200k,
+        threshold,
+    ) + tiered_cost_with_threshold(
+        cache_create_1h_tokens,
+        cache_create_1h_cost,
+        cache_create_1h_cost_above_200k,
+        threshold,
+    ) + tiered_cost_with_threshold(
+        usage.cache_read_input_tokens,
+        pricing.cache_read,
+        pricing.cache_read_above_200k,
+        threshold,
+    )) * multiplier
 }
 
 pub(crate) fn tiered_cost(tokens: u64, base: f64, above: Option<f64>) -> f64 {
-    const THRESHOLD: u64 = 200_000;
+    tiered_cost_with_threshold(tokens, base, above, 200_000)
+}
+
+pub(crate) fn tiered_cost_with_threshold(
+    tokens: u64,
+    base: f64,
+    above: Option<f64>,
+    threshold: u64,
+) -> f64 {
     if tokens == 0 {
         return 0.0;
     }
     if let Some(above) = above
-        && tokens > THRESHOLD
+        && tokens > threshold
     {
-        return (THRESHOLD as f64 * base) + ((tokens - THRESHOLD) as f64 * above);
+        return (threshold as f64 * base) + ((tokens - threshold) as f64 * above);
     }
     tokens as f64 * base
 }
@@ -235,5 +286,32 @@ mod tests {
         .unwrap();
 
         assert_eq!(usage.cache_creation_token_count(), 300);
+    }
+
+    #[test]
+    fn applies_model_specific_long_context_threshold() {
+        let mut pricing = PricingMap::default();
+        pricing.load_json(
+            r#"{
+                "long-model": {
+                    "input_cost_per_token": 1.0,
+                    "output_cost_per_token": 1.0,
+                    "input_cost_per_token_above_200k_tokens": 3.0,
+                    "long_context_threshold": 272000
+                }
+            }"#,
+        );
+        let usage = TokenUsageRaw {
+            input_tokens: 300_000,
+            ..TokenUsageRaw::default()
+        };
+        let cost = calculate_cost_for_usage(
+            Some("long-model"),
+            usage,
+            None,
+            CostMode::Calculate,
+            Some(&pricing),
+        );
+        assert!((cost - 356_000.0).abs() < f64::EPSILON);
     }
 }

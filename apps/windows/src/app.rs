@@ -3,7 +3,7 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
     process::Stdio,
-    sync::RwLock,
+    sync::{atomic::AtomicU64, RwLock},
 };
 use tokio::process::Command;
 
@@ -18,11 +18,14 @@ pub struct AppState {
     pub settings: RwLock<AppSettings>,
     pub latest_refresh: RwLock<Option<RefreshSnapshot>>,
     pub summary_scan: tokio::sync::Mutex<()>,
+    pub refresh_generation: AtomicU64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RefreshSnapshot {
+    #[serde(default)]
+    pub generation: u64,
     pub refreshed_at_ms: i64,
     pub report: serde_json::Value,
 }
@@ -86,6 +89,7 @@ impl AppState {
             settings: RwLock::new(settings),
             latest_refresh: RwLock::new(None),
             summary_scan: tokio::sync::Mutex::new(()),
+            refresh_generation: AtomicU64::new(0),
         }
     }
 }

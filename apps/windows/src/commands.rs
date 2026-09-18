@@ -2,7 +2,7 @@ use crate::app::{
     execute_cli_json_with_settings, resolve_cli_path_with_override, save_settings, AppSettings,
     AppState,
 };
-use std::path::Path;
+use std::{collections::BTreeMap, path::Path};
 use tauri::State;
 
 #[tauri::command]
@@ -67,11 +67,37 @@ pub(crate) async fn build_summary(
     settings: &AppSettings,
     cli: Option<&Path>,
 ) -> Result<serde_json::Value, String> {
+    let mut summary = build_cli_summary_for_agents(period, settings, cli, None).await?;
+    attach_live_antigravity(&mut summary, period, settings).await?;
+    attach_model_pricing(&mut summary);
+    Ok(summary)
+}
+
+/// Runs the bundled CLI for only the requested agents. Keeping this separate
+/// from the Antigravity live-plan lookup allows fast providers to publish
+/// their result while the Antigravity history scan is still running.
+pub(crate) async fn build_cli_summary_for_agents(
+    period: &str,
+    settings: &AppSettings,
+    cli: Option<&Path>,
+    agents: Option<&str>,
+) -> Result<serde_json::Value, String> {
     let mut args = vec!["summary", "--value"];
     if period != "all" && !period.is_empty() {
         args.push(period);
     }
-    let mut summary = execute_cli_json_with_settings(cli, &args, settings).await?;
+    if let Some(agents) = agents {
+        args.push("--agents");
+        args.push(agents);
+    }
+    execute_cli_json_with_settings(cli, &args, settings).await
+}
+
+pub(crate) async fn attach_live_antigravity(
+    summary: &mut serde_json::Value,
+    period: &str,
+    settings: &AppSettings,
+) -> Result<(), String> {
     let antigravity_period = period.to_string();
     let mut antigravity = tokio::task::spawn_blocking(move || {
         crate::antigravity::get_live_antigravity_data(&antigravity_period)
@@ -84,12 +110,201 @@ pub(crate) async fn build_summary(
             settings.antigravity_ultra_price,
         );
     }
-    merge_antigravity(&mut summary, &antigravity)?;
-    attach_model_pricing(&mut summary);
-    Ok(summary)
+    merge_antigravity(summary, &antigravity)?;
+    Ok(())
 }
 
-fn attach_model_pricing(summary: &mut serde_json::Value) {
+/// Merge a report containing one or more provider slices into an aggregate
+/// report. Existing rows for those providers are replaced, never added twice.
+/// This is used by the refresh coordinator and deliberately keeps unrelated
+/// provider data intact when one slow source is still in flight.
+pub(crate) fn merge_source_reports(
+    target: &mut serde_json::Value,
+    source: &serde_json::Value,
+) -> Result<(), String> {
+    let target_object = target
+        .as_object_mut()
+        .ok_or_else(|| "Le résumé cible doit être un objet JSON.".to_string())?;
+    let Some(source_agents) = source.get("agents").and_then(|value| value.as_array()) else {
+        return Ok(());
+    };
+    let source_names = source_agents
+        .iter()
+        .filter_map(|agent| agent.get("agent").and_then(|value| value.as_str()))
+        .collect::<std::collections::HashSet<_>>();
+    {
+        let target_agents = target_object
+            .entry("agents")
+            .or_insert_with(|| serde_json::json!([]))
+            .as_array_mut()
+            .ok_or_else(|| "Le champ agents doit être un tableau JSON.".to_string())?;
+        target_agents.retain(|agent| {
+            !agent
+                .get("agent")
+                .and_then(|value| value.as_str())
+                .is_some_and(|name| source_names.contains(name))
+        });
+        target_agents.extend(source_agents.iter().cloned());
+    }
+    recompute_daily_from_agents(target_object);
+
+    let source_models = source.get("models").and_then(|value| value.as_array());
+    if let Some(source_models) = source_models {
+        let target_models = target_object
+            .entry("models")
+            .or_insert_with(|| serde_json::json!([]))
+            .as_array_mut()
+            .ok_or_else(|| "Le champ models doit être un tableau JSON.".to_string())?;
+        let names = source_models
+            .iter()
+            .filter_map(|model| model.get("model").and_then(|value| value.as_str()))
+            .collect::<std::collections::HashSet<_>>();
+        target_models.retain(|model| {
+            !model
+                .get("model")
+                .and_then(|value| value.as_str())
+                .is_some_and(|name| names.contains(name))
+        });
+        target_models.extend(source_models.iter().cloned());
+        let total_cost = target_models
+            .iter()
+            .filter_map(|model| model.get("totalCost").and_then(|value| value.as_f64()))
+            .sum::<f64>();
+        for model in target_models {
+            let cost = model
+                .get("totalCost")
+                .and_then(|value| value.as_f64())
+                .unwrap_or(0.0);
+            model["percentage"] = serde_json::json!(if total_cost > 0.0 {
+                cost / total_cost * 100.0
+            } else {
+                0.0
+            });
+        }
+    }
+
+    // `summary --value` also carries a per-period matrix when the Windows
+    // shell enables AGENT_BURN_TIMELINE_CACHE. Merge each period with the
+    // same provider-replacement rules as the top-level report so a fast
+    // source never erases a slower source's cached timeline.
+    if let Some(source_timelines) = source
+        .get("timelineReports")
+        .and_then(|value| value.as_object())
+    {
+        let target_timelines = target_object
+            .entry("timelineReports")
+            .or_insert_with(|| serde_json::json!({}))
+            .as_object_mut()
+            .ok_or_else(|| "Le champ timelineReports doit être un objet JSON.".to_string())?;
+        for (period, source_report) in source_timelines {
+            let target_report = target_timelines.entry(period.clone()).or_insert_with(|| {
+                serde_json::json!({
+                    "totals": { "totalCost": 0.0, "totalTokens": 0 },
+                    "agents": [],
+                    "models": [],
+                })
+            });
+            merge_source_reports(target_report, source_report)?;
+        }
+    }
+
+    let target_agents = target_object
+        .get("agents")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| "Le champ agents doit être un tableau JSON.".to_string())?;
+    let total_cost = target_agents
+        .iter()
+        .filter_map(|agent| agent.get("totalCost").and_then(|value| value.as_f64()))
+        .sum::<f64>();
+    let total_tokens = target_agents
+        .iter()
+        .filter_map(|agent| agent.get("totalTokens").and_then(|value| value.as_u64()))
+        .sum::<u64>();
+    target_object["totals"] = serde_json::json!({
+        "totalCost": total_cost,
+        "totalTokens": total_tokens,
+    });
+    if let Some(subscription) = source.get("subscription") {
+        let mut merged_subscription = target_object
+            .get("subscription")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        if let Some(incoming_agents) = subscription
+            .get("agents")
+            .and_then(|value| value.as_array())
+        {
+            let incoming_names = incoming_agents
+                .iter()
+                .filter_map(|agent| agent.get("agent").and_then(|value| value.as_str()))
+                .collect::<std::collections::HashSet<_>>();
+            let existing_agents = merged_subscription
+                .get("agents")
+                .and_then(|value| value.as_array())
+                .map(|agents| {
+                    agents
+                        .iter()
+                        .filter(|agent| {
+                            !agent
+                                .get("agent")
+                                .and_then(|value| value.as_str())
+                                .is_some_and(|name| incoming_names.contains(name))
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            merged_subscription = subscription.clone();
+            merged_subscription["agents"] =
+                serde_json::json!([existing_agents, incoming_agents.clone()]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>());
+        } else {
+            merged_subscription = subscription.clone();
+        }
+        target_object.insert("subscription".to_string(), merged_subscription);
+    }
+    Ok(())
+}
+
+fn recompute_daily_from_agents(target: &mut serde_json::Map<String, serde_json::Value>) {
+    let Some(agents) = target.get("agents").and_then(|value| value.as_array()) else {
+        return;
+    };
+
+    let mut by_date = BTreeMap::<String, (f64, u64)>::new();
+    for agent in agents {
+        let Some(days) = agent.get("daily").and_then(|value| value.as_array()) else {
+            continue;
+        };
+        for day in days {
+            let Some(date) = day.get("date").and_then(|value| value.as_str()) else {
+                continue;
+            };
+            let cost = day.get("cost").and_then(|value| value.as_f64()).unwrap_or(0.0);
+            let tokens = day.get("tokens").and_then(|value| value.as_u64()).unwrap_or(0);
+            let entry = by_date.entry(date.to_string()).or_default();
+            entry.0 += cost;
+            entry.1 += tokens;
+        }
+    }
+
+    if !by_date.is_empty() {
+        target.insert(
+            "daily".to_string(),
+            serde_json::Value::Array(
+                by_date
+                    .into_iter()
+                    .map(|(date, (cost, tokens))| {
+                        serde_json::json!({ "date": date, "cost": cost, "tokens": tokens })
+                    })
+                    .collect(),
+            ),
+        );
+    }
+}
+
+pub(crate) fn attach_model_pricing(summary: &mut serde_json::Value) {
     fn attach(models: Option<&mut Vec<serde_json::Value>>) {
         for model in models.into_iter().flatten() {
             let Some(name) = model.get("model").and_then(|value| value.as_str()) else {
@@ -624,6 +839,93 @@ mod tests {
         };
 
         assert!(merge_antigravity(&mut summary, &antigravity).is_err());
+    }
+
+    #[test]
+    fn source_merge_replaces_rows_without_dropping_other_subscriptions() {
+        let mut target = serde_json::json!({
+            "totals": {"totalCost": 3.0, "totalTokens": 30},
+            "agents": [
+                {"agent": "codex", "totalCost": 1.0, "totalTokens": 10, "daily": [{"date": "2026-09-18", "cost": 1.0, "tokens": 10}]},
+                {"agent": "antigravity", "totalCost": 2.0, "totalTokens": 20, "daily": [{"date": "2026-09-18", "cost": 2.0, "tokens": 20}]}
+            ],
+            "models": [],
+            "subscription": {"agents": [
+                {"agent": "codex", "plan": "Free"},
+                {"agent": "antigravity", "plan": "Pro"}
+            ]}
+        });
+        let source = serde_json::json!({
+            "totals": {"totalCost": 2.0, "totalTokens": 20},
+            "agents": [{"agent": "antigravity", "totalCost": 2.5, "totalTokens": 25}],
+            "models": [],
+            "subscription": {"agents": [{"agent": "antigravity", "plan": "Ultra"}]}
+        });
+
+        merge_source_reports(&mut target, &source).expect("merge source");
+        assert_eq!(target["totals"]["totalTokens"], 35);
+        assert_eq!(
+            target["subscription"]["agents"].as_array().unwrap().len(),
+            2
+        );
+        assert_eq!(target["subscription"]["agents"][0]["agent"], "codex");
+        assert_eq!(target["subscription"]["agents"][1]["plan"], "Ultra");
+    }
+
+    #[test]
+    fn source_merge_updates_each_timeline_without_dropping_other_sources() {
+        let mut target = serde_json::json!({
+            "totals": {"totalCost": 3.0, "totalTokens": 30},
+            "agents": [
+                {"agent": "codex", "totalCost": 1.0, "totalTokens": 10},
+                {"agent": "antigravity", "totalCost": 2.0, "totalTokens": 20}
+            ],
+            "models": [],
+            "timelineReports": {
+                "today": {
+                    "totals": {"totalCost": 2.0, "totalTokens": 20},
+                    "agents": [{"agent": "antigravity", "totalCost": 2.0, "totalTokens": 20}],
+                    "models": []
+                }
+            }
+        });
+        let source = serde_json::json!({
+            "totals": {"totalCost": 1.0, "totalTokens": 10},
+            "agents": [{"agent": "codex", "totalCost": 3.0, "totalTokens": 30, "daily": [{"date": "2026-09-18", "cost": 3.0, "tokens": 30}]}],
+            "models": [],
+            "timelineReports": {
+                "today": {
+                    "totals": {"totalCost": 3.0, "totalTokens": 30},
+                    "agents": [{"agent": "codex", "totalCost": 3.0, "totalTokens": 30}],
+                    "models": []
+                },
+                "ytd": {
+                    "totals": {"totalCost": 3.0, "totalTokens": 30},
+                    "agents": [{"agent": "codex", "totalCost": 3.0, "totalTokens": 30}],
+                    "models": []
+                }
+            }
+        });
+
+        merge_source_reports(&mut target, &source).expect("merge timeline source");
+
+        assert_eq!(
+            target["timelineReports"]["today"]["totals"]["totalTokens"],
+            50
+        );
+        assert_eq!(
+            target["timelineReports"]["today"]["agents"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            target["timelineReports"]["ytd"]["totals"]["totalTokens"],
+            30
+        );
+        assert_eq!(target["daily"][0]["cost"], 3.0);
+        assert_eq!(target["daily"][0]["tokens"], 30);
     }
 
     #[test]

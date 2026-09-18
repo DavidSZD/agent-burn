@@ -91,6 +91,30 @@ export function isTimelineCacheFresh(entry, now = Date.now()) {
   return Number.isFinite(entry?.updatedAt) && now - entry.updatedAt <= 5 * 60 * 1000;
 }
 
+function formatElapsedSeconds(seconds) {
+  if (seconds < 60) return `${seconds} sec`;
+  const minutes = Math.floor(seconds / 60);
+  const remainingSeconds = seconds % 60;
+  return remainingSeconds > 0 ? `${minutes} min ${remainingSeconds} sec` : `${minutes} min`;
+}
+
+export function refreshStatusText({ updatedAt, refreshStartedAt, nextRefreshAt } = {}, now = Date.now()) {
+  if (Number.isFinite(refreshStartedAt)) {
+    const elapsedSeconds = Math.max(0, Math.floor((now - refreshStartedAt) / 1000));
+    return `Updating · ${formatElapsedSeconds(elapsedSeconds)}`;
+  }
+  if (Number.isFinite(nextRefreshAt)) {
+    const untilNext = Math.max(0, Math.ceil((nextRefreshAt - now) / 1000));
+    return `Next refresh in ${formatElapsedSeconds(untilNext)}`;
+  }
+  if (!Number.isFinite(updatedAt)) return "Waiting for first update";
+
+  const elapsedSeconds = Math.max(0, Math.floor((now - updatedAt) / 1000));
+  if (elapsedSeconds < 5) return "Updated just now";
+  if (elapsedSeconds < 60) return `Updated ${elapsedSeconds} sec ago`;
+  return `Updated ${Math.floor(elapsedSeconds / 60)} min ago`;
+}
+
 export function latestTimelineUpdatedAt(periodCache) {
   const timestamps = Object.values(periodCache || {})
     .map((entry) => entry?.updatedAt)
@@ -303,6 +327,103 @@ export function updateCacheFromTimelineSnapshot(periodCache, snapshot, updatedAt
   return allEntry;
 }
 
+// Replace only the provider rows present in a partial refresh. This keeps a
+// slow provider's last valid values visible while a faster provider publishes
+// its new report, without double-counting shared model names.
+export function mergeSourceSnapshot(periodCache, sourceSnapshot, updatedAt = Date.now()) {
+  const current = periodCache.all?.reportData || {
+    totals: { totalCost: 0, totalTokens: 0 },
+    agents: [],
+    models: [],
+  };
+  const merged = mergeSourceReports(current, sourceSnapshot);
+  periodCache.all = {
+    reportData: merged,
+    antigravityData: periodCache.all?.antigravityData || null,
+    updatedAt,
+  };
+  for (const [period, timelineReport] of Object.entries(merged.timelineReports || {})) {
+    periodCache[period] = {
+      reportData: mergeLiveSubscription(structuredClone(timelineReport), merged),
+      antigravityData: periodCache[period]?.antigravityData || null,
+      updatedAt,
+    };
+  }
+  return merged;
+}
+
+function mergeSourceReports(currentReport, sourceReport) {
+  const current = structuredClone(currentReport || {});
+  const incomingAgents = Array.isArray(sourceReport?.agents) ? sourceReport.agents : [];
+  const sourceNames = new Set(incomingAgents.map((agent) => agent?.agent).filter(Boolean));
+  current.agents = (Array.isArray(current.agents) ? current.agents : [])
+    .filter((agent) => !sourceNames.has(agent?.agent));
+  current.agents.push(...structuredClone(incomingAgents));
+  recomputeDailyFromAgents(current);
+
+  const incomingModels = Array.isArray(sourceReport?.models) ? sourceReport.models : [];
+  if (incomingModels.length > 0) {
+    const sourceModelNames = new Set(incomingModels.map((model) => model?.model).filter(Boolean));
+    current.models = (Array.isArray(current.models) ? current.models : [])
+      .filter((model) => !sourceModelNames.has(model?.model));
+    current.models.push(...structuredClone(incomingModels));
+    const totalCost = current.models.reduce((sum, model) => sum + (Number(model.totalCost) || 0), 0);
+    for (const model of current.models) {
+      model.percentage = totalCost > 0 ? ((Number(model.totalCost) || 0) / totalCost) * 100 : 0;
+    }
+  }
+
+  // The backend includes the same per-period matrix used to warm every
+  // timeline. Merge it recursively so partial provider refreshes update each
+  // cached period while preserving slower providers' last valid rows.
+  if (sourceReport?.timelineReports && typeof sourceReport.timelineReports === "object") {
+    current.timelineReports = current.timelineReports && typeof current.timelineReports === "object"
+      ? current.timelineReports
+      : {};
+    for (const [period, sourceTimeline] of Object.entries(sourceReport.timelineReports)) {
+      current.timelineReports[period] = mergeSourceReports(
+        current.timelineReports[period] || { totals: { totalCost: 0, totalTokens: 0 }, agents: [], models: [] },
+        sourceTimeline,
+      );
+    }
+  }
+
+  const totalCost = current.agents.reduce((sum, agent) => sum + (Number(agent.totalCost) || 0), 0);
+  const totalTokens = current.agents.reduce((sum, agent) => sum + (Number(agent.totalTokens) || 0), 0);
+  current.totals = { totalCost, totalTokens };
+
+  if (sourceReport?.subscription) {
+    const existingSubscription = current.subscription || {};
+    const incomingSubscriptions = Array.isArray(sourceReport.subscription.agents)
+      ? sourceReport.subscription.agents
+      : [];
+    const names = new Set(incomingSubscriptions.map((agent) => agent?.agent).filter(Boolean));
+    const existingSubscriptions = Array.isArray(existingSubscription.agents)
+      ? existingSubscription.agents.filter((agent) => !names.has(agent?.agent))
+      : [];
+    current.subscription = {
+      ...existingSubscription,
+      ...structuredClone(sourceReport.subscription),
+      agents: [...existingSubscriptions, ...structuredClone(incomingSubscriptions)],
+    };
+  }
+  return current;
+}
+
+function recomputeDailyFromAgents(report) {
+  const byDate = new Map();
+  for (const agent of report.agents || []) {
+    for (const day of agent.daily || []) {
+      if (!day?.date) continue;
+      const current = byDate.get(day.date) || { date: day.date, cost: 0, tokens: 0 };
+      current.cost += Number(day.cost) || 0;
+      current.tokens += Number(day.tokens) || 0;
+      byDate.set(day.date, current);
+    }
+  }
+  if (byDate.size > 0) report.daily = [...byDate.values()].sort((left, right) => left.date.localeCompare(right.date));
+}
+
 export function timelinePreloadOrder(periods, activePeriod) {
   return periods.filter((period) => period !== activePeriod);
 }
@@ -353,6 +474,19 @@ export function quotaRemainingPercent(agent) {
 export function mergeLiveSubscription(currentReport, liveReport) {
   if (!currentReport || !liveReport?.subscription) return currentReport;
   return { ...currentReport, subscription: liveReport.subscription };
+}
+
+export function selectedTimelineReport(periodCache, cacheKey, fallbackReport, liveReport) {
+  const cachedReport = periodCache?.[cacheKey]?.reportData;
+  const report = cachedReport || fallbackReport;
+  if (!report) return report;
+  const selected = Array.isArray(report.daily) && report.daily.length > 0
+    ? report
+    : structuredClone(report);
+  if (!Array.isArray(selected.daily) || selected.daily.length === 0) {
+    recomputeDailyFromAgents(selected);
+  }
+  return mergeLiveSubscription(selected, liveReport);
 }
 
 export async function persistQuotaSource(settingsPromise, quotaSource, persist) {

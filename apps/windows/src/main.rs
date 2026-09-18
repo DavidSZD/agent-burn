@@ -1,6 +1,7 @@
 #![windows_subsystem = "windows"]
 
 mod antigravity;
+mod antigravity_cloud;
 mod app;
 mod archive;
 mod autostart;

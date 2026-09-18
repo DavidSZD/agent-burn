@@ -300,6 +300,7 @@ fn visit_codex_session_entry(
         model.as_deref(),
         raw_usage.input_tokens,
         cached_input_tokens,
+        raw_usage.cache_write_input_tokens,
     );
 
     visit(CodexTokenUsageEvent {
@@ -396,6 +397,7 @@ fn visit_codex_exec_usage_event(
         model.as_deref(),
         raw_usage.input_tokens,
         cached_input_tokens,
+        raw_usage.cache_write_input_tokens,
     );
     visit(CodexTokenUsageEvent {
         session_id: session_id.to_string(),
@@ -415,15 +417,17 @@ fn codex_cache_write_tokens(
     model: Option<&str>,
     input_tokens: u64,
     cached_input_tokens: u64,
+    reported_cache_write_tokens: u64,
 ) -> u64 {
     let Some(model) = model.map(str::trim).filter(|model| !model.is_empty()) else {
-        return 0;
+        return reported_cache_write_tokens.min(input_tokens);
     };
     let model = model.to_ascii_lowercase();
+    let model = model.rsplit('/').next().unwrap_or(&model);
     if model.starts_with("gpt-5.6") || model.starts_with("gpt-6") {
         input_tokens.saturating_sub(cached_input_tokens)
     } else {
-        0
+        reported_cache_write_tokens.min(input_tokens)
     }
 }
 
@@ -1035,15 +1039,32 @@ mod tests {
 
     #[test]
     fn treats_all_uncached_codex_input_as_cache_write_for_gpt_5_6_and_newer() {
-        assert_eq!(codex_cache_write_tokens(Some("gpt-5.6-sol"), 100, 40), 60);
-        assert_eq!(codex_cache_write_tokens(Some("gpt-5.6-terra"), 100, 40), 60);
-        assert_eq!(codex_cache_write_tokens(Some("gpt-5.6-luna"), 100, 40), 60);
-        assert_eq!(codex_cache_write_tokens(Some("gpt-6-astra"), 100, 40), 60);
+        assert_eq!(
+            codex_cache_write_tokens(Some("gpt-5.6-sol"), 100, 40, 0),
+            60
+        );
+        assert_eq!(
+            codex_cache_write_tokens(Some("gpt-5.6-terra"), 100, 40, 0),
+            60
+        );
+        assert_eq!(
+            codex_cache_write_tokens(Some("gpt-5.6-luna"), 100, 40, 0),
+            60
+        );
+        assert_eq!(
+            codex_cache_write_tokens(Some("gpt-6-astra"), 100, 40, 0),
+            60
+        );
+        assert_eq!(
+            codex_cache_write_tokens(Some("openai/gpt-5.6-luna"), 100, 40, 0),
+            60
+        );
     }
 
     #[test]
     fn leaves_pre_gpt_5_6_codex_input_without_cache_write_cost() {
-        assert_eq!(codex_cache_write_tokens(Some("gpt-5.5"), 100, 40), 0);
-        assert_eq!(codex_cache_write_tokens(Some("gpt-5.4"), 100, 40), 0);
+        assert_eq!(codex_cache_write_tokens(Some("gpt-5.5"), 100, 40, 0), 0);
+        assert_eq!(codex_cache_write_tokens(Some("gpt-5.4"), 100, 40, 0), 0);
+        assert_eq!(codex_cache_write_tokens(Some("gpt-5"), 100, 40, 15), 15);
     }
 }

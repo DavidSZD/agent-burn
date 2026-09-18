@@ -600,13 +600,16 @@ pub(super) fn codex_group_row(
         .models
         .iter()
         .map(|(model, usage)| {
-            let input =
-                codex::non_cached_input_tokens(usage.input_tokens, usage.cached_input_tokens);
+            let input = codex::non_cached_input_tokens(
+                usage.input_tokens,
+                usage.cached_input_tokens,
+                usage.cache_write_input_tokens,
+            );
             ModelBreakdown {
                 model_name: model.clone(),
                 input_tokens: input,
                 output_tokens: usage.output_tokens,
-                cache_creation_tokens: 0,
+                cache_creation_tokens: usage.cache_write_input_tokens,
                 cache_read_tokens: usage.cached_input_tokens,
                 extra_total_tokens: 0,
                 cost: codex::calculate_codex_model_cost(model, usage, pricing, speed),
@@ -619,9 +622,13 @@ pub(super) fn codex_group_row(
         period: period.to_string(),
         agent: "codex",
         models_used: group.models.keys().cloned().collect(),
-        input_tokens: codex::non_cached_input_tokens(group.input_tokens, group.cached_input_tokens),
+        input_tokens: codex::non_cached_input_tokens(
+            group.input_tokens,
+            group.cached_input_tokens,
+            group.cache_write_input_tokens,
+        ),
         output_tokens: group.output_tokens,
-        cache_creation_tokens: 0,
+        cache_creation_tokens: group.cache_write_input_tokens,
         cache_read_tokens: group.cached_input_tokens,
         total_tokens: group.total_tokens,
         total_cost: codex::calculate_group_cost(group, pricing, speed),

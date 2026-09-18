@@ -8,7 +8,7 @@ use crate::{
     Color, IsoDate, MILLIS_PER_DAY, ModelBreakdown, PricingMap, Result, TimestampMs,
     adapter::{claude, codex, cursor},
     cli::{AgentReportKind, SharedArgs, SummaryArgs, SummaryRange, WeekDay},
-    cost::tiered_cost,
+    cost::tiered_cost_with_threshold,
     fast::FxHashMap,
     format_currency, format_date_tz, format_naive_date, format_utc_date, json_float,
     parse_iso_date, parse_tz, print_json_or_jq, utc_now, wants_json, week_start,
@@ -547,23 +547,27 @@ fn estimated_model_category_costs(
     } else {
         model_pricing.cache_read
     };
+    let threshold = pricing.long_context_threshold(&model.model_name);
     CategoryCosts {
-        input: tiered_cost(
+        input: tiered_cost_with_threshold(
             model.input_tokens,
             model_pricing.input,
             model_pricing.input_above_200k,
+            threshold,
         ),
-        output: tiered_cost(
+        output: tiered_cost_with_threshold(
             model.output_tokens,
             model_pricing.output,
             model_pricing.output_above_200k,
+            threshold,
         ),
-        cache_creation: tiered_cost(
+        cache_creation: tiered_cost_with_threshold(
             model.cache_creation_tokens,
             model_pricing.cache_create,
             model_pricing.cache_create_above_200k,
+            threshold,
         ),
-        cache_read: tiered_cost(
+        cache_read: tiered_cost_with_threshold(
             model.cache_read_tokens,
             cache_read_rate,
             if agent == "codex" && !model_pricing.cache_read_explicit {
@@ -571,6 +575,7 @@ fn estimated_model_category_costs(
             } else {
                 model_pricing.cache_read_above_200k
             },
+            threshold,
         ),
     }
     .scale(multiplier)
