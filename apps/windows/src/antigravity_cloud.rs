@@ -26,13 +26,30 @@ pub(crate) fn build_plan_from_responses(
     let plan = cloud_plan_name(load_code_assist)?;
     let email = subscription_email(load_code_assist);
 
-    let mut quotas = model_quotas(available_models);
+    // `retrieveUserQuota` is the authoritative per-account Gemini meter used
+    // by agy-quota. Prefer those request buckets for the live limits shown in
+    // Agent Burn; `fetchAvailableModels` is only a pooled provider view.
+    let mut quotas = bucket_quotas(quota_buckets);
+    if quotas.is_empty() {
+        quotas = model_quotas(available_models);
+    }
+    if quotas.is_empty() {
+        quotas = summary_quotas(quota_summary);
+    }
     let mut weekly_remaining = None;
     let mut weekly_reset_time = None;
-    let mut weekly_preferred = false;
     let mut session_remaining = None;
     let mut session_reset_time = None;
     let mut session_preferred = false;
+
+    // The open-source reference intentionally does not infer the authoritative
+    // Gemini quota from the summary endpoint. That endpoint can expose a
+    // different project bucket (43% in the user's account) while the direct
+    // REQUESTS buckets report the actual 86% account quota.
+    if let Some((remaining, reset_time)) = authoritative_quota_window(quota_buckets) {
+        weekly_remaining = Some(remaining);
+        weekly_reset_time = reset_time;
+    }
 
     if let Some(summary) = quota_summary {
         let summary = summary.get("response").unwrap_or(summary);
@@ -60,14 +77,6 @@ pub(crate) fn build_plan_from_responses(
                         .and_then(Value::as_str)
                         .unwrap_or_default()
                     {
-                        "weekly" => update_window(
-                            &mut weekly_remaining,
-                            &mut weekly_reset_time,
-                            remaining,
-                            reset,
-                            bucket_id.eq_ignore_ascii_case("gemini-weekly"),
-                            &mut weekly_preferred,
-                        ),
                         "5h" | "five_hour" | "five-hour" => update_window(
                             &mut session_remaining,
                             &mut session_reset_time,
@@ -83,13 +92,6 @@ pub(crate) fn build_plan_from_responses(
         }
     }
 
-    if quotas.is_empty() {
-        quotas = summary_quotas(quota_summary);
-    }
-    if quotas.is_empty() {
-        quotas = bucket_quotas(quota_buckets);
-    }
-
     Some(AntigravityPlan {
         plan,
         price_per_month: 0.0,
@@ -101,6 +103,25 @@ pub(crate) fn build_plan_from_responses(
         session_remaining,
         session_reset_time,
     })
+}
+
+fn authoritative_quota_window(quota: Option<&Value>) -> Option<(f64, Option<String>)> {
+    let buckets = quota
+        .and_then(|value| value.get("response").unwrap_or(value).get("buckets"))
+        .and_then(Value::as_array)?;
+    let mut remaining = Vec::new();
+    let mut reset_times = Vec::new();
+    for bucket in buckets {
+        if let Some(fraction) = bucket.get("remainingFraction").and_then(Value::as_f64) {
+            remaining.push((fraction * 100.0).clamp(0.0, 100.0));
+        }
+        if let Some(reset) = bucket.get("resetTime").and_then(Value::as_str) {
+            reset_times.push(reset.to_string());
+        }
+    }
+    let minimum = remaining.into_iter().min_by(f64::total_cmp)?;
+    reset_times.sort();
+    Some((minimum, reset_times.into_iter().next()))
 }
 
 fn update_window(
@@ -264,7 +285,7 @@ fn summary_quotas(summary: Option<&Value>) -> Vec<AntigravityQuotaInfo> {
 
 fn bucket_quotas(quota: Option<&Value>) -> Vec<AntigravityQuotaInfo> {
     quota
-        .and_then(|value| value.get("buckets"))
+        .and_then(|value| value.get("response").unwrap_or(value).get("buckets"))
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
@@ -317,13 +338,7 @@ fn fetch_plan_with_token(agent: &ureq::Agent, access_token: &str) -> Option<Anti
         agent,
         &format!("{API_HOST}/v1internal:loadCodeAssist"),
         &access_token,
-        &json!({
-            "metadata": {
-                "ideType": "ANTIGRAVITY",
-                "platform": "PLATFORM_UNSPECIFIED",
-                "pluginType": "GEMINI"
-            }
-        }),
+        &json!({}),
     )?;
     let project = project_id(&load);
     let project_body = project
@@ -331,6 +346,16 @@ fn fetch_plan_with_token(agent: &ureq::Agent, access_token: &str) -> Option<Anti
         .map(|project| json!({"project": project}))
         .unwrap_or_else(|| json!({}));
 
+    // Match agy-quota's headless path: retrieveUserQuota is the authoritative
+    // Gemini REQUESTS meter and does not require the IDE or loopback server.
+    let buckets = post_json(
+        agent,
+        &format!("{API_HOST}/v1internal:retrieveUserQuota"),
+        &access_token,
+        &json!({}),
+    );
+    // Keep the summary endpoint only as an optional source for the short
+    // session window. It must never replace the direct account quota above.
     let summary = post_json(
         agent,
         &format!("{API_HOST}/v1internal:retrieveUserQuotaSummary"),
@@ -343,17 +368,6 @@ fn fetch_plan_with_token(agent: &ureq::Agent, access_token: &str) -> Option<Anti
         &access_token,
         &project_body,
     );
-    let buckets = if summary.is_none() {
-        post_json(
-            agent,
-            &format!("{API_HOST}/v1internal:retrieveUserQuota"),
-            &access_token,
-            &project_body,
-        )
-    } else {
-        None
-    };
-
     build_plan_from_responses(&load, summary.as_ref(), models.as_ref(), buckets.as_ref())
 }
 
@@ -499,8 +513,18 @@ fn post_json(
         .header("Authorization", &format!("Bearer {access_token}"))
         .header("Content-Type", "application/json")
         .header("Accept", "application/json")
-        // Antigravity rejects quota requests without this product user-agent.
+        // These are the same product headers used by agy-quota. They are
+        // harmless for Gemini and allow fetchAvailableModels to expose the
+        // Anthropic/OpenAI provider pools as well.
         .header("User-Agent", "antigravity")
+        .header(
+            "X-Goog-Api-Client",
+            "google-cloud-sdk vscode_cloudshelleditor/0.1",
+        )
+        .header(
+            "Client-Metadata",
+            r#"{"ideType":"ANTIGRAVITY","platform":"WINDOWS","pluginType":"GEMINI"}"#,
+        )
         .send(payload)
         .ok()?;
     if response.status().as_u16() != 200 {
@@ -697,7 +721,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn cloud_plan_uses_paid_tier_and_summary_windows() {
+    fn cloud_plan_uses_paid_tier_and_authoritative_quota_windows() {
         let load = json!({
             "currentTier": {"id": "free-tier", "name": "Antigravity"},
             "paidTier": {"id": "g1-pro-tier", "name": "Google AI Pro"},
@@ -716,14 +740,17 @@ mod tests {
         let models = json!({"models": {
             "gemini-3-flash": {"displayName": "Gemini 3 Flash", "quotaInfo": {"remainingFraction": 0.91, "resetTime": "2026-09-17T09:34:22Z"}}
         }});
+        let quota = json!({"buckets": [
+            {"tokenType": "REQUESTS", "modelId": "gemini-3-flash", "remainingFraction": 0.86, "resetTime": "2026-09-22T04:34:22Z"}
+        ]});
 
-        let plan = build_plan_from_responses(&load, Some(&summary), Some(&models), None)
+        let plan = build_plan_from_responses(&load, Some(&summary), Some(&models), Some(&quota))
             .expect("cloud response should produce a plan");
 
         assert_eq!(plan.plan, "Pro");
         assert_eq!(plan.quotas[0].model_id.as_deref(), Some("gemini-3-flash"));
-        assert_eq!(plan.quotas[0].remaining, 91.0);
-        assert_eq!(plan.weekly_remaining, Some(73.0));
+        assert_eq!(plan.quotas[0].remaining, 86.0);
+        assert_eq!(plan.weekly_remaining, Some(86.0));
         assert_eq!(plan.session_remaining, Some(88.0));
     }
 
@@ -740,6 +767,7 @@ mod tests {
         assert_eq!(plan.plan, "Free");
         assert_eq!(plan.quotas[0].model_id.as_deref(), Some("chat_20706"));
         assert_eq!(plan.quotas[0].remaining, 42.0);
+        assert_eq!(plan.weekly_remaining, Some(42.0));
     }
 
     #[test]

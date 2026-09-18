@@ -281,8 +281,14 @@ fn recompute_daily_from_agents(target: &mut serde_json::Map<String, serde_json::
             let Some(date) = day.get("date").and_then(|value| value.as_str()) else {
                 continue;
             };
-            let cost = day.get("cost").and_then(|value| value.as_f64()).unwrap_or(0.0);
-            let tokens = day.get("tokens").and_then(|value| value.as_u64()).unwrap_or(0);
+            let cost = day
+                .get("cost")
+                .and_then(|value| value.as_f64())
+                .unwrap_or(0.0);
+            let tokens = day
+                .get("tokens")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0);
             let entry = by_date.entry(date.to_string()).or_default();
             entry.0 += cost;
             entry.1 += tokens;

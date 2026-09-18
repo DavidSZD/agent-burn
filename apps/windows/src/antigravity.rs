@@ -530,7 +530,9 @@ fn plan_with_agy_usage(existing: Option<AntigravityPlan>, usage: AgyUsage) -> An
 }
 
 fn plan_has_complete_windows(plan: Option<&AntigravityPlan>) -> bool {
-    plan.is_some_and(|value| value.weekly_remaining.is_some() && value.session_remaining.is_some())
+    // The direct agy-quota endpoint guarantees the authoritative weekly
+    // REQUESTS bucket but does not promise a separate 5-hour window.
+    plan.is_some_and(|value| value.weekly_remaining.is_some())
 }
 
 fn get_live_antigravity_plan() -> Option<AntigravityPlan> {
@@ -546,12 +548,10 @@ fn get_live_antigravity_plan() -> Option<AntigravityPlan> {
     }
 
     // When Antigravity is running, its local language-server response is the
-    // authoritative quota view. The credential/API response can expose a
-    // different (and lower) project bucket, which made the UI show 43% while
-    // the running client showed 86%. Probe the local server first; when the
-    // app is closed that probe exits immediately and the credential/API path
-    // still provides the offline-capable fallback. Keep `agy` as the final
-    // compatibility fallback only when both native sources lack quota windows.
+    // same 86% weekly meter visible in the client. The headless agy-quota API
+    // is still attempted when the IDE is closed, but it exposes a different
+    // REQUESTS/pool meter for some accounts and must not overwrite the live
+    // local value. Keep `agy` as the final compatibility fallback.
     let mut plan = get_language_server_plan();
     if !plan_has_complete_windows(plan.as_ref()) {
         plan = crate::antigravity_cloud::fetch_plan().or(plan);

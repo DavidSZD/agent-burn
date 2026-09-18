@@ -217,6 +217,11 @@ window.addEventListener("DOMContentLoaded", async () => {
   initPeriods();
   initRefresh();
   initSettings();
+  // The backend collector starts independently of the WebView and its first
+  // event can arrive before listeners finish attaching. Start the footer
+  // clock locally so startup still shows Updating instead of stale cache age.
+  automaticRefreshStartedAt = Date.now();
+  nextAutomaticRefreshAt = automaticRefreshStartedAt + refreshIntervalMs();
   setTimelineRefreshing(true, "startup");
   initFooterTimer();
   initBackendEvents();
@@ -224,6 +229,9 @@ window.addEventListener("DOMContentLoaded", async () => {
 
   // Démarrage rapide avec le cache
   await settingsLoadPromise;
+  if (Number.isFinite(automaticRefreshStartedAt)) {
+    nextAutomaticRefreshAt = automaticRefreshStartedAt + refreshIntervalMs();
+  }
   await initColdStart();
   updateTimelineAvailability();
   // On ne bloque le premier affichage que s'il n'existe encore aucune donnée.
@@ -252,6 +260,12 @@ function initBackendEvents() {
   listen("refresh_finished", (event) => {
     const generation = Number(event?.payload?.generation);
     if (Number.isFinite(generation) && generation < activeRefreshGeneration) return;
+    const startedAtMs = Number(event?.payload?.startedAtMs);
+    const finishedAtMs = Number(event?.payload?.finishedAtMs);
+    const scheduleAnchor = Number.isFinite(startedAtMs)
+      ? startedAtMs
+      : (Number.isFinite(finishedAtMs) ? finishedAtMs : Date.now());
+    nextAutomaticRefreshAt = scheduleAnchor + refreshIntervalMs();
     automaticRefreshStartedAt = null;
     setTimelineRefreshing(false, "automatic");
     setTimelineRefreshing(false, "startup");
@@ -310,6 +324,12 @@ function applyBackendRefresh(data, refreshedAtMs) {
 
 async function syncBackendRefresh(data, refreshedAtMs) {
   if (!applyBackendRefresh(data, refreshedAtMs)) return;
+  // If the start/finish events were emitted before the WebView subscribed,
+  // reconstruct the next scheduled run from the completed snapshot instead
+  // of falling back to “Updated … ago” indefinitely.
+  if (!Number.isFinite(nextAutomaticRefreshAt)) {
+    nextAutomaticRefreshAt = refreshedAtMs + refreshIntervalMs();
+  }
   automaticRefreshStartedAt = null;
   setTimelineRefreshing(false, "automatic");
   resolveInitialBackendRefresh();
