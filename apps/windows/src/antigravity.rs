@@ -547,14 +547,13 @@ fn get_live_antigravity_plan() -> Option<AntigravityPlan> {
         }
     }
 
-    // When Antigravity is running, its local language-server response is the
-    // same 86% weekly meter visible in the client. The headless agy-quota API
-    // is still attempted when the IDE is closed, but it exposes a different
-    // REQUESTS/pool meter for some accounts and must not overwrite the live
-    // local value. Keep `agy` as the final compatibility fallback.
-    let mut plan = get_language_server_plan();
+    // Use the headless cloud endpoint first. The daily-cloudcode host returns
+    // the account's real weekly bucket without requiring Antigravity to be
+    // open. Fall back to the local language server, then `agy`, only when the
+    // direct API cannot provide a weekly quota.
+    let mut plan = crate::antigravity_cloud::fetch_plan();
     if !plan_has_complete_windows(plan.as_ref()) {
-        plan = crate::antigravity_cloud::fetch_plan().or(plan);
+        plan = get_language_server_plan().or(plan);
         if !plan_has_complete_windows(plan.as_ref()) {
             if let Some(usage) = get_agy_usage() {
                 plan = Some(plan_with_agy_usage(plan, usage));

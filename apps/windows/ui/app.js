@@ -327,7 +327,7 @@ async function syncBackendRefresh(data, refreshedAtMs) {
   // If the start/finish events were emitted before the WebView subscribed,
   // reconstruct the next scheduled run from the completed snapshot instead
   // of falling back to “Updated … ago” indefinitely.
-  if (!Number.isFinite(nextAutomaticRefreshAt)) {
+  if (!Number.isFinite(nextAutomaticRefreshAt) || nextAutomaticRefreshAt <= refreshedAtMs) {
     nextAutomaticRefreshAt = refreshedAtMs + refreshIntervalMs();
   }
   automaticRefreshStartedAt = null;

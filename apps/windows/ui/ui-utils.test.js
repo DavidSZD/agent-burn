@@ -135,14 +135,21 @@ test("refreshes a selected timeline only after its five minute freshness window"
 test("shows elapsed time while an automatic refresh is running", () => {
   assert.equal(
     refreshStatusText({ updatedAt: 1_000, refreshStartedAt: 10_000 }, 72_500),
-    "Updating · 1 min 2 sec",
+    "Last update 1 min 11 sec ago · Updating · 1 min 2 sec",
   );
 });
 
 test("shows the next automatic refresh when idle", () => {
   assert.equal(
     refreshStatusText({ updatedAt: 1_000, nextRefreshAt: 72_500 }, 12_500),
-    "Next refresh in 1 min",
+    "Last update 11 sec ago · Next refresh in 1 min",
+  );
+});
+
+test("switches from zero-second countdown to updating", () => {
+  assert.equal(
+    refreshStatusText({ updatedAt: 1_000, nextRefreshAt: 12_000 }, 12_000),
+    "Last update 11 sec ago · Updating · 0 sec",
   );
 });
 

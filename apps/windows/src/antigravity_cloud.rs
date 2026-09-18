@@ -4,7 +4,7 @@ use std::{env, fs, path::PathBuf, sync::OnceLock, time::Duration};
 
 const KEYRING_TARGET: &str = "gemini:antigravity";
 const TOKEN_ENDPOINT: &str = "https://oauth2.googleapis.com/token";
-const API_HOST: &str = "https://cloudcode-pa.googleapis.com";
+const API_HOST: &str = "https://daily-cloudcode-pa.googleapis.com";
 const MAX_RESPONSE_BYTES: u64 = 2 * 1024 * 1024;
 
 #[derive(Debug, Clone)]

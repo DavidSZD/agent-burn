@@ -98,14 +98,30 @@ function formatElapsedSeconds(seconds) {
   return remainingSeconds > 0 ? `${minutes} min ${remainingSeconds} sec` : `${minutes} min`;
 }
 
+function lastUpdateLabel(updatedAt, now) {
+  if (!Number.isFinite(updatedAt)) return null;
+  const elapsedSeconds = Math.max(0, Math.floor((now - updatedAt) / 1000));
+  return elapsedSeconds < 5
+    ? "Last update just now"
+    : `Last update ${formatElapsedSeconds(elapsedSeconds)} ago`;
+}
+
 export function refreshStatusText({ updatedAt, refreshStartedAt, nextRefreshAt } = {}, now = Date.now()) {
+  const lastUpdate = lastUpdateLabel(updatedAt, now);
   if (Number.isFinite(refreshStartedAt)) {
     const elapsedSeconds = Math.max(0, Math.floor((now - refreshStartedAt) / 1000));
-    return `Updating · ${formatElapsedSeconds(elapsedSeconds)}`;
+    const status = `Updating · ${formatElapsedSeconds(elapsedSeconds)}`;
+    return lastUpdate ? `${lastUpdate} · ${status}` : status;
   }
   if (Number.isFinite(nextRefreshAt)) {
+    if (nextRefreshAt <= now) {
+      const elapsedSeconds = Math.max(0, Math.floor((now - nextRefreshAt) / 1000));
+      const status = `Updating · ${formatElapsedSeconds(elapsedSeconds)}`;
+      return lastUpdate ? `${lastUpdate} · ${status}` : status;
+    }
     const untilNext = Math.max(0, Math.ceil((nextRefreshAt - now) / 1000));
-    return `Next refresh in ${formatElapsedSeconds(untilNext)}`;
+    const status = `Next refresh in ${formatElapsedSeconds(untilNext)}`;
+    return lastUpdate ? `${lastUpdate} · ${status}` : status;
   }
   if (!Number.isFinite(updatedAt)) return "Waiting for first update";
 
