@@ -2507,14 +2507,23 @@ function showUpdateDiscoveryNotice(version) {
   }, 8000);
 }
 
+function hideUpdateDiscoveryNotice() {
+  window.clearTimeout(updateNoticeTimer);
+  updateNoticeTimer = null;
+  const notice = document.getElementById("update-discovery-notice");
+  if (notice) notice.hidden = true;
+}
+
 function initAppUpdateNotice() {
   renderFooterUpdateNotice(getPersistedAvailableUpdate(localStorage));
   document.getElementById("footer-update-button")?.addEventListener("click", async (event) => {
     const button = event.currentTarget;
     button.disabled = true;
     button.textContent = "Checking update…";
-    await checkForAppUpdates({ installAfterCheck: true });
-    if (!updateCheckInProgress) {
+    hideUpdateDiscoveryNotice();
+    try {
+      await checkForAppUpdates({ installAfterCheck: true });
+    } finally {
       renderFooterUpdateNotice(getPersistedAvailableUpdate(localStorage));
     }
   });
@@ -2554,10 +2563,12 @@ async function checkForAppUpdates({ automatic = false, installAfterCheck = false
     } else if (status) {
       clearPersistedAvailableUpdate(localStorage);
       renderFooterUpdateNotice(null);
+      hideUpdateDiscoveryNotice();
       status.textContent = "You’re using the latest version.";
     } else {
       clearPersistedAvailableUpdate(localStorage);
       renderFooterUpdateNotice(null);
+      hideUpdateDiscoveryNotice();
     }
   } catch (error) {
     if (status) status.textContent = `Could not check for updates: ${String(error)}`;
