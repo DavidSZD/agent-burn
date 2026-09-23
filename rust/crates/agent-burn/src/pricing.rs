@@ -655,9 +655,10 @@ impl PricingMap {
     }
 
     fn apply_override(&mut self, model: &str, override_value: &PricingOverride) {
+        let model = model.trim().to_ascii_lowercase();
         let base = self
             .entries
-            .get(model)
+            .get(&model)
             .copied()
             .unwrap_or_else(Pricing::empty);
 
@@ -736,14 +737,13 @@ impl PricingMap {
                 .unwrap_or(base.fast_multiplier),
         };
 
-        self.entries.insert(model.to_string(), pricing);
-        self.explicit_overrides
-            .insert(model.trim().to_ascii_lowercase());
+        self.entries.insert(model.clone(), pricing);
+        self.explicit_overrides.insert(model.clone());
         if let Ok(mut cache) = self.lookup_cache.lock() {
             cache.clear();
         }
         if let Some(limit) = override_value.max_input_tokens {
-            self.context_limits.insert(model.to_string(), limit);
+            self.context_limits.insert(model, limit);
         }
     }
 
@@ -2322,6 +2322,35 @@ mod tests {
             .expect("the unqualified model retains its historical price");
 
         assert_eq!(result.input, 0.44e-6);
+    }
+
+    #[test]
+    fn pricing_overrides_normalize_model_names_before_lookup_and_storage() {
+        use agent_burn_cli::PricingOverride;
+        use std::collections::BTreeMap;
+
+        let mut pricing = PricingMap::default();
+        pricing.entries.insert(
+            "deepseek-v4-flash".to_string(),
+            Pricing {
+                input: 0.22e-6,
+                ..Pricing::empty()
+            },
+        );
+        let overrides = BTreeMap::from([(
+            "DEEPSEEK-V4-FLASH".to_string(),
+            PricingOverride {
+                input_cost_per_token: Some(0.99e-6),
+                ..PricingOverride::default()
+            },
+        )]);
+        pricing.apply_overrides(overrides.iter());
+
+        let result = pricing
+            .find_at("deepseek-v4-flash", Some(1))
+            .expect("the normalized model name resolves its explicit override");
+
+        assert_eq!(result.input, 0.99e-6);
     }
 
     #[test]
