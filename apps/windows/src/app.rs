@@ -19,6 +19,7 @@ pub struct AppState {
     pub latest_refresh: RwLock<Option<RefreshSnapshot>>,
     pub summary_scan: tokio::sync::Mutex<()>,
     pub refresh_generation: AtomicU64,
+    pub scan_control: crate::scan_control::ScanControl,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -92,6 +93,7 @@ impl AppState {
             latest_refresh: RwLock::new(None),
             summary_scan: tokio::sync::Mutex::new(()),
             refresh_generation: AtomicU64::new(0),
+            scan_control: crate::scan_control::ScanControl::default(),
         }
     }
 }
@@ -188,11 +190,13 @@ pub fn resolve_cli_path_with_override(custom_path: Option<&str>) -> Option<PathB
 }
 
 pub async fn execute_cli_json_with_settings(
+    scan_control: &crate::scan_control::ScanControl,
     cli_path: Option<&Path>,
     args: &[&str],
     settings: &AppSettings,
 ) -> Result<serde_json::Value, String> {
-    execute_cli_json_inner(cli_path, args, settings).await
+    let (_permit, mut cancellation) = scan_control.begin_scan()?;
+    execute_cli_json_inner(cli_path, args, settings, &mut cancellation).await
 }
 
 fn cli_command(cli_path: Option<&Path>) -> Result<Command, String> {
@@ -205,6 +209,7 @@ async fn execute_cli_json_inner(
     cli_path: Option<&Path>,
     args: &[&str],
     settings: &AppSettings,
+    cancellation: &mut crate::scan_control::ScanCancellation,
 ) -> Result<serde_json::Value, String> {
     let mut cmd = cli_command(cli_path)?;
 
@@ -225,18 +230,74 @@ async fn execute_cli_json_inner(
     cmd.stderr(Stdio::piped());
     cmd.kill_on_drop(true);
 
-    let output = tokio::time::timeout(std::time::Duration::from_secs(120), cmd.output())
-        .await
-        .map_err(|_| "La CLI a dépassé le délai maximal de 120 secondes.".to_string())?
+    let mut child = cmd
+        .spawn()
         .map_err(|e| format!("Impossible d'exécuter la CLI: {e}"))?;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let stdout_reader = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        if let Some(mut pipe) = stdout {
+            tokio::io::AsyncReadExt::read_to_end(&mut pipe, &mut bytes)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        Ok::<_, String>(bytes)
+    });
+    let stderr_reader = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        if let Some(mut pipe) = stderr {
+            tokio::io::AsyncReadExt::read_to_end(&mut pipe, &mut bytes)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        Ok::<_, String>(bytes)
+    });
 
-    let stdout_str = String::from_utf8_lossy(&output.stdout);
-    let stderr_str = String::from_utf8_lossy(&output.stderr);
+    let status = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            let _ = stdout_reader.await;
+            let _ = stderr_reader.await;
+            return Err("Scan annulé pour préparer la mise à jour.".to_string());
+        }
+        result = tokio::time::timeout(std::time::Duration::from_secs(120), child.wait()) => {
+            match result {
+                Ok(Ok(status)) => status,
+                Ok(Err(error)) => {
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                    let _ = stdout_reader.await;
+                    let _ = stderr_reader.await;
+                    return Err(format!("Impossible d'attendre la fin de la CLI: {error}"));
+                }
+                Err(_) => {
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                    let _ = stdout_reader.await;
+                    let _ = stderr_reader.await;
+                    return Err("La CLI a dépassé le délai maximal de 120 secondes.".to_string());
+                }
+            }
+        }
+    };
+    let stdout = stdout_reader
+        .await
+        .map_err(|error| format!("Lecture stdout impossible: {error}"))?
+        .map_err(|error| format!("Lecture stdout impossible: {error}"))?;
+    let stderr = stderr_reader
+        .await
+        .map_err(|error| format!("Lecture stderr impossible: {error}"))?
+        .map_err(|error| format!("Lecture stderr impossible: {error}"))?;
+    let stdout_str = String::from_utf8_lossy(&stdout);
+    let stderr_str = String::from_utf8_lossy(&stderr);
 
-    if !output.status.success() {
+    if !status.success() {
         return Err(format!(
             "Erreur CLI (code {}): {}",
-            output.status,
+            status,
             stderr_str.trim()
         ));
     }

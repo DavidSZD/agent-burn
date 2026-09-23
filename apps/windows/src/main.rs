@@ -9,6 +9,7 @@ mod background;
 mod commands;
 mod pricing;
 mod projects;
+mod scan_control;
 mod tray;
 
 use app::AppState;
@@ -74,6 +75,8 @@ fn main() {
             commands::get_report_cache,
             commands::save_report_cache,
             commands::get_antigravity_summary,
+            commands::prepare_for_update,
+            commands::resume_scans_after_cancelled_update,
         ])
         .run(tauri::generate_context!())
         .expect("Erreur lors de l'exécution de l'application Agent Burn Windows");
