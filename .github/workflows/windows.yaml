@@ -52,7 +52,11 @@ jobs:
         run: cargo test --manifest-path apps/windows/Cargo.toml
 
       - name: Test Windows UI and release helpers
-        run: node --test apps/windows/ui/ui-utils.test.js apps/windows/scripts/release-utils.test.mjs
+        run: >-
+          node --test apps/windows/ui/ui-utils.test.js
+          apps/windows/ui/request-gate.test.js
+          apps/windows/ui/update-notice.test.js
+          apps/windows/scripts/release-utils.test.mjs
 
       - name: Install workspace dependencies
         run: |
