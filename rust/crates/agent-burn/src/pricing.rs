@@ -11,7 +11,7 @@ use agent_burn_cli::PricingOverride;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::fast::FxHashMap;
+use crate::fast::{FxHashMap, FxHashSet};
 
 const BUILD_TIME_PRICING_JSON: &str =
     include_str!(concat!(env!("OUT_DIR"), "/litellm-pricing.json"));
@@ -65,6 +65,7 @@ pub(crate) struct PricingMap {
     long_context_thresholds: FxHashMap<String, u64>,
     lookup_cache: Mutex<FxHashMap<String, Option<Pricing>>>,
     historical: Vec<PricingPeriod>,
+    explicit_overrides: FxHashSet<String>,
     enable_models_dev_fallback: bool,
     enable_embedded_models_dev_fallback: bool,
 }
@@ -461,9 +462,20 @@ impl PricingMap {
     }
 
     pub(crate) fn find_at(&self, model: &str, timestamp_ms: Option<i64>) -> Option<Pricing> {
-        if let Some(timestamp_ms) = timestamp_ms {
+        let normalized_model = model.trim().to_ascii_lowercase();
+        let model_identity = pricing_model_identity(&normalized_model);
+        let has_override = self.explicit_overrides.contains(&normalized_model)
+            || (normalized_model.contains('/')
+                && self.explicit_overrides.contains(model_identity.as_ref()))
+            || pricing_alias(&normalized_model)
+                .is_some_and(|alias| self.explicit_overrides.contains(alias));
+        if let Some(timestamp_ms) = timestamp_ms.filter(|_| !has_override) {
             let normalized = normalized_pricing_key(model);
+            let model_identity = pricing_model_identity(model);
             let has_exact_pricing = self.find_exact_with_fallback(model).is_some()
+                || self
+                    .find_exact_with_fallback(model_identity.as_ref())
+                    .is_some()
                 || pricing_alias(model)
                     .is_some_and(|alias| self.find_exact_with_fallback(alias).is_some());
             if let Some(period) = self.historical.iter().find(|period| {
@@ -725,9 +737,8 @@ impl PricingMap {
         };
 
         self.entries.insert(model.to_string(), pricing);
-        let override_identity = pricing_model_identity(model).into_owned();
-        self.historical
-            .retain(|period| pricing_model_identity(&period.model) != override_identity);
+        self.explicit_overrides
+            .insert(model.trim().to_ascii_lowercase());
         if let Ok(mut cache) = self.lookup_cache.lock() {
             cache.clear();
         }
@@ -2201,6 +2212,33 @@ mod tests {
     }
 
     #[test]
+    fn dated_lookup_recognizes_an_unqualified_exact_variant_for_provider_names() {
+        let mut pricing = PricingMap::default();
+        pricing.entries.insert(
+            "deepseek-v4-flash-lite".to_string(),
+            Pricing {
+                input: 0.9e-6,
+                ..Pricing::empty()
+            },
+        );
+        pricing.historical.push(super::PricingPeriod {
+            model: "deepseek-v4-flash".to_string(),
+            start_ms: 0,
+            end_ms: None,
+            pricing: Pricing {
+                input: 0.4e-6,
+                ..Pricing::empty()
+            },
+        });
+
+        let result = pricing
+            .find_at("deepseek/deepseek-v4-flash-lite", Some(1))
+            .expect("the exact variant has current pricing");
+
+        assert_eq!(result.input, 0.9e-6);
+    }
+
+    #[test]
     fn explicit_override_takes_precedence_over_dated_pricing() {
         use agent_burn_cli::PricingOverride;
         use std::collections::BTreeMap;
@@ -2231,11 +2269,59 @@ mod tests {
         )]);
         pricing.apply_overrides(overrides.iter());
 
+        let qualified_result = pricing
+            .find_at("deepseek/deepseek-v4-flash", Some(1))
+            .expect("the exact overridden model ignores shared historical pricing");
+        assert_eq!(qualified_result.input, 0.99e-6);
+
         let result = pricing
             .find_at("deepseek-v4-flash", Some(1))
             .expect("the model has an explicit override");
 
         assert_eq!(result.input, 0.99e-6);
+    }
+
+    #[test]
+    fn qualified_override_preserves_shared_unqualified_historical_pricing() {
+        use agent_burn_cli::PricingOverride;
+        use std::collections::BTreeMap;
+
+        let mut pricing = PricingMap::default();
+        pricing.entries.insert(
+            "deepseek-v4-flash".to_string(),
+            Pricing {
+                input: 0.22e-6,
+                ..Pricing::empty()
+            },
+        );
+        pricing.historical.push(super::PricingPeriod {
+            model: "deepseek-v4-flash".to_string(),
+            start_ms: 0,
+            end_ms: None,
+            pricing: Pricing {
+                input: 0.44e-6,
+                ..Pricing::empty()
+            },
+        });
+        let overrides = BTreeMap::from([(
+            "deepseek/deepseek-v4-flash".to_string(),
+            PricingOverride {
+                input_cost_per_token: Some(0.99e-6),
+                ..PricingOverride::default()
+            },
+        )]);
+        pricing.apply_overrides(overrides.iter());
+
+        let qualified_result = pricing
+            .find_at("deepseek/deepseek-v4-flash", Some(1))
+            .expect("the exact overridden model ignores shared historical pricing");
+        assert_eq!(qualified_result.input, 0.99e-6);
+
+        let result = pricing
+            .find_at("deepseek-v4-flash", Some(1))
+            .expect("the unqualified model retains its historical price");
+
+        assert_eq!(result.input, 0.44e-6);
     }
 
     #[test]
