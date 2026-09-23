@@ -10,7 +10,7 @@ permissions:
 
 concurrency:
   group: windows-release-feed
-  cancel-in-progress: false
+  queue: max
 
 jobs:
   release:
@@ -73,6 +73,20 @@ jobs:
           if (-not $setup) { throw "Windows setup.exe was not produced." }
           $signaturePath = "$($setup.FullName).sig"
           if (-not (Test-Path -LiteralPath $signaturePath)) { throw "Signed updater setup.exe signature is missing." }
+          $publishedAssets = Join-Path $env:RUNNER_TEMP "windows-release-assets"
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            New-Item -ItemType Directory -Force -Path $publishedAssets | Out-Null
+            gh release download $tag --pattern $setup.Name --dir $publishedAssets --clobber
+            if ($LASTEXITCODE -ne 0) { throw "Could not retrieve the immutable installer from the existing release." }
+            gh release download $tag --pattern "$($setup.Name).sig" --dir $publishedAssets --clobber
+            if ($LASTEXITCODE -ne 0) { throw "Could not retrieve the immutable installer signature from the existing release." }
+            $setup = Get-Item -LiteralPath (Join-Path $publishedAssets $setup.Name)
+            $signaturePath = "$($setup.FullName).sig"
+          } else {
+            gh release create $tag $setup.FullName $signaturePath --title "Agent Burn Windows $version" --notes "Windows desktop application release."
+            if ($LASTEXITCODE -ne 0) { throw "Could not publish the versioned Windows release assets." }
+          }
           $assetUrl = "https://github.com/${{ github.repository }}/releases/download/$tag/$([uri]::EscapeDataString($setup.Name))"
           $manifest = @{
             version = $version
@@ -86,13 +100,6 @@ jobs:
             }
           } | ConvertTo-Json -Depth 8
           Set-Content -LiteralPath "latest.json" -Value $manifest -Encoding utf8NoBOM
-          gh release view $tag *> $null
-          if ($LASTEXITCODE -eq 0) {
-            gh release upload $tag $setup.FullName --clobber
-          } else {
-            gh release create $tag $setup.FullName --title "Agent Burn Windows $version" --notes "Windows desktop application release."
-          }
-          if ($LASTEXITCODE -ne 0) { throw "Could not publish the versioned GitHub Release." }
           gh release view windows *> $null
           if ($LASTEXITCODE -ne 0) {
             gh release create windows latest.json --title "Agent Burn Windows update feed" --notes "Rolling signed update manifest for the Windows desktop app."
