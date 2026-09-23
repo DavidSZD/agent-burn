@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   clearPersistedAvailableUpdate,
+  createSafeStorage,
   getPersistedAvailableUpdate,
   rememberAvailableUpdate,
 } from "./update-notice.js";
@@ -58,4 +59,40 @@ test("ignores empty or malformed persisted version values", () => {
   assert.equal(getPersistedAvailableUpdate(storage), null);
   assert.equal(rememberAvailableUpdate(storage, " ").shouldAnnounce, false);
   assert.equal(rememberAvailableUpdate(storage, "next-version").shouldAnnounce, false);
+});
+
+test("keeps update discovery usable when browser storage is unavailable", () => {
+  const storage = createSafeStorage(() => {
+    throw new Error("Storage access denied");
+  });
+
+  assert.equal(getPersistedAvailableUpdate(storage), null);
+  assert.deepEqual(rememberAvailableUpdate(storage, "0.2.1"), {
+    version: "0.2.1",
+    shouldAnnounce: true,
+  });
+  assert.equal(getPersistedAvailableUpdate(storage), "0.2.1");
+  assert.equal(rememberAvailableUpdate(storage, "0.2.1").shouldAnnounce, false);
+  assert.doesNotThrow(() => clearPersistedAvailableUpdate(storage));
+});
+
+test("does not fail update discovery when individual storage operations throw", () => {
+  const storage = {
+    getItem() {
+      throw new Error("Read denied");
+    },
+    setItem() {
+      throw new Error("Write denied");
+    },
+    removeItem() {
+      throw new Error("Remove denied");
+    },
+  };
+
+  assert.deepEqual(rememberAvailableUpdate(storage, "0.2.2"), {
+    version: "0.2.2",
+    shouldAnnounce: true,
+  });
+  assert.equal(rememberAvailableUpdate(storage, "0.2.2").shouldAnnounce, false);
+  assert.doesNotThrow(() => clearPersistedAvailableUpdate(storage));
 });
