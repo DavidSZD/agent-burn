@@ -63,10 +63,10 @@ The release bundle contains `agent-burn.exe`; the desktop application never down
 Build or download an installer with a version newer than the installed copy, close Agent Burn from its tray menu, then launch it in update mode:
 
 ```powershell
-Start-Process '.\Agent Burn_0.1.58_x64-setup.exe' -ArgumentList '/UPDATE' -Wait
+Start-Process '.\Agent Burn_0.1.59_x64-setup.exe' -ArgumentList '/UPDATE' -Wait
 ```
 
-Update mode replaces the application in place without showing the uninstall/data-removal flow. Dashboard settings and history under `%LOCALAPPDATA%\Agent Burn` are preserved. Automatic signed update checks are enabled by default and run at most once per day. An update is never installed without pressing Install update and confirming. The release feed is configured in `tauri.conf.json`.
+Update mode replaces the application in place without showing the uninstall/data-removal flow. Dashboard settings and history under `%LOCALAPPDATA%\Agent Burn` are preserved. Automatic signed update checks are enabled by default and run at most once per day while the app is open, including at startup. You can also check manually with **Check now**. An update is never installed without pressing **Install update** and confirming. The release feed is configured in `tauri.conf.json`.
 
 To publish an updater release, add the contents of `%LOCALAPPDATA%\Agent Burn\updater\signing.key` as the GitHub Actions secret `TAURI_SIGNING_PRIVATE_KEY`. Keep that private key backed up and private. Pushing a `windows-v<version>` tag then publishes the setup installer, signed updater bundle, and rolling update feed.
 

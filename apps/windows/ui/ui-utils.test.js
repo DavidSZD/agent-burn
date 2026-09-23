@@ -36,6 +36,7 @@ import {
   subscriptionPresentation,
   visibleTokenBreakdownEntries,
   visibleAgents,
+  isAutomaticUpdateCheckDue,
 } from "./ui-utils.js";
 
 test("coalesced saves keep the in-flight write and only the newest pending state", async () => {
@@ -144,6 +145,15 @@ test("shows the next automatic refresh when idle", () => {
     refreshStatusText({ updatedAt: 1_000, nextRefreshAt: 72_500 }, 12_500),
     "Last update 11 sec ago · Next refresh in 1 min",
   );
+});
+
+test("automatic update checks run at most once per day while enabled", () => {
+  const day = 24 * 60 * 60 * 1000;
+
+  assert.equal(isAutomaticUpdateCheckDue(true, 0, day), true);
+  assert.equal(isAutomaticUpdateCheckDue(true, day, day + day - 1), false);
+  assert.equal(isAutomaticUpdateCheckDue(true, day, day * 2), true);
+  assert.equal(isAutomaticUpdateCheckDue(false, 0, day * 2), false);
 });
 
 test("switches from zero-second countdown to updating", () => {

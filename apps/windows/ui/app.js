@@ -8,6 +8,7 @@ import {
   escapeHtml,
   getRestoredPeriod,
   isTimelineCacheFresh,
+  isAutomaticUpdateCheckDue,
   latestTimelineUpdatedAt,
   modelPricingTooltip,
   modelPricingRows,
@@ -233,6 +234,9 @@ window.addEventListener("DOMContentLoaded", async () => {
   // Démarrage rapide avec le cache
   await settingsLoadPromise;
   if (appSettings?.autoCheckUpdates) void checkForAppUpdates({ automatic: true });
+  window.setInterval(() => {
+    if (appSettings?.autoCheckUpdates) void checkForAppUpdates({ automatic: true });
+  }, 60 * 60 * 1000);
   if (Number.isFinite(automaticRefreshStartedAt)) {
     nextAutomaticRefreshAt = automaticRefreshStartedAt + refreshIntervalMs();
   }
@@ -2479,8 +2483,12 @@ async function checkForAppUpdates({ automatic = false } = {}) {
   if (updateCheckInProgress) return;
   if (automatic) {
     const lastCheck = Number(localStorage.getItem("agent-burn-update-check-at") || 0);
-    if (Date.now() - lastCheck < 24 * 60 * 60 * 1000) {
-      if (status) status.textContent = "Automatic check completed recently.";
+    if (!isAutomaticUpdateCheckDue(appSettings?.autoCheckUpdates === true, lastCheck, Date.now())) {
+      if (status) {
+        status.textContent = appSettings?.autoCheckUpdates === true
+          ? "Automatic check completed recently."
+          : "Automatic checks are off.";
+      }
       return;
     }
   }

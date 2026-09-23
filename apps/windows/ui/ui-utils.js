@@ -7,6 +7,12 @@ export function escapeHtml(value) {
     .replaceAll("'", "&#39;");
 }
 
+export function isAutomaticUpdateCheckDue(enabled, lastCheckAt, now) {
+  if (!enabled) return false;
+  const lastCheck = Number(lastCheckAt);
+  return !Number.isFinite(lastCheck) || now - lastCheck >= 24 * 60 * 60 * 1000;
+}
+
 export function visibleTokenBreakdownEntries(breakdown) {
   const entries = [
     ["Input", breakdown.input],
