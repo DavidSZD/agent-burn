@@ -463,10 +463,15 @@ impl PricingMap {
     pub(crate) fn find_at(&self, model: &str, timestamp_ms: Option<i64>) -> Option<Pricing> {
         if let Some(timestamp_ms) = timestamp_ms {
             let normalized = normalized_pricing_key(model);
+            let has_exact_pricing = self.find_exact_with_fallback(model).is_some()
+                || pricing_alias(model)
+                    .is_some_and(|alias| self.find_exact_with_fallback(alias).is_some());
             if let Some(period) = self.historical.iter().find(|period| {
-                (period.model == model
-                    || period.model == normalized.as_ref()
-                    || pricing_key_matches(&period.model, model, normalized.as_ref()))
+                let exact_period_match =
+                    pricing_model_identity(&period.model) == pricing_model_identity(model);
+                (exact_period_match
+                    || (!has_exact_pricing
+                        && pricing_key_matches(&period.model, model, normalized.as_ref())))
                     && timestamp_ms >= period.start_ms
                     && period.end_ms.is_none_or(|end| timestamp_ms < end)
             }) {
@@ -720,6 +725,9 @@ impl PricingMap {
         };
 
         self.entries.insert(model.to_string(), pricing);
+        let override_identity = pricing_model_identity(model).into_owned();
+        self.historical
+            .retain(|period| pricing_model_identity(&period.model) != override_identity);
         if let Ok(mut cache) = self.lookup_cache.lock() {
             cache.clear();
         }
@@ -1411,6 +1419,10 @@ fn normalized_pricing_key(value: &str) -> Cow<'_, str> {
     } else {
         Cow::Borrowed(value)
     }
+}
+
+fn pricing_model_identity(value: &str) -> Cow<'_, str> {
+    normalized_pricing_key(value.rsplit('/').next().unwrap_or(value))
 }
 
 /// Maps Codex log labels that upstream pricing sources do not publish to
@@ -2159,6 +2171,71 @@ mod tests {
             .expect("current DeepSeek rate should resolve");
 
         assert!(old_rate.input > new_rate.input);
+    }
+
+    #[test]
+    fn dated_lookup_does_not_apply_a_base_model_period_to_an_exact_variant() {
+        let mut pricing = PricingMap::default();
+        pricing.entries.insert(
+            "deepseek-v4-flash-lite".to_string(),
+            Pricing {
+                input: 0.9e-6,
+                ..Pricing::empty()
+            },
+        );
+        pricing.historical.push(super::PricingPeriod {
+            model: "deepseek-v4-flash".to_string(),
+            start_ms: 0,
+            end_ms: None,
+            pricing: Pricing {
+                input: 0.4e-6,
+                ..Pricing::empty()
+            },
+        });
+
+        let result = pricing
+            .find_at("deepseek-v4-flash-lite", Some(1))
+            .expect("the exact variant has current pricing");
+
+        assert_eq!(result.input, 0.9e-6);
+    }
+
+    #[test]
+    fn explicit_override_takes_precedence_over_dated_pricing() {
+        use agent_burn_cli::PricingOverride;
+        use std::collections::BTreeMap;
+
+        let mut pricing = PricingMap::default();
+        pricing.entries.insert(
+            "deepseek-v4-flash".to_string(),
+            Pricing {
+                input: 0.22e-6,
+                ..Pricing::empty()
+            },
+        );
+        pricing.historical.push(super::PricingPeriod {
+            model: "deepseek-v4-flash".to_string(),
+            start_ms: 0,
+            end_ms: None,
+            pricing: Pricing {
+                input: 0.44e-6,
+                ..Pricing::empty()
+            },
+        });
+        let overrides = BTreeMap::from([(
+            "deepseek-v4-flash".to_string(),
+            PricingOverride {
+                input_cost_per_token: Some(0.99e-6),
+                ..PricingOverride::default()
+            },
+        )]);
+        pricing.apply_overrides(overrides.iter());
+
+        let result = pricing
+            .find_at("deepseek-v4-flash", Some(1))
+            .expect("the model has an explicit override");
+
+        assert_eq!(result.input, 0.99e-6);
     }
 
     #[test]

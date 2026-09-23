@@ -156,7 +156,10 @@ impl PricingRegistry {
 pub fn get_model_pricing(model_name: &str) -> Option<ModelPrice> {
     #[cfg(not(test))]
     {
-        dynamic_cached_price(model_name).or_else(|| PricingRegistry::global().find(model_name))
+        let (exact_dynamic, fuzzy_dynamic) = dynamic_cached_prices(model_name);
+        exact_dynamic
+            .or_else(|| PricingRegistry::global().find(model_name))
+            .or(fuzzy_dynamic)
     }
     #[cfg(test)]
     {
@@ -165,11 +168,11 @@ pub fn get_model_pricing(model_name: &str) -> Option<ModelPrice> {
 }
 
 #[cfg(not(test))]
-fn dynamic_cached_price(model_name: &str) -> Option<ModelPrice> {
+fn dynamic_cached_prices(model_name: &str) -> (Option<ModelPrice>, Option<ModelPrice>) {
     static CACHE: OnceLock<Mutex<DynamicPricingCache>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(DynamicPricingCache::default()));
     let Ok(mut cache) = cache.lock() else {
-        return None;
+        return (None, None);
     };
     let source_files = dynamic_price_cache_paths();
     let source_signature = source_files
@@ -184,10 +187,56 @@ fn dynamic_cached_price(model_name: &str) -> Option<ModelPrice> {
         cache.entries = load_dynamic_price_cache(&source_files);
         cache.signature = source_signature;
     }
-    find_dynamic_price(&cache.entries, model_name)
+    (
+        find_exact_dynamic_price(&cache.entries, model_name),
+        find_dynamic_price(&cache.entries, model_name),
+    )
 }
 
 fn find_dynamic_price(
+    entries: &StdHashMap<String, ModelPrice>,
+    model_name: &str,
+) -> Option<ModelPrice> {
+    let clean = model_name.trim().to_lowercase();
+    find_exact_dynamic_price(entries, &clean).or_else(|| {
+        let stripped = clean.strip_prefix("cursor-").unwrap_or(&clean);
+        let provider = if stripped.starts_with("gpt-") {
+            Some("openai/")
+        } else if stripped.starts_with("gemini-") {
+            Some("google/")
+        } else if stripped.starts_with("claude-") {
+            Some("anthropic/")
+        } else {
+            None
+        };
+
+        if let Some((provider, requested_model)) = clean.rsplit_once('/') {
+            return best_matching_dynamic_price(
+                entries.iter().map(|(key, price)| (key.as_str(), price)),
+                requested_model,
+                Some(&format!("{provider}/")),
+            );
+        }
+
+        if let Some(provider) = provider {
+            if let Some(price) = best_matching_dynamic_price(
+                entries.iter().map(|(key, price)| (key.as_str(), price)),
+                stripped,
+                Some(provider),
+            ) {
+                return Some(price);
+            }
+        }
+
+        best_matching_dynamic_price(
+            entries.iter().map(|(key, price)| (key.as_str(), price)),
+            stripped,
+            None,
+        )
+    })
+}
+
+fn find_exact_dynamic_price(
     entries: &StdHashMap<String, ModelPrice>,
     model_name: &str,
 ) -> Option<ModelPrice> {
@@ -196,12 +245,9 @@ fn find_dynamic_price(
         return Some(*price);
     }
 
-    if let Some((provider, requested_model)) = clean.rsplit_once('/') {
-        return best_matching_dynamic_price(
-            entries.iter().map(|(key, price)| (key.as_str(), price)),
-            requested_model,
-            Some(&format!("{provider}/")),
-        );
+    // A provider-qualified model may only use an exact entry for that provider.
+    if clean.contains('/') {
+        return None;
     }
 
     let stripped = clean.strip_prefix("cursor-").unwrap_or(&clean);
@@ -216,22 +262,12 @@ fn find_dynamic_price(
     };
 
     if let Some(provider) = provider {
-        if let Some(price) = best_matching_dynamic_price(
-            entries.iter().map(|(key, price)| (key.as_str(), price)),
-            stripped,
-            Some(provider),
-        ) {
-            return Some(price);
+        if let Some(price) = entries.get(&format!("{provider}{stripped}")) {
+            return Some(*price);
         }
     }
 
-    entries.get(stripped).copied().or_else(|| {
-        best_matching_dynamic_price(
-            entries.iter().map(|(key, price)| (key.as_str(), price)),
-            stripped,
-            None,
-        )
-    })
+    entries.get(stripped).copied()
 }
 
 fn best_matching_dynamic_price<'a>(
@@ -247,11 +283,16 @@ fn best_matching_dynamic_price<'a>(
             } else {
                 key.rsplit('/').next().unwrap_or(key)
             };
-            (requested_model.starts_with(model) || model.ends_with(requested_model))
-                .then_some((model.len(), *price))
+            let suffix = requested_model.as_bytes().get(model.len());
+            (requested_model.starts_with(model) && matches!(suffix, None | Some(b'-') | Some(b'@')))
+                .then_some((model.len(), key, *price))
         })
-        .max_by_key(|(specificity, _)| *specificity)
-        .map(|(_, price)| price)
+        .max_by(|(left_len, left_key, _), (right_len, right_key, _)| {
+            left_len
+                .cmp(right_len)
+                .then_with(|| right_key.cmp(left_key))
+        })
+        .map(|(_, _, price)| price)
 }
 
 #[cfg(not(test))]
@@ -540,6 +581,45 @@ mod tests {
                 .unwrap()
                 .input_per_m,
             1.0
+        );
+    }
+
+    #[test]
+    fn dynamic_pricing_does_not_match_a_prefix_inside_a_different_version() {
+        let entries = StdHashMap::from([(
+            "openai/gpt-5".to_string(),
+            ModelPrice {
+                input_per_m: 5.0,
+                output_per_m: 30.0,
+                cache_read_per_m: 0.5,
+                cache_write_per_m: 0.0,
+            },
+        )]);
+
+        assert_eq!(find_dynamic_price(&entries, "openai/gpt-5.6-sol-pro"), None);
+    }
+
+    #[test]
+    fn equal_length_dynamic_prefix_matches_are_deterministic() {
+        let first = ModelPrice {
+            input_per_m: 1.0,
+            output_per_m: 2.0,
+            cache_read_per_m: 0.1,
+            cache_write_per_m: 0.2,
+        };
+        let second = ModelPrice {
+            input_per_m: 3.0,
+            output_per_m: 4.0,
+            cache_read_per_m: 0.3,
+            cache_write_per_m: 0.4,
+        };
+        assert_eq!(
+            best_matching_dynamic_price(
+                [("provider-a/model", &first), ("provider-b/model", &second),],
+                "model-preview",
+                None,
+            ),
+            Some(first)
         );
     }
 
