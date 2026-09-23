@@ -7,6 +7,7 @@ import {
   rememberAvailableUpdate,
 } from "./update-notice.js";
 import { createUpdateOperationCoordinator } from "./update-operation.js";
+import { createUpdateScanShutdown } from "./update-scan-shutdown.js";
 import {
   aggregateTokenBreakdown,
   createCoalescedSaver,
@@ -74,6 +75,7 @@ function getListen() {
 
 const appStorage = createSafeStorage(() => window.localStorage);
 const updateOperations = createUpdateOperationCoordinator();
+const updateScanShutdown = createUpdateScanShutdown();
 
 // État de l'application
 let currentPeriod = "all"; // "All time" par défaut comme sur les captures macOS
@@ -103,6 +105,7 @@ const summaryRequestGate = new RequestGate();
 const activeRefreshSources = new Set();
 let resolveInitialBackendRefresh;
 let availableAppUpdate = null;
+let appUpdateHandoffStarted = false;
 let updateNoticeTimer = null;
 const initialBackendRefresh = new Promise((resolve) => {
   resolveInitialBackendRefresh = resolve;
@@ -663,6 +666,11 @@ function currentVisibleReport() {
 
 function requestTimeline(period, force = false) {
   const key = timelineCacheKey(period);
+  if (updateScanShutdown.isStopping()) {
+    return periodCache[key]
+      ? Promise.resolve(periodCache[key])
+      : Promise.reject(new Error("Timeline scan paused for the update."));
+  }
   if (!force && periodCache[key]) return Promise.resolve(periodCache[key]);
   if (periodRequests.has(key)) return periodRequests.get(key);
 
@@ -700,6 +708,7 @@ function requestTimeline(period, force = false) {
 // Chargement principal des données CLI
 // ==========================================================================
 async function loadData(force = false) {
+  if (updateScanShutdown.isStopping()) return;
   const cacheKey = timelineCacheKey(currentPeriod);
   const requestGeneration = summaryRequestGate.begin();
   if (!force && periodCache[cacheKey]) {
@@ -759,6 +768,7 @@ async function loadData(force = false) {
 }
 
 async function performAllTimelineRefresh(showIndicator = false) {
+  if (updateScanShutdown.isStopping()) return;
   if (showIndicator) setTimelineRefreshing(true, "manual");
   try {
     // The all-time request carries the CLI's timeline matrix. Refreshing only
@@ -2443,9 +2453,7 @@ function initSettings() {
     document.getElementById(id)?.addEventListener("change", saveSettingsFromControls);
   }
   document.getElementById("settings-check-updates-btn")?.addEventListener("click", () => checkForAppUpdates());
-  document.getElementById("settings-install-update-btn")?.addEventListener("click", () =>
-    checkForAppUpdates({ installAfterCheck: true }),
-  );
+  document.getElementById("settings-install-update-btn")?.addEventListener("click", beginUpdateInstall);
 
   // Fermeture du menu quota au clic externe
   document.addEventListener("click", () => {
@@ -2525,16 +2533,58 @@ function getCurrentAppVersion() {
 function initAppUpdateNotice() {
   renderFooterUpdateNotice(getPersistedAvailableUpdate(appStorage, getCurrentAppVersion()));
   document.getElementById("footer-update-button")?.addEventListener("click", async (event) => {
-    const button = event.currentTarget;
-    button.disabled = true;
-    button.textContent = "Checking update…";
     hideUpdateDiscoveryNotice();
-    try {
-      await checkForAppUpdates({ installAfterCheck: true });
-    } finally {
-      renderFooterUpdateNotice(getPersistedAvailableUpdate(appStorage, getCurrentAppVersion()));
-    }
+    await beginUpdateInstall();
   });
+}
+
+async function beginUpdateInstall() {
+  appUpdateHandoffStarted = false;
+  try {
+    await updateScanShutdown.run({
+      onStart: () => {
+        const status = document.getElementById("settings-update-status");
+        const installButton = document.getElementById("settings-install-update-btn");
+        const footerButton = document.getElementById("footer-update-button");
+        if (status) status.textContent = "Closing scans for the update…";
+        if (installButton) {
+          installButton.disabled = true;
+          installButton.textContent = "Closing scans…";
+        }
+        if (footerButton) {
+          footerButton.disabled = true;
+          footerButton.textContent = "Closing scans…";
+        }
+      },
+      prepare: () => invokeTauri("prepare_for_update"),
+      install: async () => {
+        await checkForAppUpdates({ installAfterCheck: true });
+        // A scheduled check may already be running. The update coordinator
+        // queues the install request, so keep scans stopped until it resolves.
+        while (updateOperations.isCheckRunning() || updateOperations.isInstallRunning()) {
+          await new Promise((resolve) => window.setTimeout(resolve, 50));
+        }
+        return appUpdateHandoffStarted;
+      },
+      resume: () => invokeTauri("resume_scans_after_cancelled_update"),
+      onResume: () => {
+        const installButton = document.getElementById("settings-install-update-btn");
+        const footerButton = document.getElementById("footer-update-button");
+        if (installButton) {
+          installButton.disabled = false;
+          installButton.textContent = "Install update";
+        }
+        if (footerButton) {
+          renderFooterUpdateNotice(getPersistedAvailableUpdate(appStorage, getCurrentAppVersion()));
+        }
+      },
+    });
+  } catch (error) {
+    const status = document.getElementById("settings-update-status");
+    if (status) status.textContent = `Could not prepare the update: ${String(error)}`;
+    const footerButton = document.getElementById("footer-update-button");
+    if (footerButton) renderFooterUpdateNotice(getPersistedAvailableUpdate(appStorage, getCurrentAppVersion()));
+  }
 }
 
 async function checkForAppUpdates({ automatic = false, installAfterCheck = false } = {}) {
@@ -2602,8 +2652,10 @@ async function installAvailableUpdate() {
         status.textContent = receivedBytes > 0 ? `Downloading update… (${Math.round(receivedBytes / 1024)} KB received)` : "Downloading update…";
       }
     });
+    appUpdateHandoffStarted = true;
     if (status) status.textContent = "Restarting to finish the update…";
   } catch (error) {
+    appUpdateHandoffStarted = false;
     if (status) status.textContent = `Update failed: ${String(error)}`;
     if (button) button.disabled = false;
     if (footerButton) footerButton.disabled = false;

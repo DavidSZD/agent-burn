@@ -20,7 +20,10 @@ pub async fn get_summary(
         .clone();
     let cli = resolve_cli_path_with_override(settings.custom_cli_path.as_deref())
         .or_else(|| state.cli_path.clone());
-    build_summary(&period_val, &settings, cli.as_deref()).await
+    if state.scan_control.is_stopping_for_update() {
+        return Err("Scan annulé pour préparer la mise à jour.".to_string());
+    }
+    build_summary(&period_val, &settings, cli.as_deref(), &state.scan_control).await
 }
 
 #[tauri::command]
@@ -39,7 +42,12 @@ pub async fn get_summary_since(
     let cli = resolve_cli_path_with_override(settings.custom_cli_path.as_deref())
         .or_else(|| state.cli_path.clone());
     let args = ["summary", "--value", "--since", since.as_str()];
-    let mut summary = execute_cli_json_with_settings(cli.as_deref(), &args, &settings).await?;
+    let mut summary =
+        execute_cli_json_with_settings(&state.scan_control, cli.as_deref(), &args, &settings)
+            .await?;
+    if state.scan_control.is_stopping_for_update() {
+        return Err("Scan annulé pour préparer la mise à jour.".to_string());
+    }
     let min_date = chrono::NaiveDate::parse_from_str(&since, "%Y-%m-%d")
         .ok()
         .and_then(|date| date.and_hms_opt(0, 0, 0))
@@ -66,8 +74,13 @@ pub(crate) async fn build_summary(
     period: &str,
     settings: &AppSettings,
     cli: Option<&Path>,
+    scan_control: &crate::scan_control::ScanControl,
 ) -> Result<serde_json::Value, String> {
-    let mut summary = build_cli_summary_for_agents(period, settings, cli, None).await?;
+    let mut summary =
+        build_cli_summary_for_agents(period, settings, cli, None, scan_control).await?;
+    if scan_control.is_stopping_for_update() {
+        return Err("Scan annulé pour préparer la mise à jour.".to_string());
+    }
     attach_live_antigravity(&mut summary, period, settings).await?;
     attach_model_pricing(&mut summary);
     Ok(summary)
@@ -81,6 +94,7 @@ pub(crate) async fn build_cli_summary_for_agents(
     settings: &AppSettings,
     cli: Option<&Path>,
     agents: Option<&str>,
+    scan_control: &crate::scan_control::ScanControl,
 ) -> Result<serde_json::Value, String> {
     let mut args = vec!["summary", "--value"];
     if period != "all" && !period.is_empty() {
@@ -90,7 +104,7 @@ pub(crate) async fn build_cli_summary_for_agents(
         args.push("--agents");
         args.push(agents);
     }
-    execute_cli_json_with_settings(cli, &args, settings).await
+    execute_cli_json_with_settings(scan_control, cli, &args, settings).await
 }
 
 pub(crate) async fn attach_live_antigravity(
@@ -607,7 +621,18 @@ pub async fn get_harness(
         .clone();
     let cli = resolve_cli_path_with_override(settings.custom_cli_path.as_deref())
         .or_else(|| state.cli_path.clone());
-    execute_cli_json_with_settings(cli.as_deref(), &args, &settings).await
+    execute_cli_json_with_settings(&state.scan_control, cli.as_deref(), &args, &settings).await
+}
+
+#[tauri::command]
+pub async fn prepare_for_update(state: State<'_, AppState>) -> Result<(), String> {
+    state.scan_control.stop_for_update().await;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn resume_scans_after_cancelled_update(state: State<'_, AppState>) {
+    state.scan_control.resume_after_cancelled_update();
 }
 
 #[tauri::command]

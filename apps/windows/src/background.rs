@@ -115,9 +115,13 @@ async fn collect_and_archive(app: &AppHandle, generation: u64) -> bool {
         &fast_settings,
         fast_cli.as_deref(),
         Some(FAST_AGENT_LIST),
+        &state.scan_control,
     );
-    let antigravity_future =
-        collect_antigravity_source(&antigravity_settings, antigravity_cli.as_deref());
+    let antigravity_future = collect_antigravity_source(
+        &antigravity_settings,
+        antigravity_cli.as_deref(),
+        &state.scan_control,
+    );
     tokio::pin!(fast_future);
     tokio::pin!(antigravity_future);
     let mut combined = state
@@ -212,6 +216,7 @@ fn publish_source_result(
 async fn collect_antigravity_source(
     settings: &crate::app::AppSettings,
     cli: Option<&std::path::Path>,
+    scan_control: &crate::scan_control::ScanControl,
 ) -> Result<serde_json::Value, String> {
     // Keep the slow Antigravity source independent from the fast providers.
     // A stalled live-quota endpoint must not hold the whole refresh cycle (or
@@ -223,9 +228,13 @@ async fn collect_antigravity_source(
             settings,
             cli,
             Some("antigravity"),
+            scan_control,
         )
         .await
         .unwrap_or_else(|_| empty_report());
+        if scan_control.is_stopping_for_update() {
+            return Err("Scan annulé pour préparer la mise à jour.".to_string());
+        }
         match timeout(
             std::time::Duration::from_secs(20),
             crate::commands::attach_live_antigravity(&mut report, "all", settings),
