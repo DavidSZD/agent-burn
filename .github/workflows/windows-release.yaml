@@ -51,7 +51,7 @@ jobs:
         shell: pwsh
         run: |
           if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY)) { throw "Set the TAURI_SIGNING_PRIVATE_KEY repository secret before tagging a Windows release." }
-          pnpm --dir apps/windows build
+          & ./apps/windows/build.ps1 -Release
 
       - name: Publish versioned release and update feed
         shell: pwsh
