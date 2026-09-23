@@ -81,8 +81,9 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw "Could not publish the versioned Windows release assets." }
           }
 
-          $release = gh release view $tag --json assets | ConvertFrom-Json
+          $release = gh release view $tag --json assets,isDraft | ConvertFrom-Json
           if ($LASTEXITCODE -ne 0) { throw "Could not inspect the published Windows release assets." }
+          if ($release.isDraft) { throw "Publish the versioned Windows release before updating the feed." }
           $setupAssets = @($release.assets | Where-Object { $_.name -match '-setup\.exe$' })
           if ($setupAssets.Count -ne 1) { throw "Expected exactly one setup.exe asset in the versioned release." }
           $setupAsset = $setupAssets[0]
