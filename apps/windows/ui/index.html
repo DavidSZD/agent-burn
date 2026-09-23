@@ -306,6 +306,8 @@
 
     </main>
 
+    <div id="update-discovery-notice" class="update-discovery-notice" role="status" aria-live="polite" hidden></div>
+
     <!-- Barre de pied de page (Footer StatusBar) -->
     <footer class="window-footer">
       <div class="footer-left">
@@ -313,7 +315,8 @@
         <span id="footer-status-text">Updating...</span>
       </div>
       <div class="footer-right">
-        <span>v0.1.63 (Windows)</span>
+        <button id="footer-update-button" class="footer-update-button" type="button" hidden></button>
+        <span data-app-version="0.1.64">v0.1.64 (Windows)</span>
       </div>
     </footer>
   </div>

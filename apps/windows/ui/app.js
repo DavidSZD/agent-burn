@@ -1,6 +1,13 @@
 import { RequestGate } from "./request-gate.js";
 import { check } from "@tauri-apps/plugin-updater";
 import {
+  clearPersistedAvailableUpdate,
+  createSafeStorage,
+  getPersistedAvailableUpdate,
+  rememberAvailableUpdate,
+} from "./update-notice.js";
+import { createUpdateOperationCoordinator } from "./update-operation.js";
+import {
   aggregateTokenBreakdown,
   createCoalescedSaver,
   createReplaceableCallback,
@@ -65,6 +72,9 @@ function getListen() {
   return window.__TAURI__?.event?.listen || null;
 }
 
+const appStorage = createSafeStorage(() => window.localStorage);
+const updateOperations = createUpdateOperationCoordinator();
+
 // État de l'application
 let currentPeriod = "all"; // "All time" par défaut comme sur les captures macOS
 let currentTab = "summary";
@@ -93,7 +103,7 @@ const summaryRequestGate = new RequestGate();
 const activeRefreshSources = new Set();
 let resolveInitialBackendRefresh;
 let availableAppUpdate = null;
-let updateCheckInProgress = false;
+let updateNoticeTimer = null;
 const initialBackendRefresh = new Promise((resolve) => {
   resolveInitialBackendRefresh = resolve;
 });
@@ -215,12 +225,13 @@ function getAgentDisplayName(agent) {
 // Initialisation au chargement
 // ==========================================================================
 window.addEventListener("DOMContentLoaded", async () => {
-  const savedPeriod = localStorage.getItem("agent-burn-period");
+  const savedPeriod = appStorage.getItem("agent-burn-period");
   currentPeriod = getRestoredPeriod(savedPeriod, Object.keys(PERIOD_LABELS));
   if (currentPeriod === "rtd") currentPeriod = "all";
   initPeriods();
   initRefresh();
   initSettings();
+  initAppUpdateNotice();
   // The backend collector starts independently of the WebView and its first
   // event can arrive before listeners finish attaching. Start the footer
   // clock locally so startup still shows Updating instead of stale cache age.
@@ -245,7 +256,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   // On ne bloque le premier affichage que s'il n'existe encore aucune donnée.
   if (!periodCache[currentPeriod]) await loadData(true);
   currentTab = restoredTab(
-    localStorage.getItem("agent-burn-tab"),
+    appStorage.getItem("agent-burn-tab"),
     visibleAgents(detectedAgents, appSettings?.hiddenAgents),
   );
   switchTab(currentTab);
@@ -536,12 +547,12 @@ function renderHarnessTabs() {
 function switchTab(tabId) {
   if (currentPeriod === "rtd" && tabId !== currentTab) {
     currentPeriod = "all";
-    localStorage.setItem("agent-burn-period", currentPeriod);
+    appStorage.setItem("agent-burn-period", currentPeriod);
     const cached = periodCache.all;
     if (cached) reportData = mergeLiveSubscription(cached.reportData, latestLiveQuotaReport);
   }
   currentTab = tabId;
-  localStorage.setItem("agent-burn-tab", currentTab);
+  appStorage.setItem("agent-burn-tab", currentTab);
 
   // Mise à jour de la classe active sur les onglets
   renderHarnessTabs();
@@ -579,7 +590,7 @@ function initPeriods() {
 
 async function switchPeriod(newPeriod) {
   currentPeriod = newPeriod;
-  localStorage.setItem("agent-burn-period", currentPeriod);
+  appStorage.setItem("agent-burn-period", currentPeriod);
 
   // Mise à jour de tous les dropdowns de l'interface
   const sSelect = document.getElementById("summary-period-select");
@@ -2432,7 +2443,9 @@ function initSettings() {
     document.getElementById(id)?.addEventListener("change", saveSettingsFromControls);
   }
   document.getElementById("settings-check-updates-btn")?.addEventListener("click", () => checkForAppUpdates());
-  document.getElementById("settings-install-update-btn")?.addEventListener("click", installAvailableUpdate);
+  document.getElementById("settings-install-update-btn")?.addEventListener("click", () =>
+    checkForAppUpdates({ installAfterCheck: true }),
+  );
 
   // Fermeture du menu quota au clic externe
   document.addEventListener("click", () => {
@@ -2477,51 +2490,111 @@ async function saveSettingsFromControls() {
   void preloadTimelines(false, true);
 }
 
-async function checkForAppUpdates({ automatic = false } = {}) {
+function renderFooterUpdateNotice(version) {
+  const button = document.getElementById("footer-update-button");
+  if (!button) return;
+  button.hidden = !version;
+  button.disabled = false;
+  button.textContent = version ? `Update available · ${version}` : "";
+  button.title = version ? `Check and install Agent Burn ${version}` : "";
+  button.setAttribute("aria-label", version ? `Update available: version ${version}. Check before installing.` : "");
+}
+
+function showUpdateDiscoveryNotice(version) {
+  const notice = document.getElementById("update-discovery-notice");
+  if (!notice) return;
+  notice.textContent = `Agent Burn ${version} is available. Select the update in the footer to check and install it.`;
+  notice.hidden = false;
+  window.clearTimeout(updateNoticeTimer);
+  updateNoticeTimer = window.setTimeout(() => {
+    notice.hidden = true;
+  }, 8000);
+}
+
+function hideUpdateDiscoveryNotice() {
+  window.clearTimeout(updateNoticeTimer);
+  updateNoticeTimer = null;
+  const notice = document.getElementById("update-discovery-notice");
+  if (notice) notice.hidden = true;
+}
+
+function getCurrentAppVersion() {
+  return document.querySelector("[data-app-version]")?.getAttribute("data-app-version");
+}
+
+function initAppUpdateNotice() {
+  renderFooterUpdateNotice(getPersistedAvailableUpdate(appStorage, getCurrentAppVersion()));
+  document.getElementById("footer-update-button")?.addEventListener("click", async (event) => {
+    const button = event.currentTarget;
+    button.disabled = true;
+    button.textContent = "Checking update…";
+    hideUpdateDiscoveryNotice();
+    try {
+      await checkForAppUpdates({ installAfterCheck: true });
+    } finally {
+      renderFooterUpdateNotice(getPersistedAvailableUpdate(appStorage, getCurrentAppVersion()));
+    }
+  });
+}
+
+async function checkForAppUpdates({ automatic = false, installAfterCheck = false } = {}) {
   const status = document.getElementById("settings-update-status");
   const installButton = document.getElementById("settings-install-update-btn");
-  if (updateCheckInProgress) return;
   if (automatic) {
-    const lastCheck = Number(localStorage.getItem("agent-burn-update-check-at") || 0);
+    const lastCheck = Number(appStorage.getItem("agent-burn-update-check-at") || 0);
     if (!isAutomaticUpdateCheckDue(appSettings?.autoCheckUpdates === true, lastCheck, Date.now())) {
       if (status) {
         status.textContent = appSettings?.autoCheckUpdates === true
           ? "Automatic check completed recently."
           : "Automatic checks are off.";
       }
-      return;
+      return false;
     }
   }
-  updateCheckInProgress = true;
+  if (updateOperations.requestCheck({ installAfterCheck }) !== "started") return false;
+  let checkSucceeded = false;
   if (status) status.textContent = "Checking for updates…";
   if (installButton) installButton.hidden = true;
   try {
     await availableAppUpdate?.close();
     availableAppUpdate = null;
     availableAppUpdate = await check();
-    localStorage.setItem("agent-burn-update-check-at", String(Date.now()));
+    appStorage.setItem("agent-burn-update-check-at", String(Date.now()));
+    checkSucceeded = true;
     if (availableAppUpdate) {
+      const notice = rememberAvailableUpdate(appStorage, availableAppUpdate.version);
+      renderFooterUpdateNotice(notice.version);
+      if (notice.shouldAnnounce) showUpdateDiscoveryNotice(notice.version);
       if (status) status.textContent = `Version ${availableAppUpdate.version} is available.`;
       if (installButton) installButton.hidden = false;
-    } else if (status) {
-      status.textContent = "You’re using the latest version.";
+    } else {
+      clearPersistedAvailableUpdate(appStorage);
+      renderFooterUpdateNotice(null);
+      hideUpdateDiscoveryNotice();
+      if (status) status.textContent = "You’re using the latest version.";
     }
   } catch (error) {
     if (status) status.textContent = `Could not check for updates: ${String(error)}`;
-  } finally {
-    updateCheckInProgress = false;
   }
+  const installRequested = updateOperations.finishCheck(checkSucceeded && !!availableAppUpdate);
+  if (installRequested) await installAvailableUpdate();
+  return checkSucceeded;
 }
 
 async function installAvailableUpdate() {
-  if (!availableAppUpdate) return;
+  if (!availableAppUpdate || !updateOperations.isInstallRunning()) return;
   const status = document.getElementById("settings-update-status");
-  const confirmed = window.confirm(`Install Agent Burn ${availableAppUpdate.version} now? The app will close and reopen after installation.`);
-  if (!confirmed) return;
   const button = document.getElementById("settings-install-update-btn");
-  if (button) button.disabled = true;
-  if (status) status.textContent = "Downloading update…";
+  const footerButton = document.getElementById("footer-update-button");
+  const installingVersion = availableAppUpdate.version;
   try {
+    const confirmed = window.confirm(`Install Agent Burn ${installingVersion} now? The app will close and reopen after installation.`);
+    if (!confirmed) return;
+    if (button) button.disabled = true;
+    if (footerButton) footerButton.disabled = true;
+    if (status) status.textContent = "Downloading update…";
+    clearPersistedAvailableUpdate(appStorage);
+    renderFooterUpdateNotice(null);
     let receivedBytes = 0;
     await availableAppUpdate.downloadAndInstall((event) => {
       if (event.event === "Progress" && status) {
@@ -2533,6 +2606,11 @@ async function installAvailableUpdate() {
   } catch (error) {
     if (status) status.textContent = `Update failed: ${String(error)}`;
     if (button) button.disabled = false;
+    if (footerButton) footerButton.disabled = false;
+    rememberAvailableUpdate(appStorage, installingVersion);
+    renderFooterUpdateNotice(installingVersion);
+  } finally {
+    updateOperations.finishInstall();
   }
 }
 
