@@ -41,15 +41,71 @@ function normalizeVersion(version) {
     : null;
 }
 
-export function getPersistedAvailableUpdate(storage) {
+function compareVersions(left, right) {
+  const leftVersion = normalizeVersion(left);
+  const rightVersion = normalizeVersion(right);
+  if (!leftVersion || !rightVersion) return null;
+
+  const parse = (version) => {
+    const withoutBuild = version.replace(/^v/, "").split("+", 1)[0];
+    const separator = withoutBuild.indexOf("-");
+    return {
+      core: (separator < 0 ? withoutBuild : withoutBuild.slice(0, separator)).split(".").map(Number),
+      prerelease: separator < 0 ? [] : withoutBuild.slice(separator + 1).split("."),
+    };
+  };
+  const leftParts = parse(leftVersion);
+  const rightParts = parse(rightVersion);
+
+  for (let index = 0; index < 3; index += 1) {
+    if (leftParts.core[index] !== rightParts.core[index]) {
+      return leftParts.core[index] > rightParts.core[index] ? 1 : -1;
+    }
+  }
+
+  const leftPrerelease = leftParts.prerelease;
+  const rightPrerelease = rightParts.prerelease;
+  if (leftPrerelease.length === 0 || rightPrerelease.length === 0) {
+    if (leftPrerelease.length === rightPrerelease.length) return 0;
+    return leftPrerelease.length === 0 ? 1 : -1;
+  }
+
+  const identifierCount = Math.max(leftPrerelease.length, rightPrerelease.length);
+  for (let index = 0; index < identifierCount; index += 1) {
+    const leftIdentifier = leftPrerelease[index];
+    const rightIdentifier = rightPrerelease[index];
+    if (leftIdentifier === undefined || rightIdentifier === undefined) {
+      return leftIdentifier === undefined ? -1 : 1;
+    }
+    if (leftIdentifier === rightIdentifier) continue;
+
+    const leftNumeric = /^\d+$/.test(leftIdentifier);
+    const rightNumeric = /^\d+$/.test(rightIdentifier);
+    if (leftNumeric && rightNumeric) {
+      return Number(leftIdentifier) > Number(rightIdentifier) ? 1 : -1;
+    }
+    if (leftNumeric !== rightNumeric) return leftNumeric ? -1 : 1;
+    return leftIdentifier > rightIdentifier ? 1 : -1;
+  }
+
+  return 0;
+}
+
+export function getPersistedAvailableUpdate(storage, currentVersion) {
+  let version = sessionAvailableUpdateVersion;
   try {
-    if (!storage || typeof storage.getItem !== "function") return sessionAvailableUpdateVersion;
-    const rawVersion = storage.getItem(AVAILABLE_UPDATE_VERSION_KEY);
-    const version = normalizeVersion(rawVersion);
-    sessionAvailableUpdateVersion = version;
-    return version;
+    if (storage && typeof storage.getItem === "function") {
+      version = normalizeVersion(storage.getItem(AVAILABLE_UPDATE_VERSION_KEY));
+      sessionAvailableUpdateVersion = version;
+    }
   } catch {}
-  return sessionAvailableUpdateVersion;
+
+  const comparison = version ? compareVersions(version, currentVersion) : null;
+  if (comparison !== null && comparison <= 0) {
+    clearPersistedAvailableUpdate(storage);
+    return null;
+  }
+  return version;
 }
 
 export function rememberAvailableUpdate(storage, version) {

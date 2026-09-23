@@ -61,6 +61,31 @@ test("ignores empty or malformed persisted version values", () => {
   assert.equal(rememberAvailableUpdate(storage, "next-version").shouldAnnounce, false);
 });
 
+test("clears a persisted update that is not newer than the running app", () => {
+  const storage = createStorage();
+  storage.setItem("agent-burn-available-update-version", "0.1.64");
+
+  assert.equal(getPersistedAvailableUpdate(storage, "0.1.64"), null);
+  assert.equal(storage.getItem("agent-burn-available-update-version"), null);
+});
+
+test("keeps a persisted update when it is newer than the running app", () => {
+  const storage = createStorage();
+  storage.setItem("agent-burn-available-update-version", "0.1.65");
+
+  assert.equal(getPersistedAvailableUpdate(storage, "0.1.64"), "0.1.65");
+});
+
+test("uses semantic prerelease ordering when validating a persisted update", () => {
+  const prereleaseStorage = createStorage();
+  prereleaseStorage.setItem("agent-burn-available-update-version", "0.1.64-beta.2");
+  assert.equal(getPersistedAvailableUpdate(prereleaseStorage, "0.1.64-beta.1"), "0.1.64-beta.2");
+
+  const stableStorage = createStorage();
+  stableStorage.setItem("agent-burn-available-update-version", "0.1.64-beta.2");
+  assert.equal(getPersistedAvailableUpdate(stableStorage, "0.1.64"), null);
+});
+
 test("keeps update discovery usable when browser storage is unavailable", () => {
   const storage = createSafeStorage(() => {
     throw new Error("Storage access denied");

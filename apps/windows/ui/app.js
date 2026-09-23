@@ -2518,8 +2518,12 @@ function hideUpdateDiscoveryNotice() {
   if (notice) notice.hidden = true;
 }
 
+function getCurrentAppVersion() {
+  return document.querySelector("[data-app-version]")?.getAttribute("data-app-version");
+}
+
 function initAppUpdateNotice() {
-  renderFooterUpdateNotice(getPersistedAvailableUpdate(appStorage));
+  renderFooterUpdateNotice(getPersistedAvailableUpdate(appStorage, getCurrentAppVersion()));
   document.getElementById("footer-update-button")?.addEventListener("click", async (event) => {
     const button = event.currentTarget;
     button.disabled = true;
@@ -2528,7 +2532,7 @@ function initAppUpdateNotice() {
     try {
       await checkForAppUpdates({ installAfterCheck: true });
     } finally {
-      renderFooterUpdateNotice(getPersistedAvailableUpdate(appStorage));
+      renderFooterUpdateNotice(getPersistedAvailableUpdate(appStorage, getCurrentAppVersion()));
     }
   });
 }
