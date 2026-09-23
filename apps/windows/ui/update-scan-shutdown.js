@@ -6,6 +6,12 @@ export function createUpdateScanShutdown() {
       return pending;
     },
 
+    clearTimelineRefreshForUpdate(setTimelineRefreshing) {
+      if (!pending) return false;
+      setTimelineRefreshing(false, "timeline");
+      return true;
+    },
+
     async run({ prepare, install, resume, onStart, onResume }) {
       if (pending) return false;
       pending = true;

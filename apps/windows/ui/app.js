@@ -708,7 +708,7 @@ function requestTimeline(period, force = false) {
 // Chargement principal des données CLI
 // ==========================================================================
 async function loadData(force = false) {
-  if (updateScanShutdown.isStopping()) return;
+  if (updateScanShutdown.clearTimelineRefreshForUpdate(setTimelineRefreshing)) return;
   const cacheKey = timelineCacheKey(currentPeriod);
   const requestGeneration = summaryRequestGate.begin();
   if (!force && periodCache[cacheKey]) {

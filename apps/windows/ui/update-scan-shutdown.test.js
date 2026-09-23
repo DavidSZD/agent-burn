@@ -66,3 +66,23 @@ test("ignores repeated install clicks while scan shutdown is active", async () =
   releasePrepare();
   await first;
 });
+
+test("clears a timeline loading indicator when an update cancels the load", async () => {
+  const shutdown = createUpdateScanShutdown();
+  let releasePrepare;
+  const first = shutdown.run({
+    prepare: () => new Promise((resolve) => { releasePrepare = resolve; }),
+    install: async () => false,
+    resume: async () => {},
+  });
+  let refreshState = null;
+
+  assert.equal(
+    shutdown.clearTimelineRefreshForUpdate((active, source) => { refreshState = { active, source }; }),
+    true,
+  );
+  assert.deepEqual(refreshState, { active: false, source: "timeline" });
+  releasePrepare();
+  await first;
+  assert.equal(shutdown.clearTimelineRefreshForUpdate(() => assert.fail("no update in progress")), false);
+});
