@@ -11,6 +11,9 @@ jobs:
   build:
     runs-on: windows-latest
     timeout-minutes: 25
+    env:
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
@@ -54,4 +57,11 @@ jobs:
           pnpm install --frozen-lockfile
 
       - name: Package Windows application
-        run: pnpm --dir apps/windows build
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY)) {
+            pnpm --dir apps/windows run build:ui
+            pnpm --dir apps/windows exec tauri build --no-bundle
+          } else {
+            pnpm --dir apps/windows build
+          }

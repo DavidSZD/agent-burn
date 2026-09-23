@@ -1144,6 +1144,12 @@ body {
   background: #32323a;
 }
 
+.update-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
 /* Toggle Switch */
 .switch {
   position: relative;

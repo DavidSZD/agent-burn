@@ -41,6 +41,7 @@ pub struct AppSettings {
     pub quota_source: String,
     pub antigravity_ultra_price: Option<f64>,
     pub hidden_agents: Vec<String>,
+    pub auto_check_updates: bool,
 }
 
 impl Default for AppSettings {
@@ -53,6 +54,7 @@ impl Default for AppSettings {
             quota_source: "codex".to_string(),
             antigravity_ultra_price: None,
             hidden_agents: Vec::new(),
+            auto_check_updates: true,
         }
     }
 }
@@ -286,6 +288,16 @@ mod tests {
         .normalized();
 
         assert_eq!(settings.refresh_minutes, 1);
+    }
+
+    #[test]
+    fn automatic_updates_default_to_enabled_and_old_settings_remain_compatible() {
+        assert!(AppSettings::default().auto_check_updates);
+        let old_settings: AppSettings = serde_json::from_str(
+            r#"{"codexHomes":"","offline":false,"refreshMinutes":5,"quotaSource":"codex"}"#,
+        )
+        .unwrap();
+        assert!(old_settings.auto_check_updates);
     }
 
     #[test]

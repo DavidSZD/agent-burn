@@ -1,4 +1,5 @@
 import { RequestGate } from "./request-gate.js";
+import { check } from "@tauri-apps/plugin-updater";
 import {
   aggregateTokenBreakdown,
   createCoalescedSaver,
@@ -90,6 +91,8 @@ const harnessCache = {};
 const summaryRequestGate = new RequestGate();
 const activeRefreshSources = new Set();
 let resolveInitialBackendRefresh;
+let availableAppUpdate = null;
+let updateCheckInProgress = false;
 const initialBackendRefresh = new Promise((resolve) => {
   resolveInitialBackendRefresh = resolve;
 });
@@ -229,6 +232,7 @@ window.addEventListener("DOMContentLoaded", async () => {
 
   // Démarrage rapide avec le cache
   await settingsLoadPromise;
+  if (appSettings?.autoCheckUpdates) void checkForAppUpdates({ automatic: true });
   if (Number.isFinite(automaticRefreshStartedAt)) {
     nextAutomaticRefreshAt = automaticRefreshStartedAt + refreshIntervalMs();
   }
@@ -2419,9 +2423,12 @@ function initSettings() {
     "settings-offline-toggle",
     "settings-refresh-select",
     "settings-antigravity-ultra-price",
+    "settings-auto-updates-toggle",
   ]) {
     document.getElementById(id)?.addEventListener("change", saveSettingsFromControls);
   }
+  document.getElementById("settings-check-updates-btn")?.addEventListener("click", () => checkForAppUpdates());
+  document.getElementById("settings-install-update-btn")?.addEventListener("click", installAvailableUpdate);
 
   // Fermeture du menu quota au clic externe
   document.addEventListener("click", () => {
@@ -2436,11 +2443,15 @@ function applySettingsToControls() {
   const offline = document.getElementById("settings-offline-toggle");
   const refresh = document.getElementById("settings-refresh-select");
   const ultraPrice = document.getElementById("settings-antigravity-ultra-price");
+  const autoUpdates = document.getElementById("settings-auto-updates-toggle");
   if (cli) cli.value = appSettings.customCliPath || "";
   if (homes) homes.value = appSettings.codexHomes || "";
   if (offline) offline.checked = !!appSettings.offline;
   if (refresh) refresh.value = String(appSettings.refreshMinutes || 1);
   if (ultraPrice) ultraPrice.value = appSettings.antigravityUltraPrice ? String(appSettings.antigravityUltraPrice) : "";
+  if (autoUpdates) autoUpdates.checked = appSettings.autoCheckUpdates !== false;
+  const updateStatus = document.getElementById("settings-update-status");
+  if (updateStatus) updateStatus.textContent = autoUpdates?.checked ? "Automatic checks run once a day." : "Automatic checks are off.";
 }
 
 async function saveSettingsFromControls() {
@@ -2452,11 +2463,69 @@ async function saveSettingsFromControls() {
     quotaSource: appSettings?.quotaSource || "antigravity",
     antigravityUltraPrice: Number(document.getElementById("settings-antigravity-ultra-price")?.value) || null,
     hiddenAgents: appSettings?.hiddenAgents || [],
+    autoCheckUpdates: document.getElementById("settings-auto-updates-toggle")?.checked !== false,
   };
   appSettings = await invokeTauri("set_settings", { settings });
+  if (appSettings.autoCheckUpdates) void checkForAppUpdates({ automatic: true });
+  else document.getElementById("settings-update-status").textContent = "Automatic checks are off.";
   for (const key in harnessCache) delete harnessCache[key];
   await loadData(true);
   void preloadTimelines(false, true);
+}
+
+async function checkForAppUpdates({ automatic = false } = {}) {
+  const status = document.getElementById("settings-update-status");
+  const installButton = document.getElementById("settings-install-update-btn");
+  if (updateCheckInProgress) return;
+  if (automatic) {
+    const lastCheck = Number(localStorage.getItem("agent-burn-update-check-at") || 0);
+    if (Date.now() - lastCheck < 24 * 60 * 60 * 1000) {
+      if (status) status.textContent = "Automatic check completed recently.";
+      return;
+    }
+  }
+  updateCheckInProgress = true;
+  if (status) status.textContent = "Checking for updates…";
+  if (installButton) installButton.hidden = true;
+  try {
+    await availableAppUpdate?.close();
+    availableAppUpdate = null;
+    availableAppUpdate = await check();
+    localStorage.setItem("agent-burn-update-check-at", String(Date.now()));
+    if (availableAppUpdate) {
+      if (status) status.textContent = `Version ${availableAppUpdate.version} is available.`;
+      if (installButton) installButton.hidden = false;
+    } else if (status) {
+      status.textContent = "You’re using the latest version.";
+    }
+  } catch (error) {
+    if (status) status.textContent = `Could not check for updates: ${String(error)}`;
+  } finally {
+    updateCheckInProgress = false;
+  }
+}
+
+async function installAvailableUpdate() {
+  if (!availableAppUpdate) return;
+  const status = document.getElementById("settings-update-status");
+  const confirmed = window.confirm(`Install Agent Burn ${availableAppUpdate.version} now? The app will close and reopen after installation.`);
+  if (!confirmed) return;
+  const button = document.getElementById("settings-install-update-btn");
+  if (button) button.disabled = true;
+  if (status) status.textContent = "Downloading update…";
+  try {
+    let receivedBytes = 0;
+    await availableAppUpdate.downloadAndInstall((event) => {
+      if (event.event === "Progress" && status) {
+        receivedBytes += Number(event.data?.chunkLength || 0);
+        status.textContent = receivedBytes > 0 ? `Downloading update… (${Math.round(receivedBytes / 1024)} KB received)` : "Downloading update…";
+      }
+    });
+    if (status) status.textContent = "Restarting to finish the update…";
+  } catch (error) {
+    if (status) status.textContent = `Update failed: ${String(error)}`;
+    if (button) button.disabled = false;
+  }
 }
 
 function renderSettings() {

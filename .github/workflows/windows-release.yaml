@@ -1,0 +1,77 @@
+name: Windows desktop release
+
+on:
+  push:
+    tags:
+      - "windows-v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 35
+    env:
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 22.20.0
+
+      - name: Enable pnpm
+        run: corepack enable
+
+      - name: Install workspace dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Build signed Windows installer and updater bundle
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY)) { throw "Set the TAURI_SIGNING_PRIVATE_KEY repository secret before tagging a Windows release." }
+          pnpm --dir apps/windows build
+
+      - name: Publish versioned release and update feed
+        shell: pwsh
+        run: |
+          $version = (Get-Content apps/windows/tauri.conf.json | ConvertFrom-Json).version
+          $tag = "windows-v$version"
+          $bundle = Get-ChildItem "apps/windows/target/release/bundle/nsis" -Filter "*.nsis.zip" | Select-Object -First 1
+          if (-not $bundle) { throw "Tauri updater bundle (.nsis.zip) was not produced." }
+          $signaturePath = "$($bundle.FullName).sig"
+          if (-not (Test-Path -LiteralPath $signaturePath)) { throw "Signed updater bundle signature is missing." }
+          $setup = Get-ChildItem "apps/windows/target/release/bundle/nsis" -Filter "*-setup.exe" | Select-Object -First 1
+          if (-not $setup) { throw "Windows setup.exe was not produced." }
+          $assetUrl = "https://github.com/${{ github.repository }}/releases/download/$tag/$([uri]::EscapeDataString($bundle.Name))"
+          $manifest = @{
+            version = $version
+            notes = "Agent Burn Windows $version"
+            pub_date = (Get-Date).ToUniversalTime().ToString("o")
+            platforms = @{
+              "windows-x86_64" = @{
+                signature = (Get-Content -Raw $signaturePath).Trim()
+                url = $assetUrl
+              }
+            }
+          } | ConvertTo-Json -Depth 8
+          Set-Content -LiteralPath "latest.json" -Value $manifest -Encoding utf8NoBOM
+          gh release create $tag $setup.FullName $bundle.FullName --title "Agent Burn Windows $version" --notes "Windows desktop application release."
+          if ($LASTEXITCODE -ne 0) { throw "Could not publish the versioned GitHub Release." }
+          gh release view windows *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create windows latest.json --title "Agent Burn Windows update feed" --notes "Rolling signed update manifest for the Windows desktop app."
+          } else {
+            gh release upload windows latest.json --clobber
+          }
+          if ($LASTEXITCODE -ne 0) { throw "Could not update the Windows update feed." }

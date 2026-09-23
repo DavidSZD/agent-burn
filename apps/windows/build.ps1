@@ -22,6 +22,13 @@ if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
     exit 1
 }
 
+# Use the developer's local updater signing key when it exists. The private
+# key remains outside the repository and is never copied into the app bundle.
+$updaterKey = Join-Path $env:LOCALAPPDATA "Agent Burn\updater\signing.key"
+if ($Release -and (Test-Path -LiteralPath $updaterKey) -and -not $env:TAURI_SIGNING_PRIVATE_KEY -and -not $env:TAURI_SIGNING_PRIVATE_KEY_PATH) {
+    $env:TAURI_SIGNING_PRIVATE_KEY_PATH = $updaterKey
+}
+
 # 2. Vérification de WebView2
 $wv2 = Get-ItemProperty -Path "HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}" -ErrorAction SilentlyContinue
 if (-not $wv2) {
@@ -45,6 +52,8 @@ Copy-Item -LiteralPath $cliBin -Destination $bundledCli -Force
 Write-Host "==> Lancement de l'application Tauri Windows..." -ForegroundColor Cyan
 Push-Location $PSScriptRoot
 try {
+    pnpm exec esbuild ui/app.js --bundle --format=esm --outfile=ui/app.bundle.js
+    if ($LASTEXITCODE -ne 0) { throw "La compilation de l'interface a échoué (code $LASTEXITCODE)." }
     if ($Release) {
         npx --yes @tauri-apps/cli build
     } else {

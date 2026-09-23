@@ -246,6 +246,30 @@
           </div>
 
           <div class="groupbox settings-box">
+            <h2 class="settings-sec-title">Application updates</h2>
+            <div class="setting-item">
+              <div class="setting-labels">
+                <span class="setting-name">Check automatically</span>
+                <span class="setting-desc">Checks once a day. Updates are never installed without your confirmation.</span>
+              </div>
+              <label class="switch">
+                <input type="checkbox" id="settings-auto-updates-toggle" />
+                <span class="slider"></span>
+              </label>
+            </div>
+            <div class="setting-item">
+              <div class="setting-labels">
+                <span class="setting-name">Update status</span>
+                <span class="setting-desc" id="settings-update-status">Not checked yet</span>
+              </div>
+              <div class="update-controls">
+                <button class="secondary-macos-btn" id="settings-check-updates-btn">Check now</button>
+                <button class="secondary-macos-btn" id="settings-install-update-btn" hidden>Install update</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="groupbox settings-box">
             <h2 class="settings-sec-title">General</h2>
             <div class="setting-item">
               <div class="setting-labels">
@@ -289,11 +313,11 @@
         <span id="footer-status-text">Updating...</span>
       </div>
       <div class="footer-right">
-        <span>v0.1.57 (Windows)</span>
+        <span>v0.1.58 (Windows)</span>
       </div>
     </footer>
   </div>
 
-    <script type="module" src="app.js"></script>
+    <script type="module" src="app.bundle.js"></script>
 </body>
 </html>
