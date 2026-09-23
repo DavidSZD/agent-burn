@@ -51,6 +51,9 @@ jobs:
       - name: Test Windows application
         run: cargo test --manifest-path apps/windows/Cargo.toml
 
+      - name: Test Windows UI and release helpers
+        run: node --test apps/windows/ui/ui-utils.test.js apps/windows/scripts/release-utils.test.mjs
+
       - name: Install workspace dependencies
         run: |
           corepack enable
@@ -61,7 +64,10 @@ jobs:
         run: |
           if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY)) {
             pnpm --dir apps/windows run build:ui
+            if ($LASTEXITCODE -ne 0) { throw "The Windows UI bundle failed to build." }
             pnpm --dir apps/windows exec tauri build --no-bundle
+            if ($LASTEXITCODE -ne 0) { throw "The Windows Tauri app failed to build." }
           } else {
             pnpm --dir apps/windows build
+            if ($LASTEXITCODE -ne 0) { throw "The Windows release bundle failed to build." }
           }
