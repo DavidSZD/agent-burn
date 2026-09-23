@@ -192,35 +192,66 @@ fn find_dynamic_price(
     model_name: &str,
 ) -> Option<ModelPrice> {
     let clean = model_name.trim().to_lowercase();
-    let stripped = clean
-        .trim_start_matches("openrouter/")
-        .trim_start_matches("openai/")
-        .trim_start_matches("google/")
-        .trim_start_matches("vertex_ai/")
-        .trim_start_matches("x-ai/")
-        .trim_start_matches("cursor-");
+    if let Some(price) = entries.get(&clean) {
+        return Some(*price);
+    }
+
+    if let Some((provider, requested_model)) = clean.rsplit_once('/') {
+        return best_matching_dynamic_price(
+            entries.iter().map(|(key, price)| (key.as_str(), price)),
+            requested_model,
+            Some(&format!("{provider}/")),
+        );
+    }
+
+    let stripped = clean.strip_prefix("cursor-").unwrap_or(&clean);
+    let provider = if stripped.starts_with("gpt-") {
+        Some("openai/")
+    } else if stripped.starts_with("gemini-") {
+        Some("google/")
+    } else if stripped.starts_with("claude-") {
+        Some("anthropic/")
+    } else {
+        None
+    };
+
+    if let Some(provider) = provider {
+        if let Some(price) = best_matching_dynamic_price(
+            entries.iter().map(|(key, price)| (key.as_str(), price)),
+            stripped,
+            Some(provider),
+        ) {
+            return Some(price);
+        }
+    }
+
+    entries.get(stripped).copied().or_else(|| {
+        best_matching_dynamic_price(
+            entries.iter().map(|(key, price)| (key.as_str(), price)),
+            stripped,
+            None,
+        )
+    })
+}
+
+fn best_matching_dynamic_price<'a>(
+    entries: impl IntoIterator<Item = (&'a str, &'a ModelPrice)>,
+    requested_model: &str,
+    provider_prefix: Option<&str>,
+) -> Option<ModelPrice> {
     entries
-        .get(&clean)
-        .or_else(|| entries.get(stripped))
-        .or_else(|| {
-            let provider = if stripped.starts_with("gpt-") {
-                "openai"
-            } else if stripped.starts_with("gemini-") {
-                "google"
-            } else if stripped.starts_with("claude-") {
-                "anthropic"
+        .into_iter()
+        .filter_map(|(key, price)| {
+            let model = if let Some(provider_prefix) = provider_prefix {
+                key.strip_prefix(provider_prefix)?
             } else {
-                return None;
+                key.rsplit('/').next().unwrap_or(key)
             };
-            entries.get(&format!("{provider}/{stripped}"))
+            (requested_model.starts_with(model) || model.ends_with(requested_model))
+                .then_some((model.len(), *price))
         })
-        .copied()
-        .or_else(|| {
-            entries.iter().find_map(|(key, price)| {
-                (stripped.starts_with(key) || key.ends_with(&format!("/{stripped}")))
-                    .then_some(*price)
-            })
-        })
+        .max_by_key(|(specificity, _)| *specificity)
+        .map(|(_, price)| price)
 }
 
 #[cfg(not(test))]
@@ -452,6 +483,63 @@ mod tests {
                 .unwrap()
                 .output_per_m,
             10.0
+        );
+    }
+
+    #[test]
+    fn qualified_dynamic_price_never_uses_an_unqualified_provider_alias() {
+        let entries = StdHashMap::from([
+            (
+                "gpt-6-luna".to_string(),
+                ModelPrice {
+                    input_per_m: 2.0,
+                    output_per_m: 10.0,
+                    cache_read_per_m: 0.2,
+                    cache_write_per_m: 2.5,
+                },
+            ),
+            (
+                "openrouter/gpt-6-luna".to_string(),
+                ModelPrice {
+                    input_per_m: 8.0,
+                    output_per_m: 40.0,
+                    cache_read_per_m: 0.8,
+                    cache_write_per_m: 10.0,
+                },
+            ),
+        ]);
+
+        assert_eq!(find_dynamic_price(&entries, "openai/gpt-6-luna"), None);
+    }
+
+    #[test]
+    fn dynamic_variant_matching_prefers_the_longest_provider_model_prefix() {
+        let entries = StdHashMap::from([
+            (
+                "openai/gpt-5.1".to_string(),
+                ModelPrice {
+                    input_per_m: 2.0,
+                    output_per_m: 8.0,
+                    cache_read_per_m: 0.2,
+                    cache_write_per_m: 2.5,
+                },
+            ),
+            (
+                "openai/gpt-5.1-codex-mini".to_string(),
+                ModelPrice {
+                    input_per_m: 1.0,
+                    output_per_m: 4.0,
+                    cache_read_per_m: 0.1,
+                    cache_write_per_m: 1.25,
+                },
+            ),
+        ]);
+
+        assert_eq!(
+            find_dynamic_price(&entries, "gpt-5.1-codex-mini-preview")
+                .unwrap()
+                .input_per_m,
+            1.0
         );
     }
 
