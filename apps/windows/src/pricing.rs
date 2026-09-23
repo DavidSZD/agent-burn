@@ -241,13 +241,9 @@ fn find_exact_dynamic_price(
     model_name: &str,
 ) -> Option<ModelPrice> {
     let clean = model_name.trim().to_lowercase();
-    if let Some(price) = entries.get(&clean) {
-        return Some(*price);
-    }
-
     // A provider-qualified model may only use an exact entry for that provider.
     if clean.contains('/') {
-        return None;
+        return entries.get(&clean).copied();
     }
 
     let stripped = clean.strip_prefix("cursor-").unwrap_or(&clean);
@@ -267,7 +263,10 @@ fn find_exact_dynamic_price(
         }
     }
 
-    entries.get(stripped).copied()
+    entries
+        .get(&clean)
+        .or_else(|| entries.get(stripped))
+        .copied()
 }
 
 fn best_matching_dynamic_price<'a>(
@@ -551,6 +550,40 @@ mod tests {
         ]);
 
         assert_eq!(find_dynamic_price(&entries, "openai/gpt-6-luna"), None);
+    }
+
+    #[test]
+    fn unqualified_gpt_prefers_its_inferred_provider_over_an_alias() {
+        let entries = StdHashMap::from([
+            (
+                "gpt-6-luna".to_string(),
+                ModelPrice {
+                    input_per_m: 0.0,
+                    output_per_m: 0.0,
+                    cache_read_per_m: 0.0,
+                    cache_write_per_m: 0.0,
+                },
+            ),
+            (
+                "openai/gpt-6-luna".to_string(),
+                ModelPrice {
+                    input_per_m: 2.0,
+                    output_per_m: 10.0,
+                    cache_read_per_m: 0.2,
+                    cache_write_per_m: 2.5,
+                },
+            ),
+        ]);
+
+        assert_eq!(
+            find_exact_dynamic_price(&entries, "gpt-6-luna"),
+            Some(ModelPrice {
+                input_per_m: 2.0,
+                output_per_m: 10.0,
+                cache_read_per_m: 0.2,
+                cache_write_per_m: 2.5,
+            })
+        );
     }
 
     #[test]
