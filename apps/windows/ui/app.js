@@ -1,6 +1,11 @@
 import { RequestGate } from "./request-gate.js";
 import { check } from "@tauri-apps/plugin-updater";
 import {
+  clearPersistedAvailableUpdate,
+  getPersistedAvailableUpdate,
+  rememberAvailableUpdate,
+} from "./update-notice.js";
+import {
   aggregateTokenBreakdown,
   createCoalescedSaver,
   createReplaceableCallback,
@@ -94,6 +99,7 @@ const activeRefreshSources = new Set();
 let resolveInitialBackendRefresh;
 let availableAppUpdate = null;
 let updateCheckInProgress = false;
+let updateNoticeTimer = null;
 const initialBackendRefresh = new Promise((resolve) => {
   resolveInitialBackendRefresh = resolve;
 });
@@ -221,6 +227,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   initPeriods();
   initRefresh();
   initSettings();
+  initAppUpdateNotice();
   // The backend collector starts independently of the WebView and its first
   // event can arrive before listeners finish attaching. Start the footer
   // clock locally so startup still shows Updating instead of stale cache age.
@@ -2432,7 +2439,9 @@ function initSettings() {
     document.getElementById(id)?.addEventListener("change", saveSettingsFromControls);
   }
   document.getElementById("settings-check-updates-btn")?.addEventListener("click", () => checkForAppUpdates());
-  document.getElementById("settings-install-update-btn")?.addEventListener("click", installAvailableUpdate);
+  document.getElementById("settings-install-update-btn")?.addEventListener("click", () =>
+    checkForAppUpdates({ installAfterCheck: true }),
+  );
 
   // Fermeture du menu quota au clic externe
   document.addEventListener("click", () => {
@@ -2477,10 +2486,44 @@ async function saveSettingsFromControls() {
   void preloadTimelines(false, true);
 }
 
-async function checkForAppUpdates({ automatic = false } = {}) {
+function renderFooterUpdateNotice(version) {
+  const button = document.getElementById("footer-update-button");
+  if (!button) return;
+  button.hidden = !version;
+  button.disabled = false;
+  button.textContent = version ? `Update available · ${version}` : "";
+  button.title = version ? `Check and install Agent Burn ${version}` : "";
+  button.setAttribute("aria-label", version ? `Update available: version ${version}. Check before installing.` : "");
+}
+
+function showUpdateDiscoveryNotice(version) {
+  const notice = document.getElementById("update-discovery-notice");
+  if (!notice) return;
+  notice.textContent = `Agent Burn ${version} is available. Select the update in the footer to check and install it.`;
+  notice.hidden = false;
+  window.clearTimeout(updateNoticeTimer);
+  updateNoticeTimer = window.setTimeout(() => {
+    notice.hidden = true;
+  }, 8000);
+}
+
+function initAppUpdateNotice() {
+  renderFooterUpdateNotice(getPersistedAvailableUpdate(localStorage));
+  document.getElementById("footer-update-button")?.addEventListener("click", async (event) => {
+    const button = event.currentTarget;
+    button.disabled = true;
+    button.textContent = "Checking update…";
+    await checkForAppUpdates({ installAfterCheck: true });
+    if (!updateCheckInProgress) {
+      renderFooterUpdateNotice(getPersistedAvailableUpdate(localStorage));
+    }
+  });
+}
+
+async function checkForAppUpdates({ automatic = false, installAfterCheck = false } = {}) {
   const status = document.getElementById("settings-update-status");
   const installButton = document.getElementById("settings-install-update-btn");
-  if (updateCheckInProgress) return;
+  if (updateCheckInProgress) return false;
   if (automatic) {
     const lastCheck = Number(localStorage.getItem("agent-burn-update-check-at") || 0);
     if (!isAutomaticUpdateCheckDue(appSettings?.autoCheckUpdates === true, lastCheck, Date.now())) {
@@ -2489,10 +2532,11 @@ async function checkForAppUpdates({ automatic = false } = {}) {
           ? "Automatic check completed recently."
           : "Automatic checks are off.";
       }
-      return;
+      return false;
     }
   }
   updateCheckInProgress = true;
+  let checkSucceeded = false;
   if (status) status.textContent = "Checking for updates…";
   if (installButton) installButton.hidden = true;
   try {
@@ -2500,17 +2544,28 @@ async function checkForAppUpdates({ automatic = false } = {}) {
     availableAppUpdate = null;
     availableAppUpdate = await check();
     localStorage.setItem("agent-burn-update-check-at", String(Date.now()));
+    checkSucceeded = true;
     if (availableAppUpdate) {
+      const notice = rememberAvailableUpdate(localStorage, availableAppUpdate.version);
+      renderFooterUpdateNotice(notice.version);
+      if (notice.shouldAnnounce) showUpdateDiscoveryNotice(notice.version);
       if (status) status.textContent = `Version ${availableAppUpdate.version} is available.`;
       if (installButton) installButton.hidden = false;
     } else if (status) {
+      clearPersistedAvailableUpdate(localStorage);
+      renderFooterUpdateNotice(null);
       status.textContent = "You’re using the latest version.";
+    } else {
+      clearPersistedAvailableUpdate(localStorage);
+      renderFooterUpdateNotice(null);
     }
   } catch (error) {
     if (status) status.textContent = `Could not check for updates: ${String(error)}`;
   } finally {
     updateCheckInProgress = false;
   }
+  if (installAfterCheck && checkSucceeded && availableAppUpdate) await installAvailableUpdate();
+  return checkSucceeded;
 }
 
 async function installAvailableUpdate() {
@@ -2519,8 +2574,13 @@ async function installAvailableUpdate() {
   const confirmed = window.confirm(`Install Agent Burn ${availableAppUpdate.version} now? The app will close and reopen after installation.`);
   if (!confirmed) return;
   const button = document.getElementById("settings-install-update-btn");
+  const footerButton = document.getElementById("footer-update-button");
   if (button) button.disabled = true;
+  if (footerButton) footerButton.disabled = true;
   if (status) status.textContent = "Downloading update…";
+  const installingVersion = availableAppUpdate.version;
+  clearPersistedAvailableUpdate(localStorage);
+  renderFooterUpdateNotice(null);
   try {
     let receivedBytes = 0;
     await availableAppUpdate.downloadAndInstall((event) => {
@@ -2533,6 +2593,9 @@ async function installAvailableUpdate() {
   } catch (error) {
     if (status) status.textContent = `Update failed: ${String(error)}`;
     if (button) button.disabled = false;
+    if (footerButton) footerButton.disabled = false;
+    rememberAvailableUpdate(localStorage, installingVersion);
+    renderFooterUpdateNotice(installingVersion);
   }
 }
 
