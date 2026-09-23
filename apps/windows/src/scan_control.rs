@@ -1,3 +1,4 @@
+#[cfg(test)]
 use std::future::Future;
 use tokio::sync::watch;
 
@@ -48,6 +49,7 @@ impl ScanControl {
         self.state.borrow().stopping_for_update
     }
 
+    #[cfg(test)]
     pub async fn run<T, F>(&self, future: F) -> Result<T, String>
     where
         F: Future<Output = T>,
