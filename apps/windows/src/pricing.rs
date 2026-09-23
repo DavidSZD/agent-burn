@@ -1,8 +1,12 @@
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::{collections::HashMap as StdHashMap, sync::OnceLock};
+#[cfg(not(test))]
+use std::{env, fs, path::PathBuf, sync::Mutex, time::SystemTime};
 
 const LITELLM_PRICING_JSON: &str = include_str!("litellm-pricing-embedded.json");
+#[cfg(not(test))]
+const MAX_DYNAMIC_PRICING_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ModelPrice {
@@ -150,7 +154,274 @@ impl PricingRegistry {
 }
 
 pub fn get_model_pricing(model_name: &str) -> Option<ModelPrice> {
-    PricingRegistry::global().find(model_name)
+    #[cfg(not(test))]
+    {
+        let (exact_dynamic, fuzzy_dynamic) = dynamic_cached_prices(model_name);
+        exact_dynamic
+            .or_else(|| PricingRegistry::global().find(model_name))
+            .or(fuzzy_dynamic)
+    }
+    #[cfg(test)]
+    {
+        PricingRegistry::global().find(model_name)
+    }
+}
+
+#[cfg(not(test))]
+fn dynamic_cached_prices(model_name: &str) -> (Option<ModelPrice>, Option<ModelPrice>) {
+    static CACHE: OnceLock<Mutex<DynamicPricingCache>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(DynamicPricingCache::default()));
+    let Ok(mut cache) = cache.lock() else {
+        return (None, None);
+    };
+    let source_files = dynamic_price_cache_paths();
+    let source_signature = source_files
+        .iter()
+        .map(|path| {
+            fs::metadata(path)
+                .ok()
+                .and_then(|metadata| Some((metadata.modified().ok()?, metadata.len())))
+        })
+        .collect::<Vec<_>>();
+    if cache.signature != source_signature {
+        cache.entries = load_dynamic_price_cache(&source_files);
+        cache.signature = source_signature;
+    }
+    (
+        find_exact_dynamic_price(&cache.entries, model_name),
+        find_dynamic_price(&cache.entries, model_name),
+    )
+}
+
+fn find_dynamic_price(
+    entries: &StdHashMap<String, ModelPrice>,
+    model_name: &str,
+) -> Option<ModelPrice> {
+    let clean = model_name.trim().to_lowercase();
+    find_exact_dynamic_price(entries, &clean).or_else(|| {
+        let stripped = clean.strip_prefix("cursor-").unwrap_or(&clean);
+        let provider = if stripped.starts_with("gpt-") {
+            Some("openai/")
+        } else if stripped.starts_with("gemini-") {
+            Some("google/")
+        } else if stripped.starts_with("claude-") {
+            Some("anthropic/")
+        } else {
+            None
+        };
+
+        if let Some((provider, requested_model)) = clean.rsplit_once('/') {
+            return best_matching_dynamic_price(
+                entries.iter().map(|(key, price)| (key.as_str(), price)),
+                requested_model,
+                Some(&format!("{provider}/")),
+            );
+        }
+
+        if let Some(provider) = provider {
+            if let Some(price) = best_matching_dynamic_price(
+                entries.iter().map(|(key, price)| (key.as_str(), price)),
+                stripped,
+                Some(provider),
+            ) {
+                return Some(price);
+            }
+        }
+
+        best_matching_dynamic_price(
+            entries.iter().map(|(key, price)| (key.as_str(), price)),
+            stripped,
+            None,
+        )
+    })
+}
+
+fn find_exact_dynamic_price(
+    entries: &StdHashMap<String, ModelPrice>,
+    model_name: &str,
+) -> Option<ModelPrice> {
+    let clean = model_name.trim().to_lowercase();
+    // A provider-qualified model may only use an exact entry for that provider.
+    if clean.contains('/') {
+        return entries.get(&clean).copied();
+    }
+
+    let stripped = clean.strip_prefix("cursor-").unwrap_or(&clean);
+    let provider = if stripped.starts_with("gpt-") {
+        Some("openai/")
+    } else if stripped.starts_with("gemini-") {
+        Some("google/")
+    } else if stripped.starts_with("claude-") {
+        Some("anthropic/")
+    } else {
+        None
+    };
+
+    if let Some(provider) = provider {
+        if let Some(price) = entries.get(&format!("{provider}{stripped}")) {
+            return Some(*price);
+        }
+    }
+
+    entries
+        .get(&clean)
+        .or_else(|| entries.get(stripped))
+        .copied()
+}
+
+fn best_matching_dynamic_price<'a>(
+    entries: impl IntoIterator<Item = (&'a str, &'a ModelPrice)>,
+    requested_model: &str,
+    provider_prefix: Option<&str>,
+) -> Option<ModelPrice> {
+    entries
+        .into_iter()
+        .filter_map(|(key, price)| {
+            let model = if let Some(provider_prefix) = provider_prefix {
+                key.strip_prefix(provider_prefix)?
+            } else {
+                key.rsplit('/').next().unwrap_or(key)
+            };
+            let suffix = requested_model.as_bytes().get(model.len());
+            (requested_model.starts_with(model) && matches!(suffix, None | Some(b'-') | Some(b'@')))
+                .then_some((model.len(), key, *price))
+        })
+        .max_by(|(left_len, left_key, _), (right_len, right_key, _)| {
+            left_len
+                .cmp(right_len)
+                .then_with(|| right_key.cmp(left_key))
+        })
+        .map(|(_, _, price)| price)
+}
+
+#[cfg(not(test))]
+#[derive(Default)]
+struct DynamicPricingCache {
+    signature: Vec<Option<(SystemTime, u64)>>,
+    entries: StdHashMap<String, ModelPrice>,
+}
+
+#[cfg(not(test))]
+fn dynamic_price_cache_paths() -> Vec<PathBuf> {
+    let Some(root) = env::var_os("LOCALAPPDATA")
+        .or_else(|| env::var_os("XDG_CACHE_HOME"))
+        .or_else(|| env::var_os("HOME"))
+        .map(PathBuf::from)
+    else {
+        return Vec::new();
+    };
+    let cache_dir = root.join("Agent Burn").join("pricing-cache");
+    vec![
+        cache_dir.join("litellm.json"),
+        cache_dir.join("models-dev.json"),
+    ]
+}
+
+#[cfg(not(test))]
+fn load_dynamic_price_cache(paths: &[PathBuf]) -> StdHashMap<String, ModelPrice> {
+    let mut entries = StdHashMap::new();
+    if let Some(path) = paths.first() {
+        if let Some(json) = read_dynamic_pricing_file(path) {
+            load_litellm_cache(&json, &mut entries);
+        }
+    }
+    if let Some(path) = paths.get(1) {
+        if let Some(json) = read_dynamic_pricing_file(path) {
+            load_models_dev_cache(&json, &mut entries);
+        }
+    }
+    entries
+}
+
+#[cfg(not(test))]
+fn read_dynamic_pricing_file(path: &std::path::Path) -> Option<String> {
+    let metadata = fs::metadata(path).ok()?;
+    if metadata.len() > MAX_DYNAMIC_PRICING_BYTES {
+        return None;
+    }
+    fs::read_to_string(path).ok()
+}
+
+fn load_litellm_cache(json: &str, entries: &mut StdHashMap<String, ModelPrice>) {
+    let Ok(models) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(json)
+    else {
+        return;
+    };
+    for (name, value) in models {
+        let Some(input) = value
+            .get("input_cost_per_token")
+            .and_then(serde_json::Value::as_f64)
+        else {
+            continue;
+        };
+        let Some(output) = value
+            .get("output_cost_per_token")
+            .and_then(serde_json::Value::as_f64)
+        else {
+            continue;
+        };
+        entries.insert(
+            name.to_lowercase(),
+            ModelPrice {
+                input_per_m: input * 1_000_000.0,
+                output_per_m: output * 1_000_000.0,
+                cache_read_per_m: value
+                    .get("cache_read_input_token_cost")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(input * 0.1)
+                    * 1_000_000.0,
+                cache_write_per_m: value
+                    .get("cache_creation_input_token_cost")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(input * 1.25)
+                    * 1_000_000.0,
+            },
+        );
+    }
+}
+
+fn load_models_dev_cache(json: &str, entries: &mut StdHashMap<String, ModelPrice>) {
+    let Ok(providers) = serde_json::from_str::<serde_json::Value>(json) else {
+        return;
+    };
+    let Some(providers) = providers.as_object() else {
+        return;
+    };
+    for (provider, data) in providers {
+        let Some(models) = data.get("models").and_then(serde_json::Value::as_object) else {
+            continue;
+        };
+        for (key, model) in models {
+            let Some(cost) = model.get("cost") else {
+                continue;
+            };
+            let Some(input) = cost.get("input").and_then(serde_json::Value::as_f64) else {
+                continue;
+            };
+            let Some(output) = cost.get("output").and_then(serde_json::Value::as_f64) else {
+                continue;
+            };
+            let name = model
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(key)
+                .to_lowercase();
+            let price = ModelPrice {
+                input_per_m: input,
+                output_per_m: output,
+                cache_read_per_m: cost
+                    .get("cache_read")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(input * 0.1),
+                cache_write_per_m: cost
+                    .get("cache_write")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(input * 1.25),
+            };
+            entries.entry(name.clone()).or_insert(price);
+            entries.entry(format!("{provider}/{name}")).or_insert(price);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -214,5 +485,185 @@ mod tests {
             get_model_pricing("gpt-5.1-codex-mini-preview"),
             get_model_pricing("gpt-5.1-codex-mini")
         );
+    }
+
+    #[test]
+    fn parses_live_litellm_rates_in_dollars_per_million() {
+        let mut entries = StdHashMap::new();
+        load_litellm_cache(
+            r#"{"openai/gpt-6-luna":{"input_cost_per_token":0.000002,"output_cost_per_token":0.00001,"cache_read_input_token_cost":0.0000002,"cache_creation_input_token_cost":0.0000025}}"#,
+            &mut entries,
+        );
+        let price = entries["openai/gpt-6-luna"];
+        assert!((price.input_per_m - 2.0).abs() < f64::EPSILON);
+        assert!((price.output_per_m - 10.0).abs() < f64::EPSILON);
+        assert!((price.cache_read_per_m - 0.2).abs() < f64::EPSILON);
+        assert!((price.cache_write_per_m - 2.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn dynamically_cached_provider_prices_resolve_unqualified_model_names() {
+        let entries = StdHashMap::from([(
+            "openai/gpt-6-luna".to_string(),
+            ModelPrice {
+                input_per_m: 2.0,
+                output_per_m: 10.0,
+                cache_read_per_m: 0.2,
+                cache_write_per_m: 2.5,
+            },
+        )]);
+        assert_eq!(
+            find_dynamic_price(&entries, "gpt-6-luna")
+                .unwrap()
+                .input_per_m,
+            2.0
+        );
+        assert_eq!(
+            find_dynamic_price(&entries, "openai/gpt-6-luna")
+                .unwrap()
+                .output_per_m,
+            10.0
+        );
+    }
+
+    #[test]
+    fn qualified_dynamic_price_never_uses_an_unqualified_provider_alias() {
+        let entries = StdHashMap::from([
+            (
+                "gpt-6-luna".to_string(),
+                ModelPrice {
+                    input_per_m: 2.0,
+                    output_per_m: 10.0,
+                    cache_read_per_m: 0.2,
+                    cache_write_per_m: 2.5,
+                },
+            ),
+            (
+                "openrouter/gpt-6-luna".to_string(),
+                ModelPrice {
+                    input_per_m: 8.0,
+                    output_per_m: 40.0,
+                    cache_read_per_m: 0.8,
+                    cache_write_per_m: 10.0,
+                },
+            ),
+        ]);
+
+        assert_eq!(find_dynamic_price(&entries, "openai/gpt-6-luna"), None);
+    }
+
+    #[test]
+    fn unqualified_gpt_prefers_its_inferred_provider_over_an_alias() {
+        let entries = StdHashMap::from([
+            (
+                "gpt-6-luna".to_string(),
+                ModelPrice {
+                    input_per_m: 0.0,
+                    output_per_m: 0.0,
+                    cache_read_per_m: 0.0,
+                    cache_write_per_m: 0.0,
+                },
+            ),
+            (
+                "openai/gpt-6-luna".to_string(),
+                ModelPrice {
+                    input_per_m: 2.0,
+                    output_per_m: 10.0,
+                    cache_read_per_m: 0.2,
+                    cache_write_per_m: 2.5,
+                },
+            ),
+        ]);
+
+        assert_eq!(
+            find_exact_dynamic_price(&entries, "gpt-6-luna"),
+            Some(ModelPrice {
+                input_per_m: 2.0,
+                output_per_m: 10.0,
+                cache_read_per_m: 0.2,
+                cache_write_per_m: 2.5,
+            })
+        );
+    }
+
+    #[test]
+    fn dynamic_variant_matching_prefers_the_longest_provider_model_prefix() {
+        let entries = StdHashMap::from([
+            (
+                "openai/gpt-5.1".to_string(),
+                ModelPrice {
+                    input_per_m: 2.0,
+                    output_per_m: 8.0,
+                    cache_read_per_m: 0.2,
+                    cache_write_per_m: 2.5,
+                },
+            ),
+            (
+                "openai/gpt-5.1-codex-mini".to_string(),
+                ModelPrice {
+                    input_per_m: 1.0,
+                    output_per_m: 4.0,
+                    cache_read_per_m: 0.1,
+                    cache_write_per_m: 1.25,
+                },
+            ),
+        ]);
+
+        assert_eq!(
+            find_dynamic_price(&entries, "gpt-5.1-codex-mini-preview")
+                .unwrap()
+                .input_per_m,
+            1.0
+        );
+    }
+
+    #[test]
+    fn dynamic_pricing_does_not_match_a_prefix_inside_a_different_version() {
+        let entries = StdHashMap::from([(
+            "openai/gpt-5".to_string(),
+            ModelPrice {
+                input_per_m: 5.0,
+                output_per_m: 30.0,
+                cache_read_per_m: 0.5,
+                cache_write_per_m: 0.0,
+            },
+        )]);
+
+        assert_eq!(find_dynamic_price(&entries, "openai/gpt-5.6-sol-pro"), None);
+    }
+
+    #[test]
+    fn equal_length_dynamic_prefix_matches_are_deterministic() {
+        let first = ModelPrice {
+            input_per_m: 1.0,
+            output_per_m: 2.0,
+            cache_read_per_m: 0.1,
+            cache_write_per_m: 0.2,
+        };
+        let second = ModelPrice {
+            input_per_m: 3.0,
+            output_per_m: 4.0,
+            cache_read_per_m: 0.3,
+            cache_write_per_m: 0.4,
+        };
+        assert_eq!(
+            best_matching_dynamic_price(
+                [("provider-a/model", &first), ("provider-b/model", &second),],
+                "model-preview",
+                None,
+            ),
+            Some(first)
+        );
+    }
+
+    #[test]
+    fn parses_models_dev_provider_model_records() {
+        let mut entries = StdHashMap::new();
+        load_models_dev_cache(
+            r#"{"openai":{"models":{"gpt-6-luna":{"id":"gpt-6-luna","cost":{"input":2,"output":10,"cache_read":0.2,"cache_write":2.5}}}}}"#,
+            &mut entries,
+        );
+        assert_eq!(entries["gpt-6-luna"].input_per_m, 2.0);
+        assert_eq!(entries["openai/gpt-6-luna"].output_per_m, 10.0);
     }
 }

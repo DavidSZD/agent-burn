@@ -56,3 +56,4 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 *.exe
 !apps/windows/resources/
 !apps/windows/resources/.gitkeep
+apps/windows/ui/app.bundle.js
