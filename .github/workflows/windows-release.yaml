@@ -75,19 +75,31 @@ jobs:
           if (-not (Test-Path -LiteralPath $signaturePath)) { throw "Signed updater setup.exe signature is missing." }
           $publishedAssets = Join-Path $env:RUNNER_TEMP "windows-release-assets"
           gh release view $tag *> $null
-          if ($LASTEXITCODE -eq 0) {
-            New-Item -ItemType Directory -Force -Path $publishedAssets | Out-Null
-            gh release download $tag --pattern $setup.Name --dir $publishedAssets --clobber
-            if ($LASTEXITCODE -ne 0) { throw "Could not retrieve the immutable installer from the existing release." }
-            gh release download $tag --pattern "$($setup.Name).sig" --dir $publishedAssets --clobber
-            if ($LASTEXITCODE -ne 0) { throw "Could not retrieve the immutable installer signature from the existing release." }
-            $setup = Get-Item -LiteralPath (Join-Path $publishedAssets $setup.Name)
-            $signaturePath = "$($setup.FullName).sig"
-          } else {
+          $releaseExists = $LASTEXITCODE -eq 0
+          if (-not $releaseExists) {
             gh release create $tag $setup.FullName $signaturePath --title "Agent Burn Windows $version" --notes "Windows desktop application release."
             if ($LASTEXITCODE -ne 0) { throw "Could not publish the versioned Windows release assets." }
           }
-          $assetUrl = "https://github.com/${{ github.repository }}/releases/download/$tag/$([uri]::EscapeDataString($setup.Name))"
+
+          $release = gh release view $tag --json assets,isDraft | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw "Could not inspect the published Windows release assets." }
+          if ($release.isDraft) { throw "Publish the versioned Windows release before updating the feed." }
+          $setupAssets = @($release.assets | Where-Object { $_.name -match '-setup\.exe$' })
+          if ($setupAssets.Count -ne 1) { throw "Expected exactly one setup.exe asset in the versioned release." }
+          $setupAsset = $setupAssets[0]
+          $signatureAssetName = "$($setupAsset.name).sig"
+          if (-not ($release.assets | Where-Object { $_.name -eq $signatureAssetName })) {
+            throw "The published installer signature asset is missing: $signatureAssetName"
+          }
+
+          New-Item -ItemType Directory -Force -Path $publishedAssets | Out-Null
+          gh release download $tag --pattern $setupAsset.name --dir $publishedAssets --clobber
+          if ($LASTEXITCODE -ne 0) { throw "Could not retrieve the published installer asset." }
+          gh release download $tag --pattern $signatureAssetName --dir $publishedAssets --clobber
+          if ($LASTEXITCODE -ne 0) { throw "Could not retrieve the published installer signature." }
+          $signaturePath = Join-Path $publishedAssets $signatureAssetName
+          $assetUrl = $setupAsset.url
+          if ([string]::IsNullOrWhiteSpace($assetUrl)) { throw "The published installer has no download URL." }
           $manifest = @{
             version = $version
             notes = "Agent Burn Windows $version"
@@ -99,6 +111,10 @@ jobs:
               }
             }
           } | ConvertTo-Json -Depth 8
+          $manifestData = $manifest | ConvertFrom-Json
+          if ($manifestData.platforms.'windows-x86_64'.url -ne $setupAsset.url) {
+            throw "The update manifest URL does not match the published installer asset URL."
+          }
           Set-Content -LiteralPath "latest.json" -Value $manifest -Encoding utf8NoBOM
           gh release view windows *> $null
           if ($LASTEXITCODE -ne 0) {
