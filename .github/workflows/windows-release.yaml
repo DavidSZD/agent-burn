@@ -47,7 +47,7 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
 
-      - name: Build signed Windows installer and updater bundle
+      - name: Build signed Windows installer and updater artifact
         shell: pwsh
         run: |
           if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY)) { throw "Set the TAURI_SIGNING_PRIVATE_KEY repository secret before tagging a Windows release." }
@@ -69,13 +69,11 @@ jobs:
             node apps/windows/scripts/validate-release.mjs "$env:GITHUB_REF_NAME" "$version" "$latestManifestPath"
             if ($LASTEXITCODE -ne 0) { throw "This release must not replace a newer Windows update feed." }
           }
-          $bundle = Get-ChildItem "apps/windows/target/release/bundle/nsis" -Filter "*.nsis.zip" | Select-Object -First 1
-          if (-not $bundle) { throw "Tauri updater bundle (.nsis.zip) was not produced." }
-          $signaturePath = "$($bundle.FullName).sig"
-          if (-not (Test-Path -LiteralPath $signaturePath)) { throw "Signed updater bundle signature is missing." }
           $setup = Get-ChildItem "apps/windows/target/release/bundle/nsis" -Filter "*-setup.exe" | Select-Object -First 1
           if (-not $setup) { throw "Windows setup.exe was not produced." }
-          $assetUrl = "https://github.com/${{ github.repository }}/releases/download/$tag/$([uri]::EscapeDataString($bundle.Name))"
+          $signaturePath = "$($setup.FullName).sig"
+          if (-not (Test-Path -LiteralPath $signaturePath)) { throw "Signed updater setup.exe signature is missing." }
+          $assetUrl = "https://github.com/${{ github.repository }}/releases/download/$tag/$([uri]::EscapeDataString($setup.Name))"
           $manifest = @{
             version = $version
             notes = "Agent Burn Windows $version"
@@ -90,9 +88,9 @@ jobs:
           Set-Content -LiteralPath "latest.json" -Value $manifest -Encoding utf8NoBOM
           gh release view $tag *> $null
           if ($LASTEXITCODE -eq 0) {
-            gh release upload $tag $setup.FullName $bundle.FullName --clobber
+            gh release upload $tag $setup.FullName --clobber
           } else {
-            gh release create $tag $setup.FullName $bundle.FullName --title "Agent Burn Windows $version" --notes "Windows desktop application release."
+            gh release create $tag $setup.FullName --title "Agent Burn Windows $version" --notes "Windows desktop application release."
           }
           if ($LASTEXITCODE -ne 0) { throw "Could not publish the versioned GitHub Release." }
           gh release view windows *> $null

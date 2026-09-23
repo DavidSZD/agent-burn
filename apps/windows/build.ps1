@@ -22,11 +22,25 @@ if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
     exit 1
 }
 
-# Use the developer's local updater signing key when it exists. The private
-# key remains outside the repository and is never copied into the app bundle.
-$updaterKey = Join-Path $env:LOCALAPPDATA "Agent Burn\updater\signing.key"
-if ($Release -and (Test-Path -LiteralPath $updaterKey) -and -not $env:TAURI_SIGNING_PRIVATE_KEY -and -not $env:TAURI_SIGNING_PRIVATE_KEY_PATH) {
-    $env:TAURI_SIGNING_PRIVATE_KEY_PATH = $updaterKey
+# Load the developer's local updater signing key when Release mode is requested.
+# Tauri's build command reads TAURI_SIGNING_PRIVATE_KEY; the path-only variable
+# accepted by the signer subcommand is not sufficient for `tauri build`.
+# The key stays outside the repository and is never copied into the app bundle.
+if ($Release -and [string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY)) {
+    $updaterKey = $env:TAURI_SIGNING_PRIVATE_KEY_PATH
+    if ([string]::IsNullOrWhiteSpace($updaterKey)) {
+        $updaterKey = Join-Path $env:LOCALAPPDATA "Agent Burn\updater\signing.key"
+    }
+
+    if (Test-Path -LiteralPath $updaterKey) {
+        $env:TAURI_SIGNING_PRIVATE_KEY = [System.IO.File]::ReadAllText($updaterKey)
+    } else {
+        throw "Updater signing key not found. Set TAURI_SIGNING_PRIVATE_KEY or provide a key at $updaterKey."
+    }
+}
+
+if ($Release -and $null -eq $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD) {
+    $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = ""
 }
 
 # 2. Vérification de WebView2

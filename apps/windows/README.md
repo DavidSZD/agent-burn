@@ -63,7 +63,7 @@ The release bundle contains `agent-burn.exe`; the desktop application never down
 Build or download an installer with a version newer than the installed copy, close Agent Burn from its tray menu, then launch it in update mode:
 
 ```powershell
-Start-Process '.\Agent Burn_0.1.60_x64-setup.exe' -ArgumentList '/UPDATE' -Wait
+Start-Process '.\Agent Burn_0.1.61_x64-setup.exe' -ArgumentList '/UPDATE' -Wait
 ```
 
 Update mode replaces the application in place without showing the uninstall/data-removal flow. Dashboard settings and history under `%LOCALAPPDATA%\Agent Burn` are preserved. Automatic signed update checks are enabled by default and run at most once per day while the app is open, including at startup. You can also check manually with **Check now**. An update is never installed without pressing **Install update** and confirming. The release feed is configured in `tauri.conf.json`.
