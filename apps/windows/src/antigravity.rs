@@ -8,6 +8,9 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 
+const GEMINI_QUOTA_CACHE_VERSION_KEY: &str = "geminiQuotaVersion";
+const GEMINI_QUOTA_CACHE_VERSION: u64 = 1;
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AntigravitySession {
     pub id: String,
@@ -522,17 +525,49 @@ fn plan_with_agy_usage(existing: Option<AntigravityPlan>, usage: AgyUsage) -> An
         session_remaining: None,
         session_reset_time: None,
     });
-    plan.weekly_remaining = usage.weekly_remaining;
-    plan.weekly_reset_time = usage.weekly_reset_time;
-    plan.session_remaining = usage.session_remaining;
-    plan.session_reset_time = usage.session_reset_time;
+    if plan.weekly_remaining.is_none() && usage.weekly_remaining.is_some() {
+        plan.weekly_remaining = usage.weekly_remaining;
+        plan.weekly_reset_time = usage.weekly_reset_time;
+    }
+    if plan.session_remaining.is_none() && usage.session_remaining.is_some() {
+        plan.session_remaining = usage.session_remaining;
+        plan.session_reset_time = usage.session_reset_time;
+    }
     plan
 }
 
 fn plan_has_complete_windows(plan: Option<&AntigravityPlan>) -> bool {
-    // The direct agy-quota endpoint guarantees the authoritative weekly
-    // REQUESTS bucket but does not promise a separate 5-hour window.
-    plan.is_some_and(|value| value.weekly_remaining.is_some())
+    plan.is_some_and(|value| {
+        value.weekly_remaining.is_some()
+            && value.weekly_reset_time.is_some()
+            && value.session_remaining.is_some()
+            && value.session_reset_time.is_some()
+    })
+}
+
+fn merge_missing_quota_windows(current: &mut Option<AntigravityPlan>, fallback: AntigravityPlan) {
+    let Some(current) = current else {
+        *current = Some(fallback);
+        return;
+    };
+
+    if current.weekly_remaining.is_none() {
+        current.weekly_remaining = fallback.weekly_remaining;
+        current.weekly_reset_time = fallback.weekly_reset_time;
+    }
+    if current.session_remaining.is_none() {
+        current.session_remaining = fallback.session_remaining;
+        current.session_reset_time = fallback.session_reset_time;
+    }
+    if current.quotas.is_empty() {
+        current.quotas = fallback.quotas;
+    }
+    if current.email.is_none() {
+        current.email = fallback.email;
+    }
+    if current.name.is_none() {
+        current.name = fallback.name;
+    }
 }
 
 fn get_live_antigravity_plan() -> Option<AntigravityPlan> {
@@ -547,16 +582,18 @@ fn get_live_antigravity_plan() -> Option<AntigravityPlan> {
         }
     }
 
-    // Use the headless cloud endpoint first. The daily-cloudcode host returns
-    // the account's real weekly bucket without requiring Antigravity to be
-    // open. Fall back to the local language server, then `agy`, only when the
-    // direct API cannot provide a weekly quota.
+    // Use the headless cloud endpoint first. Fill either missing Gemini
+    // window from the local language server, then `agy`; never blend provider
+    // pools or replace a valid higher-priority window with a fallback value.
     let mut plan = crate::antigravity_cloud::fetch_plan();
     if !plan_has_complete_windows(plan.as_ref()) {
-        plan = get_language_server_plan().or(plan);
+        if let Some(local_plan) = get_language_server_plan() {
+            merge_missing_quota_windows(&mut plan, local_plan);
+        }
         if !plan_has_complete_windows(plan.as_ref()) {
             if let Some(usage) = get_agy_usage() {
-                plan = Some(plan_with_agy_usage(plan, usage));
+                let existing = plan.take();
+                plan = Some(plan_with_agy_usage(existing, usage));
             }
         }
     }
@@ -595,17 +632,37 @@ fn cached_plan_path() -> PathBuf {
 }
 
 fn save_cached_antigravity_plan(plan: &AntigravityPlan) {
-    if let Ok(bytes) = serde_json::to_vec_pretty(plan) {
+    if let Some(bytes) = serialize_cached_antigravity_plan(plan) {
         let _ = fs::write(cached_plan_path(), bytes);
     }
+}
+
+fn serialize_cached_antigravity_plan(plan: &AntigravityPlan) -> Option<Vec<u8>> {
+    let mut value = serde_json::to_value(plan).ok()?;
+    value.as_object_mut()?.insert(
+        GEMINI_QUOTA_CACHE_VERSION_KEY.to_string(),
+        serde_json::json!(GEMINI_QUOTA_CACHE_VERSION),
+    );
+    serde_json::to_vec_pretty(&value).ok()
+}
+
+fn deserialize_cached_antigravity_plan(bytes: &[u8]) -> Option<AntigravityPlan> {
+    let value = serde_json::from_slice::<serde_json::Value>(bytes).ok()?;
+    if value
+        .get(GEMINI_QUOTA_CACHE_VERSION_KEY)
+        .and_then(serde_json::Value::as_u64)
+        != Some(GEMINI_QUOTA_CACHE_VERSION)
+    {
+        return None;
+    }
+    serde_json::from_value(value).ok()
 }
 
 fn load_cached_antigravity_plan() -> Option<AntigravityPlan> {
     fs::read(cached_plan_path())
         .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .filter(|plan: &AntigravityPlan| !plan.plan.eq_ignore_ascii_case("unknown"))
-        .or_else(load_plan_from_report_cache)
+        .and_then(|bytes| deserialize_cached_antigravity_plan(&bytes))
+        .filter(|plan| !plan.plan.eq_ignore_ascii_case("unknown"))
         .or_else(|| {
             plan_name_from_quota_history(&crate::archive::load_quota_history()).map(|plan| {
                 AntigravityPlan {
@@ -636,51 +693,6 @@ fn plan_name_from_quota_history(history: &serde_json::Value) -> Option<String> {
                 .filter(|plan| !plan.is_empty() && !plan.eq_ignore_ascii_case("unknown"))
                 .map(str::to_string)
         })
-    })
-}
-
-fn load_plan_from_report_cache() -> Option<AntigravityPlan> {
-    let cached = crate::archive::load_report_cache();
-    let agent = cached
-        .pointer("/summary/subscription/agents")?
-        .as_array()?
-        .iter()
-        .find(|agent| agent.get("agent").and_then(|value| value.as_str()) == Some("antigravity"))?;
-    let window = agent.get("window");
-    let short_window = agent.get("shortWindow");
-    let plan_name = agent.get("plan").and_then(|value| value.as_str())?;
-    if plan_name.eq_ignore_ascii_case("unknown") || plan_name.trim().is_empty() {
-        return None;
-    }
-    Some(AntigravityPlan {
-        plan: plan_name.to_string(),
-        price_per_month: agent
-            .get("pricePerMonth")
-            .and_then(|value| value.as_f64())
-            .unwrap_or(0.0),
-        email: agent
-            .get("account")
-            .and_then(|value| value.as_str())
-            .map(str::to_string),
-        name: None,
-        quotas: serde_json::from_value(agent.get("liveLimits").cloned().unwrap_or_default())
-            .unwrap_or_default(),
-        weekly_remaining: window
-            .and_then(|value| value.get("usedPercent"))
-            .and_then(|value| value.as_f64())
-            .map(|used| 100.0 - used),
-        weekly_reset_time: window
-            .and_then(|value| value.get("resetDate"))
-            .and_then(|value| value.as_str())
-            .map(str::to_string),
-        session_remaining: short_window
-            .and_then(|value| value.get("usedPercent"))
-            .and_then(|value| value.as_f64())
-            .map(|used| 100.0 - used),
-        session_reset_time: short_window
-            .and_then(|value| value.get("resetDate"))
-            .and_then(|value| value.as_str())
-            .map(str::to_string),
     })
 }
 
@@ -725,18 +737,23 @@ fn parse_live_status(status: &serde_json::Value) -> Option<AntigravityPlan> {
         .as_array()?
         .iter()
         .filter_map(|config| {
+            let model_id = config.get("modelId").and_then(|value| value.as_str());
+            let label = config.get("label").and_then(|value| value.as_str())?;
+            if !model_id
+                .or(Some(label))
+                .is_some_and(|value| value.to_ascii_lowercase().contains("gemini"))
+            {
+                return None;
+            }
             let quota = config.get("quotaInfo")?;
             Some(AntigravityQuotaInfo {
-                label: config.get("label")?.as_str()?.to_string(),
+                label: label.to_string(),
                 remaining: quota.get("remainingFraction")?.as_f64()? * 100.0,
                 reset_time: quota
                     .get("resetTime")
                     .and_then(|value| value.as_str())
                     .map(str::to_string),
-                model_id: config
-                    .get("modelId")
-                    .and_then(|value| value.as_str())
-                    .map(str::to_string),
+                model_id: model_id.map(str::to_string),
             })
         })
         .collect();
@@ -751,6 +768,28 @@ fn parse_live_status(status: &serde_json::Value) -> Option<AntigravityPlan> {
     if let Some(quota_summary) = status.get("quotaSummary") {
         if let Some(groups) = quota_summary.get("groups").and_then(|g| g.as_array()) {
             for group in groups {
+                let is_gemini_group = group
+                    .get("displayName")
+                    .and_then(|value| value.as_str())
+                    .map(|name| name.to_ascii_lowercase().contains("gemini"))
+                    .unwrap_or_else(|| {
+                        group
+                            .get("buckets")
+                            .and_then(|value| value.as_array())
+                            .is_some_and(|buckets| {
+                                buckets.iter().any(|bucket| {
+                                    bucket
+                                        .get("bucketId")
+                                        .and_then(|value| value.as_str())
+                                        .is_some_and(|id| {
+                                            id.to_ascii_lowercase().contains("gemini")
+                                        })
+                                })
+                            })
+                    });
+                if !is_gemini_group {
+                    continue;
+                }
                 if let Some(buckets) = group.get("buckets").and_then(|b| b.as_array()) {
                     for bucket in buckets {
                         let window = bucket.get("window").and_then(|w| w.as_str()).unwrap_or("");
@@ -1041,6 +1080,23 @@ fn read_varint(b: &[u8], mut pos: usize) -> (u64, usize) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn live_sources_are_considered_complete_only_with_both_gemini_windows() {
+        let partial = AntigravityPlan {
+            plan: "Pro".to_string(),
+            price_per_month: 20.0,
+            email: None,
+            name: None,
+            quotas: Vec::new(),
+            weekly_remaining: Some(76.0),
+            weekly_reset_time: Some("2026-10-01T00:00:00Z".to_string()),
+            session_remaining: Some(92.0),
+            session_reset_time: None,
+        };
+
+        assert!(!plan_has_complete_windows(Some(&partial)));
+    }
+
     fn varint(mut value: u64) -> Vec<u8> {
         let mut bytes = Vec::new();
         loop {
@@ -1187,6 +1243,126 @@ mod tests {
     }
 
     #[test]
+    fn live_status_keeps_only_gemini_quota_limits() {
+        let status = serde_json::json!({
+            "userStatus": {
+                "planStatus": {"planInfo": {"planName": "Pro"}},
+                "cascadeModelConfigData": {"clientModelConfigs": [
+                    {"label": "Gemini Pro", "modelId": "gemini-pro", "quotaInfo": {"remainingFraction": 0.76, "resetTime": "2026-10-01T00:00:00Z"}},
+                    {"label": "Claude Sonnet", "modelId": "claude-sonnet-4-6", "quotaInfo": {"remainingFraction": 0.40, "resetTime": "2026-09-24T21:00:00Z"}}
+                ]}
+            },
+            "quotaSummary": {"groups": [
+                {"displayName": "Gemini Models", "buckets": [
+                    {"bucketId": "gemini-weekly", "window": "weekly", "remainingFraction": 0.76, "resetTime": "2026-10-01T00:00:00Z"},
+                    {"bucketId": "gemini-5h", "window": "5h", "remainingFraction": 0.92, "resetTime": "2026-09-25T02:00:00Z"}
+                ]},
+                {"displayName": "Claude and GPT models", "buckets": [
+                    {"bucketId": "claude-weekly", "window": "weekly", "remainingFraction": 0.80, "resetTime": "2026-10-01T01:00:00Z"},
+                    {"bucketId": "claude-5h", "window": "5h", "remainingFraction": 0.40, "resetTime": "2026-09-24T21:00:00Z"}
+                ]}
+            ]}
+        });
+
+        let plan = parse_live_status(&status).expect("live plan");
+
+        assert_eq!(plan.weekly_remaining, Some(76.0));
+        assert_eq!(
+            plan.weekly_reset_time.as_deref(),
+            Some("2026-10-01T00:00:00Z")
+        );
+        assert_eq!(plan.session_remaining, Some(92.0));
+        assert_eq!(
+            plan.session_reset_time.as_deref(),
+            Some("2026-09-25T02:00:00Z")
+        );
+        assert!(plan.quotas.iter().all(|quota| quota
+            .model_id
+            .as_deref()
+            .is_some_and(|id| id.contains("gemini"))));
+    }
+
+    #[test]
+    fn merging_fallback_quota_only_fills_missing_windows() {
+        let mut primary = Some(AntigravityPlan {
+            plan: "Pro".to_string(),
+            price_per_month: 20.0,
+            email: None,
+            name: None,
+            quotas: Vec::new(),
+            weekly_remaining: Some(76.0),
+            weekly_reset_time: Some("2026-10-01T00:00:00Z".to_string()),
+            session_remaining: None,
+            session_reset_time: None,
+        });
+        let fallback = AntigravityPlan {
+            plan: "Pro".to_string(),
+            price_per_month: 20.0,
+            email: None,
+            name: None,
+            quotas: Vec::new(),
+            weekly_remaining: Some(40.0),
+            weekly_reset_time: Some("2026-09-24T21:00:00Z".to_string()),
+            session_remaining: Some(92.0),
+            session_reset_time: Some("2026-09-25T02:00:00Z".to_string()),
+        };
+
+        merge_missing_quota_windows(&mut primary, fallback);
+
+        let merged = primary.expect("primary plan is retained");
+        assert_eq!(merged.weekly_remaining, Some(76.0));
+        assert_eq!(
+            merged.weekly_reset_time.as_deref(),
+            Some("2026-10-01T00:00:00Z")
+        );
+        assert_eq!(merged.session_remaining, Some(92.0));
+        assert_eq!(
+            merged.session_reset_time.as_deref(),
+            Some("2026-09-25T02:00:00Z")
+        );
+    }
+
+    #[test]
+    fn legacy_antigravity_cache_without_gemini_scope_is_rejected() {
+        let legacy = serde_json::json!({
+            "plan": "Pro",
+            "pricePerMonth": 20.0,
+            "email": null,
+            "name": null,
+            "quotas": [],
+            "weekly_remaining": 39.6,
+            "weekly_reset_time": "2026-09-24T19:54:31Z",
+            "session_remaining": 92.0,
+            "session_reset_time": "2026-09-25T02:00:00Z"
+        });
+
+        assert!(
+            deserialize_cached_antigravity_plan(&serde_json::to_vec(&legacy).unwrap()).is_none()
+        );
+    }
+
+    #[test]
+    fn versioned_antigravity_cache_round_trips_gemini_windows() {
+        let plan = AntigravityPlan {
+            plan: "Pro".to_string(),
+            price_per_month: 20.0,
+            email: None,
+            name: None,
+            quotas: Vec::new(),
+            weekly_remaining: Some(76.0),
+            weekly_reset_time: Some("2026-10-01T00:00:00Z".to_string()),
+            session_remaining: Some(92.0),
+            session_reset_time: Some("2026-09-25T02:00:00Z".to_string()),
+        };
+
+        let bytes = serialize_cached_antigravity_plan(&plan).expect("cache serializes");
+        let restored = deserialize_cached_antigravity_plan(&bytes).expect("versioned cache loads");
+
+        assert_eq!(restored.weekly_remaining, Some(76.0));
+        assert_eq!(restored.session_remaining, Some(92.0));
+    }
+
+    #[test]
     fn agy_usage_output_extracts_gemini_weekly_and_five_hour_limits() {
         let output = "Gemini Models\tWeekly Limit Remaining\t88%\t2026-09-23T04:34:22Z\n\
 Gemini Models\tFive Hour Limit Remaining\t100%\t2026-09-16T20:31:31Z\n\
@@ -1241,6 +1417,40 @@ Claude and GPT models\tWeekly Limit Remaining\t97%\t2026-09-23T15:31:31Z\n";
         assert_eq!(merged.email.as_deref(), Some("user@example.test"));
         assert_eq!(merged.weekly_remaining, Some(81.0));
         assert_eq!(merged.session_remaining, Some(64.0));
+    }
+
+    #[test]
+    fn agy_fallback_does_not_replace_an_existing_quota_window() {
+        let plan = AntigravityPlan {
+            plan: "Pro".to_string(),
+            price_per_month: 20.0,
+            email: None,
+            name: None,
+            quotas: Vec::new(),
+            weekly_remaining: Some(76.0),
+            weekly_reset_time: Some("2026-10-01T01:04:33Z".to_string()),
+            session_remaining: None,
+            session_reset_time: None,
+        };
+        let usage = AgyUsage {
+            weekly_remaining: Some(40.0),
+            weekly_reset_time: Some("2026-10-01T14:54:31Z".to_string()),
+            session_remaining: Some(82.0),
+            session_reset_time: Some("2026-09-24T23:44:59Z".to_string()),
+        };
+
+        let merged = plan_with_agy_usage(Some(plan), usage);
+
+        assert_eq!(merged.weekly_remaining, Some(76.0));
+        assert_eq!(
+            merged.weekly_reset_time.as_deref(),
+            Some("2026-10-01T01:04:33Z")
+        );
+        assert_eq!(merged.session_remaining, Some(82.0));
+        assert_eq!(
+            merged.session_reset_time.as_deref(),
+            Some("2026-09-24T23:44:59Z")
+        );
     }
 
     #[test]
