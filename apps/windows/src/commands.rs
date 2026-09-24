@@ -5,6 +5,8 @@ use crate::app::{
 use std::{collections::BTreeMap, path::Path};
 use tauri::State;
 
+const GEMINI_QUOTA_SCOPE: &str = "gemini";
+
 #[tauri::command]
 pub async fn get_summary(
     period: Option<String>,
@@ -516,11 +518,6 @@ fn merge_antigravity(
         let root = summary
             .as_object_mut()
             .ok_or_else(|| "Le résumé CLI doit être un objet JSON.".to_string())?;
-        let limiting = plan
-            .quotas
-            .iter()
-            .min_by(|a, b| a.remaining.total_cmp(&b.remaining));
-
         let window_val = if let (Some(rem), Some(reset_time)) =
             (plan.weekly_remaining, &plan.weekly_reset_time)
         {
@@ -541,24 +538,7 @@ fn merge_antigravity(
                 "elapsedMinutes": elapsed_mins,
             }))
         } else {
-            limiting.map(|quota| {
-                let elapsed_mins = quota
-                    .reset_time
-                    .as_deref()
-                    .and_then(|rt| chrono::DateTime::parse_from_rfc3339(rt).ok())
-                    .map(|reset_dt| {
-                        let total_mins = 7.0 * 24.0 * 60.0;
-                        let rem_mins = (reset_dt.with_timezone(&chrono::Utc) - chrono::Utc::now())
-                            .num_seconds() as f64
-                            / 60.0;
-                        (total_mins - rem_mins).clamp(0.0, total_mins)
-                    });
-                serde_json::json!({
-                    "usedPercent": (100.0 - quota.remaining).clamp(0.0, 100.0),
-                    "resetDate": quota.reset_time,
-                    "elapsedMinutes": elapsed_mins,
-                })
-            })
+            None
         };
 
         let short_window_val = if let (Some(rem), Some(reset_time)) =
@@ -588,6 +568,7 @@ fn merge_antigravity(
             "plan": plan.plan,
             "pricePerMonth": if plan.price_per_month > 0.0 { Some(plan.price_per_month) } else { None },
             "account": plan.email.as_ref().or(plan.name.as_ref()),
+            "quotaScope": GEMINI_QUOTA_SCOPE,
             "liveLimits": plan.quotas,
             "window": window_val,
             "shortWindow": short_window_val,
@@ -728,9 +709,42 @@ pub fn open_project_folder(path: String) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn get_report_cache() -> Result<serde_json::Value, String> {
-    tokio::task::spawn_blocking(crate::archive::load_report_cache)
-        .await
-        .map_err(|error| format!("Erreur lecture cache rapports: {error}"))
+    tokio::task::spawn_blocking(|| {
+        let mut cache = crate::archive::load_report_cache();
+        remove_unverified_antigravity_quotas(&mut cache);
+        cache
+    })
+    .await
+    .map_err(|error| format!("Erreur lecture cache rapports: {error}"))
+}
+
+fn remove_unverified_antigravity_quotas(cache: &mut serde_json::Value) {
+    fn sanitize_report(report: &mut serde_json::Value) {
+        if let Some(agents) = report
+            .pointer_mut("/subscription/agents")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            agents.retain(|agent| {
+                agent.get("agent").and_then(serde_json::Value::as_str) != Some("antigravity")
+                    || agent.get("quotaScope").and_then(serde_json::Value::as_str)
+                        == Some(GEMINI_QUOTA_SCOPE)
+            });
+        }
+    }
+
+    if let Some(summary) = cache.get_mut("summary") {
+        sanitize_report(summary);
+    }
+    if let Some(periods) = cache
+        .get_mut("periods")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        for period in periods.values_mut() {
+            if let Some(report) = period.get_mut("reportData") {
+                sanitize_report(report);
+            }
+        }
+    }
 }
 
 #[tauri::command]
@@ -1000,11 +1014,88 @@ mod tests {
             .find(|a| a["agent"] == "antigravity")
             .expect("antigravity in subscription");
         assert_eq!(ag["plan"], "Pro");
+        assert_eq!(ag["quotaScope"], "gemini");
         let win = &ag["window"];
         assert!((win["usedPercent"].as_f64().unwrap() - 4.5).abs() < 0.01);
         assert!(win["elapsedMinutes"].as_f64().is_some());
         let swin = &ag["shortWindow"];
         assert!((swin["usedPercent"].as_f64().unwrap() - 20.0).abs() < 0.01);
         assert!(swin["elapsedMinutes"].as_f64().is_some());
+    }
+
+    #[test]
+    fn antigravity_merge_never_promotes_an_untyped_model_quota_to_weekly() {
+        let mut summary = serde_json::json!({
+            "totals": {"totalCost": 0.0, "totalTokens": 0},
+            "agents": [], "models": [], "daily": []
+        });
+        let antigravity = crate::antigravity::AntigravitySummary {
+            period: "all".into(),
+            session_count: 0,
+            total_tokens: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            total_cost: 0.0,
+            top_models: vec![],
+            sessions: vec![],
+            daily: vec![],
+            plan: Some(crate::antigravity::AntigravityPlan {
+                plan: "Pro".into(),
+                price_per_month: 20.0,
+                email: None,
+                name: None,
+                quotas: vec![crate::antigravity::AntigravityQuotaInfo {
+                    label: "Gemini Pro".into(),
+                    remaining: 92.0,
+                    reset_time: Some("2026-09-25T02:00:00Z".into()),
+                    model_id: Some("gemini-pro".into()),
+                }],
+                weekly_remaining: None,
+                weekly_reset_time: None,
+                session_remaining: Some(92.0),
+                session_reset_time: Some("2026-09-25T02:00:00Z".into()),
+            }),
+        };
+
+        merge_antigravity(&mut summary, &antigravity).expect("merge summary");
+
+        let agent = &summary["subscription"]["agents"][0];
+        assert!(agent["window"].is_null());
+        assert_eq!(agent["shortWindow"]["usedPercent"], 8.0);
+    }
+
+    #[test]
+    fn report_cache_hides_legacy_antigravity_quota_but_keeps_scoped_data() {
+        let mut cache = serde_json::json!({
+            "summary": {"subscription": {"agents": [
+                {"agent": "antigravity", "window": {"usedPercent": 60.4}},
+                {"agent": "codex", "window": {"usedPercent": 12.0}}
+            ]}},
+            "periods": {
+                "all": {"reportData": {"subscription": {"agents": [
+                    {"agent": "antigravity", "window": {"usedPercent": 24.0}, "quotaScope": "gemini"},
+                    {"agent": "cursor", "window": null}
+                ]}}}
+            }
+        });
+
+        remove_unverified_antigravity_quotas(&mut cache);
+
+        assert_eq!(
+            cache["summary"]["subscription"]["agents"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            cache["summary"]["subscription"]["agents"][0]["agent"],
+            "codex"
+        );
+        assert_eq!(
+            cache["periods"]["all"]["reportData"]["subscription"]["agents"][0]["quotaScope"],
+            "gemini"
+        );
     }
 }

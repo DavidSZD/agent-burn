@@ -1,6 +1,6 @@
 {
 	"name": "@agent-burn/windows",
-	"version": "0.1.66",
+	"version": "0.1.67",
 	"private": true,
 	"description": "Agent Burn Windows system tray and dashboard application",
 	"type": "module",

@@ -43,20 +43,13 @@ pub(crate) fn build_plan_from_responses(
     let mut session_preferred = false;
     let mut weekly_preferred = false;
 
-    // The open-source reference treats retrieveUserQuota's REQUESTS buckets
-    // as the authoritative account meter. Some responses also contain a
-    // five-hour bucket; never let that short window become the dashboard's
-    // weekly window just because it has the lower remaining percentage.
-    if let Some((remaining, reset_time)) = authoritative_quota_window(quota_buckets) {
-        weekly_remaining = Some(remaining);
-        weekly_reset_time = reset_time;
-    }
-    let weekly_from_authoritative_endpoint = weekly_remaining.is_some();
-
+    // The quota summary explicitly labels both windows and separates Gemini
+    // from Claude/GPT. Use that classification before considering the
+    // per-model retrieveUserQuota buckets, which may omit their window type.
     if let Some(summary) = quota_summary {
         let summary = summary.get("response").unwrap_or(summary);
         if let Some(groups) = summary.get("groups").and_then(Value::as_array) {
-            for group in groups {
+            for group in groups.iter().filter(|group| is_gemini_group(group)) {
                 let Some(buckets) = group.get("buckets").and_then(Value::as_array) else {
                     continue;
                 };
@@ -75,16 +68,14 @@ pub(crate) fn build_plan_from_responses(
                         .and_then(Value::as_str)
                         .unwrap_or_default();
                     match quota_window_kind(bucket) {
-                        Some(QuotaWindowKind::Weekly) if !weekly_from_authoritative_endpoint => {
-                            update_window(
-                                &mut weekly_remaining,
-                                &mut weekly_reset_time,
-                                remaining,
-                                reset,
-                                bucket_id.eq_ignore_ascii_case("gemini-weekly"),
-                                &mut weekly_preferred,
-                            )
-                        }
+                        Some(QuotaWindowKind::Weekly) => update_window(
+                            &mut weekly_remaining,
+                            &mut weekly_reset_time,
+                            remaining,
+                            reset,
+                            bucket_id.eq_ignore_ascii_case("gemini-weekly"),
+                            &mut weekly_preferred,
+                        ),
                         Some(QuotaWindowKind::FiveHour) => update_window(
                             &mut session_remaining,
                             &mut session_reset_time,
@@ -93,11 +84,17 @@ pub(crate) fn build_plan_from_responses(
                             bucket_id.eq_ignore_ascii_case("gemini-5h"),
                             &mut session_preferred,
                         ),
-                        Some(QuotaWindowKind::Weekly) => {}
                         None => {}
                     }
                 }
             }
+        }
+    }
+
+    if weekly_remaining.is_none() {
+        if let Some((remaining, reset_time)) = authoritative_quota_window(quota_buckets) {
+            weekly_remaining = Some(remaining);
+            weekly_reset_time = reset_time;
         }
     }
 
@@ -149,37 +146,48 @@ fn quota_window_kind(bucket: &Value) -> Option<QuotaWindowKind> {
     None
 }
 
+fn is_gemini_quota_bucket(bucket: &Value) -> bool {
+    ["modelId", "bucketId"].iter().any(|field| {
+        bucket
+            .get(*field)
+            .and_then(Value::as_str)
+            .is_some_and(|id| id.to_ascii_lowercase().contains("gemini"))
+    })
+}
+
+fn is_gemini_group(group: &Value) -> bool {
+    if let Some(name) = group.get("displayName").and_then(Value::as_str) {
+        return name.to_ascii_lowercase().contains("gemini");
+    }
+    group
+        .get("buckets")
+        .and_then(Value::as_array)
+        .is_some_and(|buckets| buckets.iter().any(is_gemini_quota_bucket))
+}
+
 fn authoritative_quota_window(quota: Option<&Value>) -> Option<(f64, Option<String>)> {
     let buckets = quota
         .and_then(|value| value.get("response").unwrap_or(value).get("buckets"))
         .and_then(Value::as_array)?;
 
-    // Prefer explicitly weekly buckets. The direct endpoint normally returns
-    // only REQUESTS buckets, in which case tokenType=REQUESTS is the signal.
-    // If neither marker exists, retain compatibility with older payloads and
-    // accept all non-five-hour buckets.
-    let mut candidates = buckets
+    // retrieveUserQuota also contains provider pools for Claude/GPT. Only
+    // Gemini model buckets may feed Antigravity's Gemini weekly meter.
+    let gemini_buckets = buckets
         .iter()
+        .filter(|bucket| is_gemini_quota_bucket(bucket))
+        .collect::<Vec<_>>();
+    if gemini_buckets.is_empty() {
+        return None;
+    }
+
+    // A generic REQUESTS bucket is not enough to distinguish weekly from a
+    // five-hour model pool. Only use the direct endpoint when the payload
+    // explicitly identifies a weekly bucket.
+    let candidates = gemini_buckets
+        .iter()
+        .copied()
         .filter(|bucket| quota_window_kind(bucket) == Some(QuotaWindowKind::Weekly))
         .collect::<Vec<_>>();
-    if candidates.is_empty() {
-        candidates = buckets
-            .iter()
-            .filter(|bucket| {
-                quota_window_kind(bucket) != Some(QuotaWindowKind::FiveHour)
-                    && bucket
-                        .get("tokenType")
-                        .and_then(Value::as_str)
-                        .is_some_and(|token_type| token_type.eq_ignore_ascii_case("REQUESTS"))
-            })
-            .collect();
-    }
-    if candidates.is_empty() {
-        candidates = buckets
-            .iter()
-            .filter(|bucket| quota_window_kind(bucket) != Some(QuotaWindowKind::FiveHour))
-            .collect();
-    }
 
     let tightest = candidates
         .iter()
@@ -295,6 +303,9 @@ fn model_quotas(available_models: Option<&Value>) -> Vec<AntigravityQuotaInfo> {
     let mut quotas = models
         .iter()
         .filter_map(|(model_id, model)| {
+            if !model_id.to_ascii_lowercase().contains("gemini") {
+                return None;
+            }
             let quota = model.get("quotaInfo")?;
             let remaining = quota.get("remainingFraction")?.as_f64()?;
             Some(AntigravityQuotaInfo {
@@ -327,6 +338,7 @@ fn summary_quotas(summary: Option<&Value>) -> Vec<AntigravityQuotaInfo> {
 
     groups
         .iter()
+        .filter(|group| is_gemini_group(group))
         .flat_map(|group| {
             let group_label = group
                 .get("displayName")
@@ -365,6 +377,9 @@ fn bucket_quotas(quota: Option<&Value>) -> Vec<AntigravityQuotaInfo> {
         .into_iter()
         .flatten()
         .filter_map(|bucket| {
+            if !is_gemini_quota_bucket(bucket) {
+                return None;
+            }
             let remaining = bucket.get("remainingFraction")?.as_f64()?;
             let model_id = bucket
                 .get("modelId")
@@ -832,12 +847,16 @@ mod tests {
         assert_eq!(plan.plan, "Pro");
         assert_eq!(plan.quotas[0].model_id.as_deref(), Some("gemini-3-flash"));
         assert_eq!(plan.quotas[0].remaining, 86.0);
-        assert_eq!(plan.weekly_remaining, Some(86.0));
+        assert_eq!(plan.weekly_remaining, Some(73.0));
+        assert_eq!(
+            plan.weekly_reset_time.as_deref(),
+            Some("2026-09-23T04:34:22Z")
+        );
         assert_eq!(plan.session_remaining, Some(88.0));
     }
 
     #[test]
-    fn cloud_plan_falls_back_to_quota_buckets_when_summary_is_unavailable() {
+    fn cloud_plan_ignores_non_gemini_buckets_when_summary_is_unavailable() {
         let load = json!({"currentTier": {"id": "free-tier", "name": "Antigravity"}});
         let quota = json!({"buckets": [
             {"tokenType": "WTUS", "modelId": "chat_20706", "remainingFraction": 0.42, "resetTime": "2026-09-17T09:34:22Z"}
@@ -847,9 +866,23 @@ mod tests {
             .expect("quota buckets should produce a plan");
 
         assert_eq!(plan.plan, "Free");
-        assert_eq!(plan.quotas[0].model_id.as_deref(), Some("chat_20706"));
-        assert_eq!(plan.quotas[0].remaining, 42.0);
-        assert_eq!(plan.weekly_remaining, Some(42.0));
+        assert!(plan.quotas.is_empty());
+        assert_eq!(plan.weekly_remaining, None);
+        assert_eq!(plan.session_remaining, None);
+    }
+
+    #[test]
+    fn untyped_gemini_request_buckets_are_not_misreported_as_weekly() {
+        let load = json!({"currentTier": {"id": "pro-tier", "name": "Google AI Pro"}});
+        let quota = json!({"buckets": [
+            {"tokenType": "REQUESTS", "modelId": "gemini-3.8-flash", "remainingFraction": 0.92, "resetTime": "2026-09-25T02:00:00Z"}
+        ]});
+
+        let plan = build_plan_from_responses(&load, None, None, Some(&quota))
+            .expect("account plan is available");
+
+        assert_eq!(plan.weekly_remaining, None);
+        assert_eq!(plan.weekly_reset_time, None);
     }
 
     #[test]
@@ -880,11 +913,81 @@ mod tests {
     }
 
     #[test]
+    fn cloud_plan_uses_only_gemini_models_for_both_quota_windows() {
+        let load = json!({"currentTier": {"id": "pro-tier", "name": "Google AI Pro"}});
+        let summary = json!({"groups": [
+            {"displayName": "Gemini Models", "buckets": [
+                {"bucketId": "gemini-weekly", "window": "weekly", "remainingFraction": 0.76, "resetTime": "2026-10-01T00:00:00Z"},
+                {"bucketId": "gemini-5h", "window": "5h", "remainingFraction": 0.92, "resetTime": "2026-09-25T02:00:00Z"}
+            ]},
+            {"displayName": "Claude and GPT models", "buckets": [
+                {"bucketId": "claude-weekly", "window": "weekly", "remainingFraction": 0.80, "resetTime": "2026-10-01T01:00:00Z"},
+                {"bucketId": "claude-5h", "window": "5h", "remainingFraction": 0.40, "resetTime": "2026-09-24T21:00:00Z"}
+            ]}
+        ]});
+        let quota = json!({"buckets": [
+            {"tokenType": "REQUESTS", "modelId": "gemini-3.8-flash", "remainingFraction": 0.92, "resetTime": "2026-09-25T02:00:00Z"},
+            {"tokenType": "REQUESTS", "modelId": "claude-sonnet-4-6", "remainingFraction": 0.396, "resetTime": "2026-09-24T19:54:31Z"}
+        ]});
+
+        let plan = build_plan_from_responses(&load, Some(&summary), None, Some(&quota))
+            .expect("cloud response should produce a plan");
+
+        assert_eq!(plan.weekly_remaining, Some(76.0));
+        assert_eq!(
+            plan.weekly_reset_time.as_deref(),
+            Some("2026-10-01T00:00:00Z")
+        );
+        assert_eq!(plan.session_remaining, Some(92.0));
+        assert_eq!(
+            plan.session_reset_time.as_deref(),
+            Some("2026-09-25T02:00:00Z")
+        );
+        assert!(plan.quotas.iter().all(|quota| quota
+            .model_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with("gemini"))));
+    }
+
+    #[test]
+    fn cloud_summary_fallback_ignores_non_gemini_groups() {
+        let load = json!({"currentTier": {"id": "pro-tier", "name": "Google AI Pro"}});
+        let summary = json!({"groups": [
+            {"displayName": "Gemini Models", "buckets": [
+                {"bucketId": "gemini-weekly", "window": "weekly", "remainingFraction": 0.76, "resetTime": "2026-10-01T00:00:00Z"},
+                {"bucketId": "gemini-5h", "window": "5h", "remainingFraction": 0.92, "resetTime": "2026-09-25T02:00:00Z"}
+            ]},
+            {"displayName": "Claude and GPT models", "buckets": [
+                {"bucketId": "claude-weekly", "window": "weekly", "remainingFraction": 0.80, "resetTime": "2026-10-01T01:00:00Z"},
+                {"bucketId": "claude-5h", "window": "5h", "remainingFraction": 0.40, "resetTime": "2026-09-24T21:00:00Z"}
+            ]}
+        ]});
+
+        let plan = build_plan_from_responses(&load, Some(&summary), None, None)
+            .expect("plan name should be retained without the optional APIs");
+
+        assert_eq!(plan.weekly_remaining, Some(76.0));
+        assert_eq!(
+            plan.weekly_reset_time.as_deref(),
+            Some("2026-10-01T00:00:00Z")
+        );
+        assert_eq!(plan.session_remaining, Some(92.0));
+        assert_eq!(
+            plan.session_reset_time.as_deref(),
+            Some("2026-09-25T02:00:00Z")
+        );
+        assert!(plan
+            .quotas
+            .iter()
+            .all(|quota| quota.label.starts_with("Gemini Models · ")));
+    }
+
+    #[test]
     fn weekly_reset_time_belongs_to_the_tightest_weekly_bucket() {
         let load = json!({"currentTier": {"id": "pro-tier", "name": "Google AI Pro"}});
         let quota = json!({"buckets": [
-            {"window": "weekly", "remainingFraction": 0.86, "resetTime": "2026-09-23T04:34:22Z"},
-            {"window": "weekly", "remainingFraction": 0.94, "resetTime": "2026-09-22T04:34:22Z"}
+            {"modelId": "gemini-weekly-a", "window": "weekly", "remainingFraction": 0.86, "resetTime": "2026-09-23T04:34:22Z"},
+            {"modelId": "gemini-weekly-b", "window": "weekly", "remainingFraction": 0.94, "resetTime": "2026-09-22T04:34:22Z"}
         ]});
 
         let plan = build_plan_from_responses(&load, None, None, Some(&quota))
