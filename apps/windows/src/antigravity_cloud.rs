@@ -54,6 +54,9 @@ pub(crate) fn build_plan_from_responses(
                     continue;
                 };
                 for bucket in buckets {
+                    if !is_gemini_quota_bucket(bucket) {
+                        continue;
+                    }
                     let Some(fraction) = bucket.get("remainingFraction").and_then(Value::as_f64)
                     else {
                         continue;
@@ -349,6 +352,7 @@ fn summary_quotas(summary: Option<&Value>) -> Vec<AntigravityQuotaInfo> {
                 .and_then(Value::as_array)
                 .into_iter()
                 .flatten()
+                .filter(|bucket| is_gemini_quota_bucket(bucket))
                 .filter_map(move |bucket| {
                     let remaining = bucket.get("remainingFraction")?.as_f64()?;
                     let bucket_id = bucket.get("bucketId")?.as_str()?;
@@ -980,6 +984,25 @@ mod tests {
             .quotas
             .iter()
             .all(|quota| quota.label.starts_with("Gemini Models · ")));
+    }
+
+    #[test]
+    fn cloud_summary_rejects_non_gemini_buckets_inside_gemini_group() {
+        let load = json!({"currentTier": {"id": "pro-tier", "name": "Google AI Pro"}});
+        let summary = json!({"groups": [{
+            "displayName": "Gemini Models",
+            "buckets": [
+                {"bucketId": "claude-weekly", "window": "weekly", "remainingFraction": 0.396, "resetTime": "2026-09-24T19:54:31Z"},
+                {"bucketId": "claude-5h", "window": "5h", "remainingFraction": 0.40, "resetTime": "2026-09-24T19:54:31Z"}
+            ]
+        }]});
+
+        let plan = build_plan_from_responses(&load, Some(&summary), None, None)
+            .expect("account plan is available");
+
+        assert_eq!(plan.weekly_remaining, None);
+        assert_eq!(plan.session_remaining, None);
+        assert!(plan.quotas.is_empty());
     }
 
     #[test]

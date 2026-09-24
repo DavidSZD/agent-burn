@@ -525,11 +525,11 @@ fn plan_with_agy_usage(existing: Option<AntigravityPlan>, usage: AgyUsage) -> An
         session_remaining: None,
         session_reset_time: None,
     });
-    if usage.weekly_remaining.is_some() {
+    if plan.weekly_remaining.is_none() && usage.weekly_remaining.is_some() {
         plan.weekly_remaining = usage.weekly_remaining;
         plan.weekly_reset_time = usage.weekly_reset_time;
     }
-    if usage.session_remaining.is_some() {
+    if plan.session_remaining.is_none() && usage.session_remaining.is_some() {
         plan.session_remaining = usage.session_remaining;
         plan.session_reset_time = usage.session_reset_time;
     }
@@ -1417,6 +1417,40 @@ Claude and GPT models\tWeekly Limit Remaining\t97%\t2026-09-23T15:31:31Z\n";
         assert_eq!(merged.email.as_deref(), Some("user@example.test"));
         assert_eq!(merged.weekly_remaining, Some(81.0));
         assert_eq!(merged.session_remaining, Some(64.0));
+    }
+
+    #[test]
+    fn agy_fallback_does_not_replace_an_existing_quota_window() {
+        let plan = AntigravityPlan {
+            plan: "Pro".to_string(),
+            price_per_month: 20.0,
+            email: None,
+            name: None,
+            quotas: Vec::new(),
+            weekly_remaining: Some(76.0),
+            weekly_reset_time: Some("2026-10-01T01:04:33Z".to_string()),
+            session_remaining: None,
+            session_reset_time: None,
+        };
+        let usage = AgyUsage {
+            weekly_remaining: Some(40.0),
+            weekly_reset_time: Some("2026-10-01T14:54:31Z".to_string()),
+            session_remaining: Some(82.0),
+            session_reset_time: Some("2026-09-24T23:44:59Z".to_string()),
+        };
+
+        let merged = plan_with_agy_usage(Some(plan), usage);
+
+        assert_eq!(merged.weekly_remaining, Some(76.0));
+        assert_eq!(
+            merged.weekly_reset_time.as_deref(),
+            Some("2026-10-01T01:04:33Z")
+        );
+        assert_eq!(merged.session_remaining, Some(82.0));
+        assert_eq!(
+            merged.session_reset_time.as_deref(),
+            Some("2026-09-24T23:44:59Z")
+        );
     }
 
     #[test]
