@@ -818,8 +818,75 @@ mod keyring {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_plan_from_responses, form_encode, normalize_plan_name, parse_credential};
-    use serde_json::json;
+    use super::*;
+
+    fn redact_private_fields(value: &mut Value) {
+        match value {
+            Value::Object(object) => {
+                for (key, value) in object.iter_mut() {
+                    if matches!(
+                        key.to_ascii_lowercase().as_str(),
+                        "email"
+                            | "name"
+                            | "userid"
+                            | "accountid"
+                            | "projectid"
+                            | "cloudaicompanionproject"
+                            | "profilepictureurl"
+                            | "accesstoken"
+                            | "refreshtoken"
+                            | "idtoken"
+                            | "clientsecret"
+                            | "csrftoken"
+                    ) {
+                        *value = Value::String("[REDACTED]".to_string());
+                    } else {
+                        redact_private_fields(value);
+                    }
+                }
+            }
+            Value::Array(values) => {
+                for value in values {
+                    redact_private_fields(value);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn cloud_responses_with_token(
+        agent: &ureq::Agent,
+        access_token: &str,
+    ) -> Option<(Value, Option<Value>, Option<Value>, Option<Value>)> {
+        let load = post_json(
+            agent,
+            &format!("{API_HOST}/v1internal:loadCodeAssist"),
+            access_token,
+            &json!({}),
+        )?;
+        let project_body = project_id(&load)
+            .map(|project| json!({"project": project}))
+            .unwrap_or_else(|| json!({}));
+        let quota = post_json(
+            agent,
+            &format!("{API_HOST}/v1internal:retrieveUserQuota"),
+            access_token,
+            &json!({}),
+        );
+        let summary = post_json(
+            agent,
+            &format!("{API_HOST}/v1internal:retrieveUserQuotaSummary"),
+            access_token,
+            &json!({}),
+        );
+        let models = post_json(
+            agent,
+            &format!("{API_HOST}/v1internal:fetchAvailableModels"),
+            access_token,
+            &project_body,
+        );
+        Some((load, quota, summary, models))
+    }
 
     #[test]
     fn cloud_plan_uses_paid_tier_and_authoritative_quota_windows() {
@@ -1053,25 +1120,46 @@ mod tests {
     #[ignore = "requires a local authenticated Antigravity credential"]
     fn authenticated_cloud_fetch_returns_plan_and_quota() {
         let started = std::time::Instant::now();
-        let Some(plan) = super::fetch_plan() else {
-            println!("cloud-api: unavailable");
+        let Some(credential) = read_credential() else {
+            println!("cloud-api: no credential");
             return;
         };
+        let agent = http_agent();
+        let live = valid_access_token(&credential)
+            .and_then(|token| cloud_responses_with_token(&agent, &token).map(|raw| (token, raw)))
+            .or_else(|| {
+                let token = refresh_access_token(&credential.refresh_token)?;
+                cloud_responses_with_token(&agent, &token).map(|raw| (token, raw))
+            });
+        let Some((_access_token, (load, quota, summary, models))) = live else {
+            println!("cloud-api: request failed");
+            return;
+        };
+        let mut responses = json!({
+            "loadCodeAssist": load,
+            "retrieveUserQuota": quota,
+            "retrieveUserQuotaSummary": summary,
+            "fetchAvailableModels": models,
+        });
+        redact_private_fields(&mut responses);
+        let diagnostics_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("quota-diagnostics");
+        std::fs::create_dir_all(&diagnostics_dir).expect("create quota diagnostics directory");
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after Unix epoch")
+            .as_millis();
+        let output_path = diagnostics_dir.join(format!("antigravity-cloud-{stamp}.json"));
+        std::fs::write(
+            &output_path,
+            serde_json::to_vec_pretty(&responses).expect("serialize cloud responses"),
+        )
+        .expect("write cloud response diagnostics");
         println!(
-            "cloud-api: plan={}; weekly={:?}; weekly_reset={:?}; five_hour={:?}; five_hour_reset={:?}; quota_entries={}",
-            plan.plan,
-            plan.weekly_remaining,
-            plan.weekly_reset_time,
-            plan.session_remaining,
-            plan.session_reset_time,
-            plan.quotas.len()
+            "cloud-api full redacted responses: {}",
+            output_path.display()
         );
-        for quota in plan.quotas {
-            println!(
-                "cloud-api quota: label={}; remaining={}; reset={:?}",
-                quota.label, quota.remaining, quota.reset_time
-            );
-        }
         println!("cloud-api duration_ms={}", started.elapsed().as_millis());
     }
 }
