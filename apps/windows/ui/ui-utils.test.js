@@ -38,7 +38,19 @@ import {
   visibleTokenBreakdownEntries,
   visibleAgents,
   isAutomaticUpdateCheckDue,
+  manualRefreshPresentation,
 } from "./ui-utils.js";
+
+test("manual refresh explains when another scan is active", () => {
+  assert.deepEqual(manualRefreshPresentation(true), {
+    disabled: true,
+    message: "Scan in progress · refresh unavailable",
+  });
+  assert.deepEqual(manualRefreshPresentation(false), {
+    disabled: false,
+    message: "",
+  });
+});
 
 test("coalesced saves keep the in-flight write and only the newest pending state", async () => {
   let releaseFirst;
