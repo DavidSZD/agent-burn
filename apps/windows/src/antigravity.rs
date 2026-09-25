@@ -1540,6 +1540,82 @@ Claude and GPT models\tWeekly Limit Remaining\t97%\t2026-09-23T15:31:31Z\n";
         println!("local-server duration_ms={}", started.elapsed().as_millis());
     }
 
+    #[cfg(windows)]
+    fn redact_local_private_fields(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(object) => {
+                for (key, value) in object.iter_mut() {
+                    if matches!(
+                        key.to_ascii_lowercase().as_str(),
+                        "email"
+                            | "name"
+                            | "userid"
+                            | "accountid"
+                            | "projectid"
+                            | "cloudaicompanionproject"
+                            | "profilepictureurl"
+                            | "csrftoken"
+                    ) {
+                        *value = serde_json::Value::String("[REDACTED]".to_string());
+                    } else {
+                        redact_local_private_fields(value);
+                    }
+                }
+            }
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    redact_local_private_fields(value);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    #[ignore = "temporary live diagnostic; prints full local server response with private ids redacted"]
+    fn diagnostic_local_server_raw_response() {
+        let script = r#"$OutputEncoding=[Console]::OutputEncoding=[Text.UTF8Encoding]::new();$p=Get-CimInstance Win32_Process -Filter "Name = 'language_server.exe'"|Select-Object -First 1;if(-not $p){exit 1};$m=[regex]::Match($p.CommandLine,'--csrf_token\s+([^\s]+)');if(-not $m.Success){exit 1};$token=$m.Groups[1].Value;$ports=Get-NetTCPConnection -State Listen|Where-Object{$_.OwningProcess -eq $p.ProcessId -and $_.LocalAddress -eq '127.0.0.1'}|Select-Object -ExpandProperty LocalPort -Unique;[System.Net.ServicePointManager]::ServerCertificateValidationCallback={$true};$fallback=$null;foreach($port in $ports){foreach($scheme in @('http','https')){try{$headers=@{'x-codeium-csrf-token'=$token;'Connect-Protocol-Version'='1'};$s=Invoke-RestMethod -Uri "${scheme}://127.0.0.1:${port}/exa.language_server_pb.LanguageServerService/GetUserStatus" -Method Post -Headers $headers -ContentType 'application/json' -Body '{}' -TimeoutSec 2 -ErrorAction Stop;if(-not $fallback){$fallback=$s.userStatus};try{$q=Invoke-RestMethod -Uri "${scheme}://127.0.0.1:${port}/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary" -Method Post -Headers $headers -ContentType 'application/json' -Body '{}' -TimeoutSec 2 -ErrorAction Stop;@{userStatus=$s.userStatus;quotaSummary=$q.response}|ConvertTo-Json -Depth 30 -Compress;exit 0}catch{}}catch{}}};if($fallback){@{userStatus=$fallback;quotaSummary=$null}|ConvertTo-Json -Depth 30 -Compress;exit 0};exit 1"#;
+        let mut command = std::process::Command::new("powershell.exe");
+        command.args(["-NoProfile", "-NonInteractive", "-Command", script]);
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(powershell_creation_flags());
+        let started = std::time::Instant::now();
+        let Some(output) = command_output_with_timeout(command, std::time::Duration::from_secs(15))
+        else {
+            println!("local-server: timed out");
+            return;
+        };
+        println!("local-server duration_ms={}", started.elapsed().as_millis());
+        if !output.status.success() {
+            println!("local-server: unavailable");
+            return;
+        }
+        let Ok(mut response) = serde_json::from_slice::<serde_json::Value>(&output.stdout) else {
+            println!("local-server: invalid JSON response");
+            return;
+        };
+        redact_local_private_fields(&mut response);
+        let diagnostics_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("quota-diagnostics");
+        std::fs::create_dir_all(&diagnostics_dir).expect("create quota diagnostics directory");
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after Unix epoch")
+            .as_millis();
+        let output_path = diagnostics_dir.join(format!("antigravity-local-{stamp}.json"));
+        std::fs::write(
+            &output_path,
+            serde_json::to_vec_pretty(&response).expect("serialize local response"),
+        )
+        .expect("write local response diagnostics");
+        println!(
+            "local-server full redacted response: {}",
+            output_path.display()
+        );
+    }
+
     #[test]
     #[cfg(windows)]
     #[ignore = "temporary live diagnostic; uses the app agy args without its outer timeout"]
@@ -1559,6 +1635,7 @@ Claude and GPT models\tWeekly Limit Remaining\t97%\t2026-09-23T15:31:31Z\n";
         match command.output() {
             Ok(output) if output.status.success() => {
                 let stdout = String::from_utf8_lossy(&output.stdout);
+                println!("agy-cli raw response:\n{stdout}");
                 let plan = parse_agy_usage(&stdout).map(|usage| plan_with_agy_usage(None, usage));
                 print_live_quota_diagnostic("agy-cli", plan);
             }
