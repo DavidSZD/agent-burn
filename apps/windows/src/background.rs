@@ -1,16 +1,13 @@
-use std::{
-    sync::atomic::Ordering,
-    time::{Duration, Instant},
-};
+use std::{sync::atomic::Ordering, time::Duration};
 use tauri::{AppHandle, Emitter, Manager};
-use tokio::time::{sleep, timeout};
+use tokio::time::{sleep_until, timeout, Instant};
 
 fn refresh_delay(minutes: u64) -> Duration {
     Duration::from_secs(minutes.max(1) * 60)
 }
 
-fn next_refresh_delay(minutes: u64, elapsed: Duration) -> Duration {
-    refresh_delay(minutes).saturating_sub(elapsed)
+fn next_refresh_at(anchor: Instant, minutes: u64) -> Instant {
+    anchor + refresh_delay(minutes)
 }
 
 use crate::app::{resolve_cli_path_with_override, AppState, RefreshSnapshot};
@@ -20,35 +17,70 @@ const FAST_AGENT_LIST: &str =
 
 pub fn spawn_quota_collector(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
-        // Relevé initial rapide après 2 secondes pour archiver et mettre à jour le tray
-        sleep(Duration::from_secs(2)).await;
+        let state = app.state::<AppState>();
+        let mut next_refresh = Instant::now() + Duration::from_secs(2);
         loop {
-            let cycle_started = Instant::now();
-            let started_at_ms = chrono::Utc::now().timestamp_millis();
-            let generation = app
-                .state::<AppState>()
-                .refresh_generation
-                .fetch_add(1, Ordering::Relaxed)
-                + 1;
-            let _ = app.emit(
-                "refresh_started",
-                refresh_started_payload(generation, started_at_ms),
-            );
-            let success = collect_and_archive(&app, generation).await;
-            let finished_at_ms = chrono::Utc::now().timestamp_millis();
-            let _ = app.emit(
-                "refresh_finished",
-                refresh_finished_payload(generation, started_at_ms, finished_at_ms, success),
-            );
-            let minutes = app
-                .state::<AppState>()
-                .settings
-                .read()
-                .map(|settings| settings.refresh_minutes)
-                .unwrap_or(1);
-            sleep(next_refresh_delay(minutes, cycle_started.elapsed())).await;
+            tokio::select! {
+                _ = sleep_until(next_refresh) => {
+                    let scan_lock = state.scan_lock.lock();
+                    tokio::pin!(scan_lock);
+                    let _scan = tokio::select! {
+                        _ = state.refresh_schedule_changed.notified() => {
+                            let minutes = current_refresh_minutes(&state);
+                            next_refresh = next_refresh_at(Instant::now(), minutes);
+                            continue;
+                        }
+                        guard = &mut scan_lock => guard,
+                    };
+                    let cycle_started = Instant::now();
+                    let cycle_started_at_ms = chrono::Utc::now().timestamp_millis();
+                    run_refresh(&app, false).await;
+                    drop(_scan);
+                    next_refresh = next_refresh_at(cycle_started, current_refresh_minutes(&state));
+                    emit_next_refresh(&app, cycle_started_at_ms + refresh_delay(current_refresh_minutes(&state)).as_millis() as i64);
+                }
+                _ = state.refresh_schedule_changed.notified() => {
+                    next_refresh = next_refresh_at(Instant::now(), current_refresh_minutes(&state));
+                    emit_next_refresh(&app, chrono::Utc::now().timestamp_millis() + refresh_delay(current_refresh_minutes(&state)).as_millis() as i64);
+                }
+            }
         }
     });
+}
+
+fn current_refresh_minutes(state: &AppState) -> u64 {
+    state
+        .settings
+        .read()
+        .map(|settings| settings.refresh_minutes)
+        .unwrap_or(1)
+}
+
+pub(crate) async fn run_refresh(app: &AppHandle, manual: bool) -> bool {
+    let started_at_ms = chrono::Utc::now().timestamp_millis();
+    let generation = app
+        .state::<AppState>()
+        .refresh_generation
+        .fetch_add(1, Ordering::Relaxed)
+        + 1;
+    let _ = app.emit(
+        "refresh_started",
+        refresh_started_payload(generation, started_at_ms, manual),
+    );
+    let success = collect_and_archive(app, generation).await;
+    let finished_at_ms = chrono::Utc::now().timestamp_millis();
+    let _ = app.emit(
+        "refresh_finished",
+        refresh_finished_payload(generation, started_at_ms, finished_at_ms, success, manual),
+    );
+    success
+}
+
+fn emit_next_refresh(app: &AppHandle, next_refresh_at_ms: i64) {
+    let _ = app.emit(
+        "refresh_schedule_updated",
+        serde_json::json!({ "nextRefreshAtMs": next_refresh_at_ms }),
+    );
 }
 
 #[cfg(test)]
@@ -57,31 +89,51 @@ mod tests {
 
     #[test]
     fn next_refresh_waits_for_the_full_interval_after_collection() {
+        let finished = Instant::now();
         assert_eq!(
-            next_refresh_delay(5, Duration::from_secs(42)),
-            Duration::from_secs(258)
+            next_refresh_at(finished, 5),
+            finished + Duration::from_secs(300)
         );
     }
 
     #[test]
     fn a_slow_scan_does_not_push_the_next_refresh_past_its_interval() {
+        let started = Instant::now();
         assert_eq!(
-            next_refresh_delay(1, Duration::from_secs(90)),
-            Duration::ZERO
+            next_refresh_at(started, 1),
+            started + Duration::from_secs(60)
+        );
+    }
+
+    #[test]
+    fn changing_the_interval_reschedules_from_the_setting_change() {
+        let changed_at = Instant::now();
+        assert_eq!(
+            next_refresh_at(changed_at, 1),
+            changed_at + Duration::from_secs(60)
+        );
+    }
+
+    #[test]
+    fn manual_refresh_reschedules_from_scan_completion() {
+        let completed_at = Instant::now();
+        assert_eq!(
+            next_refresh_at(completed_at, 5),
+            completed_at + Duration::from_secs(300)
         );
     }
 
     #[test]
     fn automatic_refresh_start_event_contains_its_timestamp() {
         assert_eq!(
-            refresh_started_payload(7, 42),
-            serde_json::json!({ "generation": 7, "startedAtMs": 42 }),
+            refresh_started_payload(7, 42, true),
+            serde_json::json!({ "generation": 7, "startedAtMs": 42, "manual": true }),
         );
     }
 }
 
-fn refresh_started_payload(generation: u64, started_at_ms: i64) -> serde_json::Value {
-    serde_json::json!({ "generation": generation, "startedAtMs": started_at_ms })
+fn refresh_started_payload(generation: u64, started_at_ms: i64, manual: bool) -> serde_json::Value {
+    serde_json::json!({ "generation": generation, "startedAtMs": started_at_ms, "manual": manual })
 }
 
 fn refresh_finished_payload(
@@ -89,12 +141,14 @@ fn refresh_finished_payload(
     started_at_ms: i64,
     finished_at_ms: i64,
     success: bool,
+    manual: bool,
 ) -> serde_json::Value {
     serde_json::json!({
         "generation": generation,
         "startedAtMs": started_at_ms,
         "finishedAtMs": finished_at_ms,
         "success": success,
+        "manual": manual,
     })
 }
 

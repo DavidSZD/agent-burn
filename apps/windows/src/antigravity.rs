@@ -9,7 +9,7 @@ use std::{
 };
 
 const GEMINI_QUOTA_CACHE_VERSION_KEY: &str = "geminiQuotaVersion";
-const GEMINI_QUOTA_CACHE_VERSION: u64 = 1;
+const GEMINI_QUOTA_CACHE_VERSION: u64 = 2;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AntigravitySession {
@@ -586,16 +586,39 @@ fn get_live_antigravity_plan() -> Option<AntigravityPlan> {
     // window from the local language server, then `agy`; never blend provider
     // pools or replace a valid higher-priority window with a fallback value.
     let mut plan = crate::antigravity_cloud::fetch_plan();
+    let mut reset_source = plan
+        .as_ref()
+        .filter(|value| value.session_reset_time.is_some())
+        .map(|_| "cloud");
     if !plan_has_complete_windows(plan.as_ref()) {
         if let Some(local_plan) = get_language_server_plan() {
+            if plan
+                .as_ref()
+                .is_none_or(|value| value.session_remaining.is_none())
+                && local_plan.session_reset_time.is_some()
+            {
+                reset_source = Some("local");
+            }
             merge_missing_quota_windows(&mut plan, local_plan);
         }
         if !plan_has_complete_windows(plan.as_ref()) {
             if let Some(usage) = get_agy_usage() {
+                if plan
+                    .as_ref()
+                    .is_none_or(|value| value.session_remaining.is_none())
+                    && usage.session_reset_time.is_some()
+                {
+                    reset_source = Some("agy");
+                }
                 let existing = plan.take();
                 plan = Some(plan_with_agy_usage(existing, usage));
             }
         }
+    }
+    if let Some(live_plan) = plan.as_mut() {
+        let reset_time = live_plan.session_reset_time.take();
+        live_plan.session_reset_time =
+            confirm_live_session_reset(reset_source.unwrap_or("cloud"), reset_time.as_deref());
     }
     let plan = plan.or_else(load_cached_antigravity_plan);
     if let Some(plan) = plan
@@ -608,6 +631,15 @@ fn get_live_antigravity_plan() -> Option<AntigravityPlan> {
         *guard = Some((std::time::Instant::now(), plan.clone()));
     }
     plan
+}
+
+fn confirm_live_session_reset(source: &str, reset_time: Option<&str>) -> Option<String> {
+    static CONFIRMATION: OnceLock<Mutex<crate::app::GeminiResetConfirmation>> = OnceLock::new();
+    CONFIRMATION
+        .get_or_init(|| Mutex::new(crate::app::GeminiResetConfirmation::default()))
+        .lock()
+        .ok()
+        .and_then(|mut confirmation| confirmation.observe(source, reset_time))
 }
 
 fn get_language_server_plan() -> Option<AntigravityPlan> {

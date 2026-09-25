@@ -32,6 +32,7 @@ import {
   updateCacheFromTimelineSnapshot,
   mergeSourceSnapshot,
   refreshStatusText,
+  refreshScheduleAnchor,
   waitForInitialRefresh,
   subscriptionPresentation,
   visibleTokenBreakdownEntries,
@@ -145,6 +146,14 @@ test("shows the next automatic refresh when idle", () => {
     refreshStatusText({ updatedAt: 1_000, nextRefreshAt: 72_500 }, 12_500),
     "Last update 11 sec ago · Next refresh in 1 min",
   );
+});
+
+test("manual refresh schedules the next run from scan completion", () => {
+  assert.equal(refreshScheduleAnchor({ startedAt: 100, finishedAt: 900, manual: true }), 900);
+});
+
+test("automatic refresh keeps its fixed start-based cadence", () => {
+  assert.equal(refreshScheduleAnchor({ startedAt: 100, finishedAt: 900, manual: false }), 100);
 });
 
 test("automatic update checks run at most once per day while enabled", () => {

@@ -64,6 +64,7 @@ fn main() {
             commands::get_cli_status,
             commands::get_settings,
             commands::set_settings,
+            commands::request_manual_refresh,
             commands::get_autostart_status,
             commands::set_autostart,
             commands::get_quota_history,
