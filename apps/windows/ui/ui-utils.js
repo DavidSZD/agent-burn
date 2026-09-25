@@ -137,6 +137,12 @@ export function refreshStatusText({ updatedAt, refreshStartedAt, nextRefreshAt }
   return `Updated ${Math.floor(elapsedSeconds / 60)} min ago`;
 }
 
+export function refreshScheduleAnchor({ startedAt, finishedAt, manual } = {}) {
+  if (manual === true && Number.isFinite(finishedAt)) return finishedAt;
+  if (Number.isFinite(startedAt)) return startedAt;
+  return Number.isFinite(finishedAt) ? finishedAt : null;
+}
+
 export function latestTimelineUpdatedAt(periodCache) {
   const timestamps = Object.values(periodCache || {})
     .map((entry) => entry?.updatedAt)

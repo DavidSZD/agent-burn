@@ -23,6 +23,7 @@ import {
   loadQuotaHistory,
   resetWindowStartDate,
   refreshStatusText,
+  refreshScheduleAnchor,
   restoredTab,
   shouldRefreshTimelineInBackground,
   timelineSelection,
@@ -284,14 +285,23 @@ function initBackendEvents() {
     if (Number.isFinite(generation) && generation < activeRefreshGeneration) return;
     const startedAtMs = Number(event?.payload?.startedAtMs);
     const finishedAtMs = Number(event?.payload?.finishedAtMs);
-    const scheduleAnchor = Number.isFinite(startedAtMs)
-      ? startedAtMs
-      : (Number.isFinite(finishedAtMs) ? finishedAtMs : Date.now());
-    nextAutomaticRefreshAt = scheduleAnchor + refreshIntervalMs();
+    const scheduleAnchor = refreshScheduleAnchor({
+      startedAt: startedAtMs,
+      finishedAt: finishedAtMs,
+      manual: event?.payload?.manual === true,
+    });
+    nextAutomaticRefreshAt = (scheduleAnchor ?? Date.now()) + refreshIntervalMs();
     automaticRefreshStartedAt = null;
     setTimelineRefreshing(false, "automatic");
+    setTimelineRefreshing(false, "manual");
     setTimelineRefreshing(false, "startup");
     setTimelineRefreshing(false, "timeline");
+    renderFooterStatus();
+  });
+  listen("refresh_schedule_updated", (event) => {
+    const nextRefreshAtMs = Number(event?.payload?.nextRefreshAtMs);
+    if (!Number.isFinite(nextRefreshAtMs)) return;
+    nextAutomaticRefreshAt = nextRefreshAtMs;
     renderFooterStatus();
   });
   listen("refresh_source_completed", async (event) => {
@@ -632,6 +642,11 @@ function syncTimelineRefreshIndicators() {
   document.querySelectorAll(".timeline-refresh-status").forEach((status) => {
     status.hidden = !active;
   });
+  const refreshButton = document.getElementById("refresh-btn");
+  if (refreshButton) {
+    refreshButton.disabled = active;
+    refreshButton.setAttribute("aria-busy", String(active));
+  }
 }
 
 function refreshIntervalMs() {
@@ -771,30 +786,9 @@ async function performAllTimelineRefresh(showIndicator = false) {
   if (updateScanShutdown.isStopping()) return;
   if (showIndicator) setTimelineRefreshing(true, "manual");
   try {
-    // The all-time request carries the CLI's timeline matrix. Refreshing only
-    // Today left older cached periods stale even though the button appeared to
-    // succeed, so hydrate every timeline in one scan here.
-    const summary = await invokeTauri("get_summary", { range: null });
-    const refreshedAtMs = Date.now();
-    updateCacheFromTimelineSnapshot(periodCache, summary, refreshedAtMs);
-    latestLiveQuotaReport = summary;
-    lastUpdatedTime = refreshedAtMs;
-    lastBackendRefreshMs = Math.max(lastBackendRefreshMs, lastUpdatedTime);
-
-    const selected = periodCache[timelineCacheKey(currentPeriod)];
-    if (selected) {
-      reportData = mergeLiveSubscription(selected.reportData, latestLiveQuotaReport);
-      computeDetectedAgents(reportData, antigravityData);
-      renderHarnessTabs();
-      updateTopBarQuotaPill(reportData);
-      if (currentTab === "summary") renderSummary();
-      else if (currentTab !== "settings") renderHarnessView(currentTab);
-    }
-    await saveReportCache({ summary: currentVisibleReport(), periods: periodCache, currentPeriod });
-    void preloadTimelines(false, true);
+    await invokeTauri("request_manual_refresh");
   } catch (error) {
     showStatusError(`Unable to refresh timelines: ${error}`);
-  } finally {
     if (showIndicator) setTimelineRefreshing(false, "manual");
   }
 }
@@ -2480,6 +2474,7 @@ function applySettingsToControls() {
 }
 
 async function saveSettingsFromControls() {
+  const previousSettings = appSettings;
   const settings = {
     customCliPath: document.getElementById("settings-cli-input")?.value.trim() || null,
     codexHomes: document.getElementById("settings-codex-homes-input")?.value.trim() || "",
@@ -2491,11 +2486,20 @@ async function saveSettingsFromControls() {
     autoCheckUpdates: document.getElementById("settings-auto-updates-toggle")?.checked !== false,
   };
   appSettings = await invokeTauri("set_settings", { settings });
+  // The backend broadcasts the authoritative deadline after rearming its timer.
   if (appSettings.autoCheckUpdates) void checkForAppUpdates({ automatic: true });
   else document.getElementById("settings-update-status").textContent = "Automatic checks are off.";
-  for (const key in harnessCache) delete harnessCache[key];
-  await loadData(true);
-  void preloadTimelines(false, true);
+  const reportSettingsChanged = !previousSettings || [
+    "customCliPath",
+    "codexHomes",
+    "offline",
+    "antigravityUltraPrice",
+  ].some((key) => previousSettings[key] !== appSettings[key]);
+  if (reportSettingsChanged) {
+    for (const key in harnessCache) delete harnessCache[key];
+    await loadData(true);
+    void preloadTimelines(false, true);
+  }
 }
 
 function renderFooterUpdateNotice(version) {
