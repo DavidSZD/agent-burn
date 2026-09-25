@@ -326,6 +326,24 @@ body {
   border-color: var(--border);
 }
 
+.toolbar-btn:disabled {
+  color: var(--text-muted);
+  opacity: 0.45;
+  cursor: not-allowed;
+  background: transparent;
+  border-color: transparent;
+}
+
+.manual-refresh-status {
+  color: var(--text-muted);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.manual-refresh-status[hidden] {
+  display: none !important;
+}
+
 .toolbar-btn.is-refreshing svg {
   animation: timeline-spin 0.8s linear infinite;
 }

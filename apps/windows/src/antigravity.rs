@@ -9,7 +9,7 @@ use std::{
 };
 
 const GEMINI_QUOTA_CACHE_VERSION_KEY: &str = "geminiQuotaVersion";
-const GEMINI_QUOTA_CACHE_VERSION: u64 = 1;
+const GEMINI_QUOTA_CACHE_VERSION: u64 = 2;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AntigravitySession {
@@ -586,18 +586,48 @@ fn get_live_antigravity_plan() -> Option<AntigravityPlan> {
     // window from the local language server, then `agy`; never blend provider
     // pools or replace a valid higher-priority window with a fallback value.
     let mut plan = crate::antigravity_cloud::fetch_plan();
+    let mut reset_source = plan
+        .as_ref()
+        .filter(|value| value.session_reset_time.is_some())
+        .map(|_| "cloud");
     if !plan_has_complete_windows(plan.as_ref()) {
         if let Some(local_plan) = get_language_server_plan() {
+            if plan
+                .as_ref()
+                .is_none_or(|value| value.session_remaining.is_none())
+                && local_plan.session_reset_time.is_some()
+            {
+                reset_source = Some("local");
+            }
             merge_missing_quota_windows(&mut plan, local_plan);
         }
         if !plan_has_complete_windows(plan.as_ref()) {
             if let Some(usage) = get_agy_usage() {
+                if plan
+                    .as_ref()
+                    .is_none_or(|value| value.session_remaining.is_none())
+                    && usage.session_reset_time.is_some()
+                {
+                    reset_source = Some("agy");
+                }
                 let existing = plan.take();
                 plan = Some(plan_with_agy_usage(existing, usage));
             }
         }
     }
-    let plan = plan.or_else(load_cached_antigravity_plan);
+    let cached_plan = load_cached_antigravity_plan();
+    if let Some(live_plan) = plan.as_mut() {
+        let reset_time = live_plan.session_reset_time.take();
+        let previously_confirmed = cached_plan
+            .as_ref()
+            .and_then(|cached| cached.session_reset_time.as_deref());
+        live_plan.session_reset_time = confirm_live_session_reset(
+            reset_source.unwrap_or("cloud"),
+            reset_time.as_deref(),
+            previously_confirmed,
+        );
+    }
+    let plan = plan.or(cached_plan);
     if let Some(plan) = plan
         .as_ref()
         .filter(|plan| !plan.plan.eq_ignore_ascii_case("unknown"))
@@ -608,6 +638,26 @@ fn get_live_antigravity_plan() -> Option<AntigravityPlan> {
         *guard = Some((std::time::Instant::now(), plan.clone()));
     }
     plan
+}
+
+fn confirm_live_session_reset(
+    source: &str,
+    reset_time: Option<&str>,
+    previously_confirmed: Option<&str>,
+) -> Option<String> {
+    static CONFIRMATION: OnceLock<Mutex<crate::app::GeminiResetConfirmation>> = OnceLock::new();
+    CONFIRMATION
+        .get_or_init(|| Mutex::new(crate::app::GeminiResetConfirmation::default()))
+        .lock()
+        .ok()
+        .and_then(|mut confirmation| {
+            confirmation.observe_preserving_confirmed(
+                source,
+                reset_time,
+                previously_confirmed,
+                Utc::now().timestamp(),
+            )
+        })
 }
 
 fn get_language_server_plan() -> Option<AntigravityPlan> {
@@ -1506,6 +1556,146 @@ Claude and GPT models\tWeekly Limit Remaining\t97%\t2026-09-23T15:31:31Z\n";
 
         assert!(output.is_none());
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[cfg(windows)]
+    fn print_live_quota_diagnostic(source: &str, plan: Option<AntigravityPlan>) {
+        let Some(plan) = plan else {
+            println!("{source}: unavailable");
+            return;
+        };
+        println!(
+            "{source}: plan={}; weekly={:?}; weekly_reset={:?}; five_hour={:?}; five_hour_reset={:?}; quota_entries={}",
+            plan.plan,
+            plan.weekly_remaining,
+            plan.weekly_reset_time,
+            plan.session_remaining,
+            plan.session_reset_time,
+            plan.quotas.len()
+        );
+        for quota in plan.quotas {
+            println!(
+                "{source} quota: label={}; remaining={}; reset={:?}",
+                quota.label, quota.remaining, quota.reset_time
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    #[ignore = "temporary live diagnostic; requires local Antigravity server"]
+    fn diagnostic_local_server_quota() {
+        let started = std::time::Instant::now();
+        print_live_quota_diagnostic("local-server", get_language_server_plan());
+        println!("local-server duration_ms={}", started.elapsed().as_millis());
+    }
+
+    #[cfg(windows)]
+    fn redact_local_private_fields(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(object) => {
+                for (key, value) in object.iter_mut() {
+                    if matches!(
+                        key.to_ascii_lowercase().as_str(),
+                        "email"
+                            | "name"
+                            | "userid"
+                            | "accountid"
+                            | "projectid"
+                            | "cloudaicompanionproject"
+                            | "profilepictureurl"
+                            | "csrftoken"
+                    ) {
+                        *value = serde_json::Value::String("[REDACTED]".to_string());
+                    } else {
+                        redact_local_private_fields(value);
+                    }
+                }
+            }
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    redact_local_private_fields(value);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    #[ignore = "temporary live diagnostic; prints full local server response with private ids redacted"]
+    fn diagnostic_local_server_raw_response() {
+        let script = r#"$OutputEncoding=[Console]::OutputEncoding=[Text.UTF8Encoding]::new();$p=Get-CimInstance Win32_Process -Filter "Name = 'language_server.exe'"|Select-Object -First 1;if(-not $p){exit 1};$m=[regex]::Match($p.CommandLine,'--csrf_token\s+([^\s]+)');if(-not $m.Success){exit 1};$token=$m.Groups[1].Value;$ports=Get-NetTCPConnection -State Listen|Where-Object{$_.OwningProcess -eq $p.ProcessId -and $_.LocalAddress -eq '127.0.0.1'}|Select-Object -ExpandProperty LocalPort -Unique;[System.Net.ServicePointManager]::ServerCertificateValidationCallback={$true};$fallback=$null;foreach($port in $ports){foreach($scheme in @('http','https')){try{$headers=@{'x-codeium-csrf-token'=$token;'Connect-Protocol-Version'='1'};$s=Invoke-RestMethod -Uri "${scheme}://127.0.0.1:${port}/exa.language_server_pb.LanguageServerService/GetUserStatus" -Method Post -Headers $headers -ContentType 'application/json' -Body '{}' -TimeoutSec 2 -ErrorAction Stop;if(-not $fallback){$fallback=$s.userStatus};try{$q=Invoke-RestMethod -Uri "${scheme}://127.0.0.1:${port}/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary" -Method Post -Headers $headers -ContentType 'application/json' -Body '{}' -TimeoutSec 2 -ErrorAction Stop;@{userStatus=$s.userStatus;quotaSummary=$q.response}|ConvertTo-Json -Depth 30 -Compress;exit 0}catch{}}catch{}}};if($fallback){@{userStatus=$fallback;quotaSummary=$null}|ConvertTo-Json -Depth 30 -Compress;exit 0};exit 1"#;
+        let mut command = std::process::Command::new("powershell.exe");
+        command.args(["-NoProfile", "-NonInteractive", "-Command", script]);
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(powershell_creation_flags());
+        let started = std::time::Instant::now();
+        let Some(output) = command_output_with_timeout(command, std::time::Duration::from_secs(15))
+        else {
+            println!("local-server: timed out");
+            return;
+        };
+        println!("local-server duration_ms={}", started.elapsed().as_millis());
+        if !output.status.success() {
+            println!("local-server: unavailable");
+            return;
+        }
+        let Ok(mut response) = serde_json::from_slice::<serde_json::Value>(&output.stdout) else {
+            println!("local-server: invalid JSON response");
+            return;
+        };
+        redact_local_private_fields(&mut response);
+        let diagnostics_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("quota-diagnostics");
+        std::fs::create_dir_all(&diagnostics_dir).expect("create quota diagnostics directory");
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after Unix epoch")
+            .as_millis();
+        let output_path = diagnostics_dir.join(format!("antigravity-local-{stamp}.json"));
+        std::fs::write(
+            &output_path,
+            serde_json::to_vec_pretty(&response).expect("serialize local response"),
+        )
+        .expect("write local response diagnostics");
+        println!(
+            "local-server full redacted response: {}",
+            output_path.display()
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    #[ignore = "temporary live diagnostic; uses the app agy args without its outer timeout"]
+    fn diagnostic_agy_cli_quota_without_outer_timeout() {
+        let started = std::time::Instant::now();
+        let mut command = std::process::Command::new(agy_executable());
+        command.args([
+            "-p",
+            "/usage",
+            "--output-format",
+            "text",
+            "--print-timeout",
+            "12s",
+        ]);
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(powershell_creation_flags());
+        match command.output() {
+            Ok(output) if output.status.success() => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                println!("agy-cli raw response:\n{stdout}");
+                let plan = parse_agy_usage(&stdout).map(|usage| plan_with_agy_usage(None, usage));
+                print_live_quota_diagnostic("agy-cli", plan);
+            }
+            Ok(output) => println!(
+                "agy-cli: process exited with {}; stderr omitted",
+                output.status
+            ),
+            Err(_) => println!("agy-cli: process could not be started"),
+        }
+        println!("agy-cli duration_ms={}", started.elapsed().as_millis());
     }
 
     #[test]

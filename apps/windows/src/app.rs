@@ -17,9 +17,69 @@ pub struct AppState {
     pub cli_path: Option<PathBuf>,
     pub settings: RwLock<AppSettings>,
     pub latest_refresh: RwLock<Option<RefreshSnapshot>>,
-    pub summary_scan: tokio::sync::Mutex<()>,
+    pub scan_lock: tokio::sync::Mutex<()>,
+    pub refresh_schedule_changed: tokio::sync::Notify,
     pub refresh_generation: AtomicU64,
     pub scan_control: crate::scan_control::ScanControl,
+}
+
+#[derive(Default)]
+pub(crate) struct GeminiResetConfirmation {
+    candidate: Option<(String, i64, u32, String, u8)>,
+}
+
+impl GeminiResetConfirmation {
+    pub(crate) fn observe(&mut self, source: &str, reset_time: Option<&str>) -> Option<String> {
+        let Some(reset_time) = reset_time else {
+            self.candidate = None;
+            return None;
+        };
+        let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(reset_time) else {
+            self.candidate = None;
+            return None;
+        };
+        let instant = (parsed.timestamp(), parsed.timestamp_subsec_nanos());
+
+        match self.candidate.as_mut() {
+            Some((candidate_source, seconds, nanos, value, consecutive))
+                if candidate_source == source && (*seconds, *nanos) == instant =>
+            {
+                *consecutive = consecutive.saturating_add(1);
+                *value = reset_time.to_string();
+                (*consecutive >= 2).then(|| reset_time.to_string())
+            }
+            _ => {
+                self.candidate = Some((
+                    source.to_string(),
+                    instant.0,
+                    instant.1,
+                    reset_time.to_string(),
+                    1,
+                ));
+                None
+            }
+        }
+    }
+
+    pub(crate) fn observe_preserving_confirmed(
+        &mut self,
+        source: &str,
+        reset_time: Option<&str>,
+        previously_confirmed: Option<&str>,
+        now_timestamp: i64,
+    ) -> Option<String> {
+        let newly_confirmed = self.observe(source, reset_time);
+        if newly_confirmed.is_some() {
+            return newly_confirmed;
+        }
+
+        previously_confirmed.and_then(|value| {
+            chrono::DateTime::parse_from_rfc3339(value)
+                .ok()
+                .filter(|parsed| parsed.timestamp() > now_timestamp)
+                .map(|_| value.to_string())
+        })
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -91,7 +151,8 @@ impl AppState {
             cli_path,
             settings: RwLock::new(settings),
             latest_refresh: RwLock::new(None),
-            summary_scan: tokio::sync::Mutex::new(()),
+            scan_lock: tokio::sync::Mutex::new(()),
+            refresh_schedule_changed: tokio::sync::Notify::new(),
             refresh_generation: AtomicU64::new(0),
             scan_control: crate::scan_control::ScanControl::default(),
         }
@@ -349,6 +410,130 @@ mod tests {
         .normalized();
 
         assert_eq!(settings.refresh_minutes, 1);
+    }
+
+    #[test]
+    fn a_five_hour_reset_is_hidden_until_two_successive_samples_match() {
+        let mut confirmation = GeminiResetConfirmation::default();
+
+        assert_eq!(
+            confirmation.observe("cloud", Some("2026-09-25T16:30:12Z")),
+            None
+        );
+        assert_eq!(
+            confirmation.observe("cloud", Some("2026-09-25T16:30:12Z")),
+            Some("2026-09-25T16:30:12Z".to_string())
+        );
+    }
+
+    #[test]
+    fn previously_confirmed_reset_survives_restart_on_first_matching_sample() {
+        let mut confirmation = GeminiResetConfirmation::default();
+
+        assert_eq!(
+            confirmation.observe_preserving_confirmed(
+                "cloud",
+                Some("2026-09-25T16:30:12Z"),
+                Some("2026-09-25T16:30:12Z"),
+                1_790_350_000,
+            ),
+            Some("2026-09-25T16:30:12Z".to_string())
+        );
+    }
+
+    #[test]
+    fn changed_reset_keeps_the_future_confirmed_reset_until_confirmed_again() {
+        let mut confirmation = GeminiResetConfirmation::default();
+
+        assert_eq!(
+            confirmation.observe_preserving_confirmed(
+                "cloud",
+                Some("2026-09-25T16:35:12Z"),
+                Some("2026-09-25T16:30:12Z"),
+                1_790_350_000,
+            ),
+            Some("2026-09-25T16:30:12Z".to_string())
+        );
+        assert_eq!(
+            confirmation.observe_preserving_confirmed(
+                "cloud",
+                Some("2026-09-25T16:35:12Z"),
+                Some("2026-09-25T16:30:12Z"),
+                1_790_350_000,
+            ),
+            Some("2026-09-25T16:35:12Z".to_string())
+        );
+    }
+
+    #[test]
+    fn expired_confirmed_reset_is_not_restored() {
+        let mut confirmation = GeminiResetConfirmation::default();
+
+        assert_eq!(
+            confirmation.observe_preserving_confirmed(
+                "cloud",
+                Some("2026-09-25T16:35:12Z"),
+                Some("2026-09-25T16:30:12Z"),
+                1_790_354_000,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_changed_five_hour_reset_requires_two_new_matching_samples() {
+        let mut confirmation = GeminiResetConfirmation::default();
+        confirmation.observe("cloud", Some("2026-09-25T16:30:12Z"));
+        confirmation.observe("cloud", Some("2026-09-25T16:30:12Z"));
+
+        assert_eq!(
+            confirmation.observe("cloud", Some("2026-09-25T16:35:12Z")),
+            None
+        );
+        assert_eq!(
+            confirmation.observe("cloud", Some("2026-09-25T16:35:12Z")),
+            Some("2026-09-25T16:35:12Z".to_string())
+        );
+    }
+
+    #[test]
+    fn a_missing_or_invalid_five_hour_reset_clears_confirmation() {
+        let mut confirmation = GeminiResetConfirmation::default();
+        confirmation.observe("cloud", Some("2026-09-25T16:30:12Z"));
+        confirmation.observe("cloud", Some("2026-09-25T16:30:12Z"));
+
+        assert_eq!(confirmation.observe("cloud", None), None);
+        assert_eq!(confirmation.observe("cloud", Some("not-a-date")), None);
+        assert_eq!(
+            confirmation.observe("cloud", Some("2026-09-25T16:30:12Z")),
+            None
+        );
+    }
+
+    #[test]
+    fn equivalent_five_hour_reset_instants_match_across_timezones() {
+        let mut confirmation = GeminiResetConfirmation::default();
+        confirmation.observe("cloud", Some("2026-09-25T16:30:12Z"));
+
+        assert_eq!(
+            confirmation.observe("cloud", Some("2026-09-25T18:30:12+02:00")),
+            Some("2026-09-25T18:30:12+02:00".to_string())
+        );
+    }
+
+    #[test]
+    fn a_five_hour_reset_from_a_different_source_does_not_confirm_the_candidate() {
+        let mut confirmation = GeminiResetConfirmation::default();
+        confirmation.observe("cloud", Some("2026-09-25T16:30:12Z"));
+
+        assert_eq!(
+            confirmation.observe("local", Some("2026-09-25T16:30:12Z")),
+            None
+        );
+        assert_eq!(
+            confirmation.observe("local", Some("2026-09-25T16:30:12Z")),
+            Some("2026-09-25T16:30:12Z".to_string())
+        );
     }
 
     #[test]

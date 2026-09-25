@@ -29,7 +29,8 @@
       </nav>
 
       <div class="header-right">
-        <button id="refresh-btn" class="toolbar-btn" title="Refresh usage and live quotas">
+        <span id="manual-refresh-status" class="manual-refresh-status" role="status" aria-live="polite" hidden></span>
+        <button id="refresh-btn" class="toolbar-btn" title="Refresh usage and live quotas" aria-label="Refresh usage and live quotas">
           <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <polyline points="23 4 23 10 17 10"></polyline>
             <polyline points="1 20 1 14 7 14"></polyline>
@@ -316,7 +317,7 @@
       </div>
       <div class="footer-right">
         <button id="footer-update-button" class="footer-update-button" type="button" hidden></button>
-        <span data-app-version="0.1.67">v0.1.67 (Windows)</span>
+        <span data-app-version="0.1.70">v0.1.70 (Windows)</span>
       </div>
     </footer>
   </div>

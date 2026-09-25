@@ -3,7 +3,7 @@ use crate::app::{
     AppState,
 };
 use std::{collections::BTreeMap, path::Path};
-use tauri::State;
+use tauri::{AppHandle, Emitter, State};
 
 const GEMINI_QUOTA_SCOPE: &str = "gemini";
 
@@ -13,7 +13,7 @@ pub async fn get_summary(
     range: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<serde_json::Value, String> {
-    let _scan = state.summary_scan.lock().await;
+    let _scan = state.scan_lock.lock().await;
     let period_val = period.or(range).unwrap_or_else(|| "all".to_string());
     let settings = state
         .settings
@@ -33,7 +33,7 @@ pub async fn get_summary_since(
     since: String,
     state: State<'_, AppState>,
 ) -> Result<serde_json::Value, String> {
-    let _scan = state.summary_scan.lock().await;
+    let _scan = state.scan_lock.lock().await;
     chrono::NaiveDate::parse_from_str(&since, "%Y-%m-%d")
         .map_err(|_| "La date de début doit utiliser le format YYYY-MM-DD.".to_string())?;
     let settings = state
@@ -518,50 +518,42 @@ fn merge_antigravity(
         let root = summary
             .as_object_mut()
             .ok_or_else(|| "Le résumé CLI doit être un objet JSON.".to_string())?;
-        let window_val = if let (Some(rem), Some(reset_time)) =
-            (plan.weekly_remaining, &plan.weekly_reset_time)
-        {
-            let elapsed_mins =
-                chrono::DateTime::parse_from_rfc3339(reset_time)
-                    .ok()
-                    .map(|reset_dt| {
-                        let total_mins = 7.0 * 24.0 * 60.0;
-                        let rem_mins = (reset_dt.with_timezone(&chrono::Utc) - chrono::Utc::now())
-                            .num_seconds() as f64
-                            / 60.0;
-                        (total_mins - rem_mins).clamp(0.0, total_mins)
-                    });
+        let window_val = plan.weekly_remaining.map(|rem| {
+            let reset_time = plan.weekly_reset_time.as_deref();
+            let elapsed_mins = reset_time
+                .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+                .map(|reset_dt| {
+                    let total_mins = 7.0 * 24.0 * 60.0;
+                    let rem_mins = (reset_dt.with_timezone(&chrono::Utc) - chrono::Utc::now())
+                        .num_seconds() as f64
+                        / 60.0;
+                    (total_mins - rem_mins).clamp(0.0, total_mins)
+                });
 
-            Some(serde_json::json!({
+            serde_json::json!({
                 "usedPercent": (100.0 - rem).clamp(0.0, 100.0),
                 "resetDate": reset_time,
                 "elapsedMinutes": elapsed_mins,
-            }))
-        } else {
-            None
-        };
+            })
+        });
 
-        let short_window_val = if let (Some(rem), Some(reset_time)) =
-            (plan.session_remaining, &plan.session_reset_time)
-        {
-            let elapsed_mins =
-                chrono::DateTime::parse_from_rfc3339(reset_time)
-                    .ok()
-                    .map(|reset_dt| {
-                        let total_mins = 5.0 * 60.0;
-                        let rem_mins = (reset_dt.with_timezone(&chrono::Utc) - chrono::Utc::now())
-                            .num_seconds() as f64
-                            / 60.0;
-                        (total_mins - rem_mins).clamp(0.0, total_mins)
-                    });
-            Some(serde_json::json!({
+        let short_window_val = plan.session_remaining.map(|rem| {
+            let reset_time = plan.session_reset_time.as_deref();
+            let elapsed_mins = reset_time
+                .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+                .map(|reset_dt| {
+                    let total_mins = 5.0 * 60.0;
+                    let rem_mins = (reset_dt.with_timezone(&chrono::Utc) - chrono::Utc::now())
+                        .num_seconds() as f64
+                        / 60.0;
+                    (total_mins - rem_mins).clamp(0.0, total_mins)
+                });
+            serde_json::json!({
                 "usedPercent": (100.0 - rem).clamp(0.0, 100.0),
                 "resetDate": reset_time,
                 "elapsedMinutes": elapsed_mins,
-            }))
-        } else {
-            None
-        };
+            })
+        });
 
         let subscription = serde_json::json!({
             "agent": "antigravity",
@@ -593,7 +585,7 @@ pub async fn get_harness(
     agent: String,
     state: State<'_, AppState>,
 ) -> Result<serde_json::Value, String> {
-    let _scan = state.summary_scan.lock().await;
+    let _scan = state.scan_lock.lock().await;
     let args = vec!["harness", &agent, "--value"];
     let settings = state
         .settings
@@ -627,13 +619,67 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<AppSettings, String> {
 
 #[tauri::command]
 pub fn set_settings(
+    app: AppHandle,
     settings: AppSettings,
     state: State<'_, AppState>,
 ) -> Result<AppSettings, String> {
     let settings = settings.normalized();
+    let refresh_interval_changed = state
+        .settings
+        .read()
+        .map_err(|error| error.to_string())?
+        .refresh_minutes
+        != settings.refresh_minutes;
     save_settings(&settings)?;
     *state.settings.write().map_err(|error| error.to_string())? = settings.clone();
+    if refresh_interval_changed {
+        let next_refresh_at_ms = chrono::Utc::now().timestamp_millis()
+            + settings.refresh_minutes.saturating_mul(60_000) as i64;
+        let _ = app.emit(
+            "refresh_schedule_updated",
+            serde_json::json!({ "nextRefreshAtMs": next_refresh_at_ms }),
+        );
+        state.refresh_schedule_changed.notify_one();
+    }
     Ok(settings)
+}
+
+#[tauri::command]
+pub async fn request_manual_refresh(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    if state.scan_control.is_stopping_for_update() {
+        return Err("L'application se prépare à installer une mise à jour.".to_string());
+    }
+    let _scan = try_manual_refresh_lock(&state.scan_lock)?;
+    let succeeded = crate::background::run_refresh(&app, true).await;
+    let refresh_minutes = state
+        .settings
+        .read()
+        .map(|settings| settings.refresh_minutes)
+        .unwrap_or(1);
+    let next_refresh_at_ms =
+        chrono::Utc::now().timestamp_millis() + refresh_minutes.saturating_mul(60_000) as i64;
+    let _ = app.emit(
+        "refresh_schedule_updated",
+        serde_json::json!({ "nextRefreshAtMs": next_refresh_at_ms }),
+    );
+    drop(_scan);
+    state.refresh_schedule_changed.notify_one();
+    if succeeded {
+        Ok(())
+    } else {
+        Err("Le refresh n'a pu actualiser aucune source.".to_string())
+    }
+}
+
+fn try_manual_refresh_lock(
+    scan_lock: &tokio::sync::Mutex<()>,
+) -> Result<tokio::sync::MutexGuard<'_, ()>, String> {
+    scan_lock
+        .try_lock()
+        .map_err(|_| "Un scan est déjà en cours. Attends sa fin avant de rafraîchir.".to_string())
 }
 
 #[tauri::command]
@@ -767,6 +813,21 @@ pub async fn get_antigravity_summary(period: Option<String>) -> Result<serde_jso
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn manual_refresh_rejects_an_active_scan_without_waiting() {
+        let scan_lock = tokio::sync::Mutex::new(());
+        let _active_scan = scan_lock.lock().await;
+
+        assert!(try_manual_refresh_lock(&scan_lock).is_err());
+    }
+
+    #[test]
+    fn manual_refresh_can_reserve_an_idle_scan_slot() {
+        let scan_lock = tokio::sync::Mutex::new(());
+
+        assert!(try_manual_refresh_lock(&scan_lock).is_ok());
+    }
 
     #[test]
     fn model_pricing_is_attached_to_general_and_harness_rows() {
@@ -1021,6 +1082,40 @@ mod tests {
         let swin = &ag["shortWindow"];
         assert!((swin["usedPercent"].as_f64().unwrap() - 20.0).abs() < 0.01);
         assert!(swin["elapsedMinutes"].as_f64().is_some());
+    }
+
+    #[test]
+    fn unconfirmed_five_hour_reset_keeps_quota_percent_but_hides_reset_time() {
+        let mut summary = serde_json::json!({"agents": [], "models": [], "totals": {}});
+        let antigravity = crate::antigravity::AntigravitySummary {
+            period: "all".to_string(),
+            session_count: 0,
+            total_tokens: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            total_cost: 0.0,
+            top_models: Vec::new(),
+            sessions: Vec::new(),
+            daily: Vec::new(),
+            plan: Some(crate::antigravity::AntigravityPlan {
+                plan: "Pro".to_string(),
+                price_per_month: 20.0,
+                email: None,
+                name: None,
+                quotas: Vec::new(),
+                weekly_remaining: None,
+                weekly_reset_time: None,
+                session_remaining: Some(86.0),
+                session_reset_time: None,
+            }),
+        };
+
+        merge_antigravity(&mut summary, &antigravity).expect("merge succeeds");
+
+        let short_window = &summary["subscription"]["agents"][0]["shortWindow"];
+        assert_eq!(short_window["usedPercent"], 14.0);
+        assert!(short_window["resetDate"].is_null());
     }
 
     #[test]

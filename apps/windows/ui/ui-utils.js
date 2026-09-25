@@ -13,6 +13,13 @@ export function isAutomaticUpdateCheckDue(enabled, lastCheckAt, now) {
   return !Number.isFinite(lastCheck) || now - lastCheck >= 24 * 60 * 60 * 1000;
 }
 
+export function manualRefreshPresentation(scanActive) {
+  return {
+    disabled: Boolean(scanActive),
+    message: scanActive ? "Scan in progress · refresh unavailable" : "",
+  };
+}
+
 export function visibleTokenBreakdownEntries(breakdown) {
   const entries = [
     ["Input", breakdown.input],
@@ -135,6 +142,12 @@ export function refreshStatusText({ updatedAt, refreshStartedAt, nextRefreshAt }
   if (elapsedSeconds < 5) return "Updated just now";
   if (elapsedSeconds < 60) return `Updated ${elapsedSeconds} sec ago`;
   return `Updated ${Math.floor(elapsedSeconds / 60)} min ago`;
+}
+
+export function refreshScheduleAnchor({ startedAt, finishedAt, manual } = {}) {
+  if (manual === true && Number.isFinite(finishedAt)) return finishedAt;
+  if (Number.isFinite(startedAt)) return startedAt;
+  return Number.isFinite(finishedAt) ? finishedAt : null;
 }
 
 export function latestTimelineUpdatedAt(periodCache) {
