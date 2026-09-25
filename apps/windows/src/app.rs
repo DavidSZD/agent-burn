@@ -60,6 +60,26 @@ impl GeminiResetConfirmation {
             }
         }
     }
+
+    pub(crate) fn observe_preserving_confirmed(
+        &mut self,
+        source: &str,
+        reset_time: Option<&str>,
+        previously_confirmed: Option<&str>,
+        now_timestamp: i64,
+    ) -> Option<String> {
+        let newly_confirmed = self.observe(source, reset_time);
+        if newly_confirmed.is_some() {
+            return newly_confirmed;
+        }
+
+        previously_confirmed.and_then(|value| {
+            chrono::DateTime::parse_from_rfc3339(value)
+                .ok()
+                .filter(|parsed| parsed.timestamp() > now_timestamp)
+                .map(|_| value.to_string())
+        })
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -403,6 +423,60 @@ mod tests {
         assert_eq!(
             confirmation.observe("cloud", Some("2026-09-25T16:30:12Z")),
             Some("2026-09-25T16:30:12Z".to_string())
+        );
+    }
+
+    #[test]
+    fn previously_confirmed_reset_survives_restart_on_first_matching_sample() {
+        let mut confirmation = GeminiResetConfirmation::default();
+
+        assert_eq!(
+            confirmation.observe_preserving_confirmed(
+                "cloud",
+                Some("2026-09-25T16:30:12Z"),
+                Some("2026-09-25T16:30:12Z"),
+                1_790_350_000,
+            ),
+            Some("2026-09-25T16:30:12Z".to_string())
+        );
+    }
+
+    #[test]
+    fn changed_reset_keeps_the_future_confirmed_reset_until_confirmed_again() {
+        let mut confirmation = GeminiResetConfirmation::default();
+
+        assert_eq!(
+            confirmation.observe_preserving_confirmed(
+                "cloud",
+                Some("2026-09-25T16:35:12Z"),
+                Some("2026-09-25T16:30:12Z"),
+                1_790_350_000,
+            ),
+            Some("2026-09-25T16:30:12Z".to_string())
+        );
+        assert_eq!(
+            confirmation.observe_preserving_confirmed(
+                "cloud",
+                Some("2026-09-25T16:35:12Z"),
+                Some("2026-09-25T16:30:12Z"),
+                1_790_350_000,
+            ),
+            Some("2026-09-25T16:35:12Z".to_string())
+        );
+    }
+
+    #[test]
+    fn expired_confirmed_reset_is_not_restored() {
+        let mut confirmation = GeminiResetConfirmation::default();
+
+        assert_eq!(
+            confirmation.observe_preserving_confirmed(
+                "cloud",
+                Some("2026-09-25T16:35:12Z"),
+                Some("2026-09-25T16:30:12Z"),
+                1_790_354_000,
+            ),
+            None
         );
     }
 

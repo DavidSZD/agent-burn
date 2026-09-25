@@ -615,12 +615,19 @@ fn get_live_antigravity_plan() -> Option<AntigravityPlan> {
             }
         }
     }
+    let cached_plan = load_cached_antigravity_plan();
     if let Some(live_plan) = plan.as_mut() {
         let reset_time = live_plan.session_reset_time.take();
-        live_plan.session_reset_time =
-            confirm_live_session_reset(reset_source.unwrap_or("cloud"), reset_time.as_deref());
+        let previously_confirmed = cached_plan
+            .as_ref()
+            .and_then(|cached| cached.session_reset_time.as_deref());
+        live_plan.session_reset_time = confirm_live_session_reset(
+            reset_source.unwrap_or("cloud"),
+            reset_time.as_deref(),
+            previously_confirmed,
+        );
     }
-    let plan = plan.or_else(load_cached_antigravity_plan);
+    let plan = plan.or(cached_plan);
     if let Some(plan) = plan
         .as_ref()
         .filter(|plan| !plan.plan.eq_ignore_ascii_case("unknown"))
@@ -633,13 +640,24 @@ fn get_live_antigravity_plan() -> Option<AntigravityPlan> {
     plan
 }
 
-fn confirm_live_session_reset(source: &str, reset_time: Option<&str>) -> Option<String> {
+fn confirm_live_session_reset(
+    source: &str,
+    reset_time: Option<&str>,
+    previously_confirmed: Option<&str>,
+) -> Option<String> {
     static CONFIRMATION: OnceLock<Mutex<crate::app::GeminiResetConfirmation>> = OnceLock::new();
     CONFIRMATION
         .get_or_init(|| Mutex::new(crate::app::GeminiResetConfirmation::default()))
         .lock()
         .ok()
-        .and_then(|mut confirmation| confirmation.observe(source, reset_time))
+        .and_then(|mut confirmation| {
+            confirmation.observe_preserving_confirmed(
+                source,
+                reset_time,
+                previously_confirmed,
+                Utc::now().timestamp(),
+            )
+        })
 }
 
 fn get_language_server_plan() -> Option<AntigravityPlan> {
