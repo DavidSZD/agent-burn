@@ -13,6 +13,13 @@ export function isAutomaticUpdateCheckDue(enabled, lastCheckAt, now) {
   return !Number.isFinite(lastCheck) || now - lastCheck >= 24 * 60 * 60 * 1000;
 }
 
+export function manualRefreshPresentation(scanActive) {
+  return {
+    disabled: Boolean(scanActive),
+    message: scanActive ? "Scan in progress · refresh unavailable" : "",
+  };
+}
+
 export function visibleTokenBreakdownEntries(breakdown) {
   const entries = [
     ["Input", breakdown.input],

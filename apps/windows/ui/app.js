@@ -42,6 +42,7 @@ import {
   updateCacheFromTimelineSnapshot,
   mergeSourceSnapshot,
   waitForInitialRefresh,
+  manualRefreshPresentation,
 } from "./ui-utils.js";
 
 // Agent Burn Windows - Client Web / Tauri v2
@@ -643,9 +644,18 @@ function syncTimelineRefreshIndicators() {
     status.hidden = !active;
   });
   const refreshButton = document.getElementById("refresh-btn");
+  const refreshStatus = document.getElementById("manual-refresh-status");
+  const refreshPresentation = manualRefreshPresentation(active);
   if (refreshButton) {
-    refreshButton.disabled = active;
+    refreshButton.disabled = refreshPresentation.disabled;
     refreshButton.setAttribute("aria-busy", String(active));
+    refreshButton.title = active
+      ? "Manual refresh unavailable while a scan is in progress"
+      : "Refresh usage and live quotas";
+  }
+  if (refreshStatus) {
+    refreshStatus.textContent = refreshPresentation.message;
+    refreshStatus.hidden = !refreshPresentation.message;
   }
 }
 
