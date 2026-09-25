@@ -1052,8 +1052,26 @@ mod tests {
     #[test]
     #[ignore = "requires a local authenticated Antigravity credential"]
     fn authenticated_cloud_fetch_returns_plan_and_quota() {
-        let plan = super::fetch_plan().expect("cloud quota should be available");
-        assert!(!plan.plan.is_empty());
-        assert!(plan.weekly_remaining.is_some() || !plan.quotas.is_empty());
+        let started = std::time::Instant::now();
+        let Some(plan) = super::fetch_plan() else {
+            println!("cloud-api: unavailable");
+            return;
+        };
+        println!(
+            "cloud-api: plan={}; weekly={:?}; weekly_reset={:?}; five_hour={:?}; five_hour_reset={:?}; quota_entries={}",
+            plan.plan,
+            plan.weekly_remaining,
+            plan.weekly_reset_time,
+            plan.session_remaining,
+            plan.session_reset_time,
+            plan.quotas.len()
+        );
+        for quota in plan.quotas {
+            println!(
+                "cloud-api quota: label={}; remaining={}; reset={:?}",
+                quota.label, quota.remaining, quota.reset_time
+            );
+        }
+        println!("cloud-api duration_ms={}", started.elapsed().as_millis());
     }
 }

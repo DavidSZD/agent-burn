@@ -1508,6 +1508,69 @@ Claude and GPT models\tWeekly Limit Remaining\t97%\t2026-09-23T15:31:31Z\n";
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 
+    #[cfg(windows)]
+    fn print_live_quota_diagnostic(source: &str, plan: Option<AntigravityPlan>) {
+        let Some(plan) = plan else {
+            println!("{source}: unavailable");
+            return;
+        };
+        println!(
+            "{source}: plan={}; weekly={:?}; weekly_reset={:?}; five_hour={:?}; five_hour_reset={:?}; quota_entries={}",
+            plan.plan,
+            plan.weekly_remaining,
+            plan.weekly_reset_time,
+            plan.session_remaining,
+            plan.session_reset_time,
+            plan.quotas.len()
+        );
+        for quota in plan.quotas {
+            println!(
+                "{source} quota: label={}; remaining={}; reset={:?}",
+                quota.label, quota.remaining, quota.reset_time
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    #[ignore = "temporary live diagnostic; requires local Antigravity server"]
+    fn diagnostic_local_server_quota() {
+        let started = std::time::Instant::now();
+        print_live_quota_diagnostic("local-server", get_language_server_plan());
+        println!("local-server duration_ms={}", started.elapsed().as_millis());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    #[ignore = "temporary live diagnostic; uses the app agy args without its outer timeout"]
+    fn diagnostic_agy_cli_quota_without_outer_timeout() {
+        let started = std::time::Instant::now();
+        let mut command = std::process::Command::new(agy_executable());
+        command.args([
+            "-p",
+            "/usage",
+            "--output-format",
+            "text",
+            "--print-timeout",
+            "12s",
+        ]);
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(powershell_creation_flags());
+        match command.output() {
+            Ok(output) if output.status.success() => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let plan = parse_agy_usage(&stdout).map(|usage| plan_with_agy_usage(None, usage));
+                print_live_quota_diagnostic("agy-cli", plan);
+            }
+            Ok(output) => println!(
+                "agy-cli: process exited with {}; stderr omitted",
+                output.status
+            ),
+            Err(_) => println!("agy-cli: process could not be started"),
+        }
+        println!("agy-cli duration_ms={}", started.elapsed().as_millis());
+    }
+
     #[test]
     #[ignore = "requires a local authenticated Antigravity CLI"]
     fn authenticated_antigravity_cli_exposes_real_plan_and_quota() {
